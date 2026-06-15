@@ -1,13 +1,16 @@
 # ApexSight — Home Assistant Add-on Repository
 
-This is the source for the **ApexSight Push Bridge** Home Assistant add-on, which
-forwards your Frigate alerts to the ApexSight push relay so your iPhone gets
-**instant notifications even when the app is closed**. The add-on holds **no Apple
-secrets** — only your relay URL and a pairing code.
+Two add-ons that give your iPhone **instant Frigate notifications even when the
+ApexSight app is closed**. Published at
+**https://github.com/btoth525/apexsight-ha-addon**.
 
-It is published as a dedicated add-on repository at
-**https://github.com/btoth525/apexsight-ha-addon** (Home Assistant discovers
-add-on folders at the *root* of a repo, so it lives in its own repo).
+- **ApexSight Push Relay** — runs the relay (holds your Apple `.p8`, signs the
+  pushes) natively on HA OS, with an **OPEN WEB UI** button to upload your key.
+  Install this if you don't have a separate Docker host.
+- **ApexSight Push Bridge** — forwards Frigate's MQTT alerts to the relay. Holds
+  no Apple secrets — just the relay URL + a pairing code.
+
+Install **both**: the Relay first (upload your `.p8`), then the Bridge.
 
 ```
 apexsight-ha-addon/            ← repo root (what HA reads)

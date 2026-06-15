@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Registered devices</h1>
+
+{% if not grouped %}
+  <div class="card"><p class="muted">No devices yet. Enable Instant Push in the app and it'll appear here.</p></div>
+{% endif %}
+
+{% for code, rows in grouped.items() %}
+<div class="card">
+  <h2>Pairing code <span class="codechip">{{ code }}</span></h2>
+  <table>
+    <thead><tr><th>Device token</th><th>Env</th><th>Platform</th><th></th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td class="mono">{{ r['device_token'][:16] }}…{{ r['device_token'][-8:] }}</td>
+        <td>{{ r['environment'] }}</td>
+        <td>{{ r['platform'] or 'ios' }}</td>
+        <td>
+          <form method="post" action="/admin/devices/delete" onsubmit="return confirm('Remove this device?')">
+            <input type="hidden" name="device_token" value="{{ r['device_token'] }}" />
+            <button type="submit" class="danger small">Remove</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %}
+{% endblock %}

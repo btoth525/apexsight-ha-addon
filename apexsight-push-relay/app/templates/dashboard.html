@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<div class="grid">
+  <div class="card">
+    <h2>APNs status</h2>
+    {% if configured %}
+      <p class="ok">● Configured and ready</p>
+      <p class="muted">Key ID {{ settings.key_id }} · Team {{ settings.team_id }}<br/>
+      Topic {{ settings.bundle_id }} · Environment: {{ settings.env_mode }}</p>
+    {% else %}
+      <p class="err">● Not configured</p>
+      <p class="muted">Upload your <code>.p8</code> and set the IDs on the
+        <a href="/admin/settings">Settings</a> page.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Registered devices</h2>
+    <p class="big">{{ device_count }}</p>
+    <p class="muted"><a href="/admin/devices">Manage devices &rsaquo;</a></p>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Send a test push</h2>
+  <p class="muted">Enter a pairing code shown in the app (Settings → Instant Push) to verify delivery.</p>
+  <form method="post" action="/admin/test" class="row">
+    <input type="text" name="pairing_code" placeholder="APEX-XXXX-XXXX" required />
+    <button type="submit" class="primary">Send test</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>How it fits together</h2>
+  <ol class="muted steps">
+    <li>Your phone (ApexSight → Settings → Instant Push) registers its token and shows a pairing code.</li>
+    <li>You paste that code into the <strong>ApexSight Push Bridge</strong> Home Assistant addon.</li>
+    <li>Frigate detects motion → the addon POSTs the alert here → this relay signs it with your
+        <code>.p8</code> and pushes it to your phone via Apple.</li>
+  </ol>
+</div>
+{% endblock %}

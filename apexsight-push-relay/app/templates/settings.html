@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>APNs settings</h1>
+
+<div class="card">
+  <form method="post" action="/admin/settings" enctype="multipart/form-data">
+    <h2>Apple credentials</h2>
+
+    <label>APNs Auth Key (<code>.p8</code> file)
+      <input type="file" name="p8" accept=".p8" />
+      <span class="muted">{% if settings.p8_loaded %}A key is already uploaded ✓ — choose a new file only to replace it.{% else %}Not uploaded yet.{% endif %}</span>
+    </label>
+
+    <label>Key ID
+      <input type="text" name="key_id" value="{{ settings.key_id }}" placeholder="10 chars, e.g. ABC123DEFG" />
+      <span class="muted">Shown next to the key in Apple Developer → Keys.</span>
+    </label>
+
+    <label>Team ID
+      <input type="text" name="team_id" value="{{ settings.team_id }}" placeholder="10 chars" />
+      <span class="muted">Apple Developer → Membership.</span>
+    </label>
+
+    <label>App Bundle ID (APNs topic)
+      <input type="text" name="bundle_id" value="{{ settings.bundle_id }}" />
+    </label>
+
+    <label>APNs environment
+      <select name="env_mode">
+        <option value="auto" {% if settings.env_mode == 'auto' %}selected{% endif %}>Auto (trust each device)</option>
+        <option value="production" {% if settings.env_mode == 'production' %}selected{% endif %}>Force production</option>
+        <option value="sandbox" {% if settings.env_mode == 'sandbox' %}selected{% endif %}>Force sandbox (Xcode debug builds)</option>
+      </select>
+      <span class="muted">Leave on Auto. Use Force sandbox only if pushes to a debug build fail with BadDeviceToken.</span>
+    </label>
+
+    <button type="submit" class="primary">Save</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Where do I get the <code>.p8</code>?</h2>
+  <ol class="muted steps">
+    <li>Go to <strong>developer.apple.com → Certificates, Identifiers &amp; Profiles → Keys</strong>.</li>
+    <li>Click <strong>+</strong>, name it (e.g. "ApexSight APNs"), tick <strong>Apple Push Notifications service (APNs)</strong>, Continue → Register.</li>
+    <li><strong>Download</strong> the <code>.p8</code> (you can only download it once) and note the <strong>Key ID</strong>.</li>
+    <li>Find your <strong>Team ID</strong> under Membership.</li>
+    <li>Upload the <code>.p8</code> above and paste both IDs. Done.</li>
+  </ol>
+</div>
+{% endblock %}

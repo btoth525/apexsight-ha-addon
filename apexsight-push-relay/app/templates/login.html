@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card narrow">
+  <h1>Sign in</h1>
+  <p class="muted">Enter the admin username and password you set
+    (<code>APEX_ADMIN_USERNAME</code> / <code>APEX_ADMIN_PASSWORD</code>).</p>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/login">
+    <label>Username
+      <input type="text" name="username" autocapitalize="none" autocomplete="username" autofocus required />
+    </label>
+    <label>Password
+      <input type="password" name="password" autocomplete="current-password" required />
+    </label>
+    <button type="submit" class="primary">Sign in</button>
+  </form>
+</div>
+{% endblock %}
