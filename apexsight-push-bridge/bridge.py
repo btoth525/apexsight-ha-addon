@@ -8,7 +8,7 @@ code. The relay signs and delivers the actual APNs push.
 All configuration comes from environment variables (set by run.sh from the HA
 addon options + MQTT service):
 
-  RELAY_URL          e.g. https://push.yourdomain.com
+  RELAY_URL          e.g. https://relay.plexserver525.com
   PAIRING_CODE       e.g. APEX-7F3K-2Q9P  (shown in the app)
   FRIGATE_BASE_URL   externally-reachable Frigate URL for snapshots/GIFs
   TOPIC              MQTT topic (default frigate/reviews)

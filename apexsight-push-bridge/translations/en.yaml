@@ -1,0 +1,38 @@
+configuration:
+  relay_url:
+    name: Relay URL
+    description: >-
+      Your ApexSight push relay. Leave the default unless you self-host the relay
+      somewhere else.
+  pairing_code:
+    name: Pairing code
+    description: >-
+      Pre-filled with the shared household code, so for a shared-camera setup you
+      can leave it as-is. (It's the same APEX-XXXX-XXXX shown in the app under
+      Settings → Instant Push.) Change it only if you use a private code.
+  frigate_base_url:
+    name: Frigate URL (for the snapshot)
+    description: >-
+      A URL your phone can reach Frigate at, used to load the notification
+      image/GIF — e.g. https://frigate.yourdomain.com. Leave blank for text-only
+      alerts.
+  alerts_only:
+    name: Alerts only
+    description: >-
+      On = only send Frigate "alert" reviews. Off = also send lower-priority
+      detections.
+  topic:
+    name: MQTT topic
+    description: Frigate review topic. Leave as frigate/reviews unless you changed it.
+  mqtt_host:
+    name: MQTT host (optional)
+    description: Leave blank to use the Home Assistant broker automatically.
+  mqtt_port:
+    name: MQTT port (optional)
+    description: Leave 0 to use the Home Assistant broker automatically.
+  mqtt_user:
+    name: MQTT username (optional)
+    description: Leave blank to use the Home Assistant broker automatically.
+  mqtt_password:
+    name: MQTT password (optional)
+    description: Leave blank to use the Home Assistant broker automatically.

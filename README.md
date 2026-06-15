@@ -1,57 +1,65 @@
-# ApexSight — Home Assistant Add-on
+# ApexSight — Home Assistant Add-on Repository
 
-This folder contains the **ApexSight Push Bridge** add-on, which forwards Frigate
-alerts to your push relay. There are two ways to install it.
+This is the source for the **ApexSight Push Bridge** Home Assistant add-on, which
+forwards your Frigate alerts to the ApexSight push relay so your iPhone gets
+**instant notifications even when the app is closed**. The add-on holds **no Apple
+secrets** — only your relay URL and a pairing code.
 
-## Option 1 — Local install (fastest, for yourself)
-
-Home Assistant scans a special `/addons` folder for "local" add-ons.
-
-1. Get the files onto your HA machine, into `/addons/apexsight-push-bridge/`:
-   - Easiest: install the **Samba share** or **Studio Code Server** / **File
-     editor** add-on, then copy the `apexsight-push-bridge/` folder (all of it:
-     `config.yaml`, `Dockerfile`, `build.yaml`, `run.sh`, `bridge.py`) into the
-     `addons` share.
-   - Or over SSH: `scp -r homeassistant-addon/apexsight-push-bridge \
-     root@homeassistant:/addons/`
-2. HA → **Settings → Add-ons → Add-on Store**, click the **⟳** (top-right) to
-   refresh. **ApexSight Push Bridge** appears under **Local add-ons**.
-3. Click it → **Install** → **Configuration** (fill in the options below) →
-   **Start**.
-
-## Option 2 — Add-on repository (for testers / one-click installs)
-
-Home Assistant can install add-ons straight from a Git repo, but it looks for the
-add-on folders **at the repo root**. So publish a small dedicated repo:
+It is published as a dedicated add-on repository at
+**https://github.com/btoth525/apexsight-ha-addon** (Home Assistant discovers
+add-on folders at the *root* of a repo, so it lives in its own repo).
 
 ```
-your-ha-addons-repo/
-├── repository.yaml              ← copy from this folder
-└── apexsight-push-bridge/       ← copy this whole folder
+apexsight-ha-addon/            ← repo root (what HA reads)
+├── repository.yaml
+├── README.md
+└── apexsight-push-bridge/
     ├── config.yaml
-    ├── Dockerfile
     ├── build.yaml
+    ├── Dockerfile
     ├── run.sh
-    └── bridge.py
+    ├── bridge.py
+    ├── CHANGELOG.md
+    └── README.md
 ```
 
-1. Create a public GitHub repo (e.g. `apexsight-ha-addons`) with that layout
-   (copy `repository.yaml` and the `apexsight-push-bridge/` folder from here to
-   its root).
-2. Testers: HA → **Settings → Add-ons → Add-on Store → ⋮ (top-right) →
-   Repositories**, paste the repo URL, **Add**.
-3. **ApexSight Push Bridge** now shows in the store → **Install → Configure → Start**.
+## Install it (testers)
 
-## Configuration (both options)
+1. HA → **Settings → Add-ons → Add-on Store → ⋮ (top-right) → Repositories**.
+2. Paste `https://github.com/btoth525/apexsight-ha-addon` and **Add**.
+3. **ApexSight Push Bridge** appears in the store → **Install**.
+4. Open it → **Configuration**:
 
-| Option | Value |
-|--------|-------|
-| `relay_url` | Your relay, e.g. `https://push.yourdomain.com` |
-| `pairing_code` | The code shown in ApexSight → Settings → Instant Push |
-| `frigate_base_url` | URL your phone can reach Frigate at (for the snapshot/GIF) |
-| `alerts_only` | `true` = only alerts; `false` = also detections |
+   | Option | Value |
+   |--------|-------|
+   | `relay_url` | `https://relay.plexserver525.com` |
+   | `pairing_code` | The code shown in ApexSight → Settings → Instant Push |
+   | `frigate_base_url` | A URL your phone can reach Frigate at (for the snapshot/GIF) |
+   | `alerts_only` | `true` = only alerts; `false` = also detections |
 
-MQTT is auto-filled from the Home Assistant broker; override `mqtt_*` only if you
-run a separate broker.
+   MQTT is auto-filled from the HA broker; override `mqtt_*` only for a separate broker.
+5. **Start** the add-on. Trigger motion → instant rich notification, app closed. 🎉
 
-See `apexsight-push-bridge/README.md` for full details.
+## Publish / update it (maintainer)
+
+The canonical source lives in the main app repo under `homeassistant-addon/`.
+To push it to the dedicated add-on repo:
+
+```bash
+git clone https://github.com/btoth525/apexsight-ha-addon
+cd apexsight-ha-addon
+# copy the contents of this folder (ApexSight repo → homeassistant-addon/) to the root:
+cp -r /path/to/ApexSight/homeassistant-addon/. .
+git add .
+git commit -m "ApexSight Push Bridge 1.0.0"
+git push
+```
+
+When you change the add-on, bump `version` in `apexsight-push-bridge/config.yaml`,
+add a `CHANGELOG.md` entry, and push — Home Assistant will offer the update.
+
+The store branding is included: `apexsight-push-bridge/icon.png` (256×256) and
+`logo.png` (760×256) ship with the add-on, so HA shows the ApexSight mark
+automatically.
+
+See `apexsight-push-bridge/README.md` for full details on how the bridge works.
