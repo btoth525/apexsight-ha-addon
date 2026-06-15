@@ -1,0 +1,35 @@
+name: ApexSight Push Bridge
+version: "1.0.0"
+slug: apexsight_push_bridge
+description: Forwards Frigate alerts to your ApexSight push relay for instant iOS notifications.
+url: https://github.com/btoth525/apexsight/tree/main/homeassistant-addon/apexsight-push-bridge
+arch:
+  - aarch64
+  - amd64
+  - armv7
+startup: services
+boot: auto
+init: false
+# Pulls MQTT connection details automatically from the Home Assistant broker.
+services:
+  - mqtt:need
+options:
+  relay_url: ""
+  pairing_code: ""
+  frigate_base_url: ""
+  topic: "frigate/reviews"
+  alerts_only: true
+  mqtt_host: ""
+  mqtt_port: 0
+  mqtt_user: ""
+  mqtt_password: ""
+schema:
+  relay_url: url
+  pairing_code: str
+  frigate_base_url: str
+  topic: str
+  alerts_only: bool
+  mqtt_host: str?
+  mqtt_port: int?
+  mqtt_user: str?
+  mqtt_password: password?
