@@ -1,0 +1,43 @@
+name: ApexSight Push
+version: "1.0.0"
+slug: apexsight_push
+description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
+url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+init: false
+# Pulls MQTT connection details automatically from the Home Assistant broker.
+services:
+  - mqtt:need
+# Publishes the relay so your Cloudflare Tunnel / proxy can reach it.
+ports:
+  "3421/tcp": 3421
+ports_description:
+  "3421/tcp": Relay API + web GUI — point your Cloudflare Tunnel / proxy at this host port
+# "OPEN WEB UI" button → the admin page on the mapped host port.
+webui: "http://[HOST]:[PORT:3421]/admin"
+options:
+  admin_username: admin
+  admin_password: ""
+  pairing_code: "APEX-PLEX-5250"
+  frigate_base_url: ""
+  alerts_only: true
+  topic: "frigate/reviews"
+  mqtt_host: ""
+  mqtt_port: 0
+  mqtt_user: ""
+  mqtt_password: ""
+schema:
+  admin_username: str
+  admin_password: password
+  pairing_code: "match(^APEX-[A-Z0-9]{4}-[A-Z0-9]{4}$)"
+  frigate_base_url: url?
+  alerts_only: bool
+  topic: str
+  mqtt_host: str?
+  mqtt_port: int?
+  mqtt_user: str?
+  mqtt_password: password?

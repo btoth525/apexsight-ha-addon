@@ -1,26 +1,25 @@
 configuration:
-  relay_url:
-    name: Relay URL
+  admin_username:
+    name: Admin username
+    description: Username for the relay web GUI (OPEN WEB UI) login.
+  admin_password:
+    name: Admin password
     description: >-
-      Your ApexSight push relay. Leave the default unless you self-host the relay
-      somewhere else.
+      Password for the web GUI login. Pick a long one — it protects the page
+      where you upload your Apple APNs key.
   pairing_code:
     name: Pairing code
     description: >-
-      Pre-filled with the shared household code, so for a shared-camera setup you
-      can leave it as-is. (It's the same APEX-XXXX-XXXX shown in the app under
-      Settings → Instant Push.) Change it only if you use a private code.
+      Pre-filled with the shared household code. Leave as-is for a shared-camera
+      setup; it must match the code shown in the app (Settings → Instant Push).
   frigate_base_url:
     name: Frigate URL (for the snapshot)
     description: >-
       A URL your phone can reach Frigate at, used to load the notification
-      image/GIF — e.g. https://frigate.yourdomain.com. Leave blank for text-only
-      alerts.
+      image/GIF — e.g. https://frigate.yourdomain.com. Leave blank for text-only.
   alerts_only:
     name: Alerts only
-    description: >-
-      On = only send Frigate "alert" reviews. Off = also send lower-priority
-      detections.
+    description: On = only Frigate "alert" reviews. Off = also send detections.
   topic:
     name: MQTT topic
     description: Frigate review topic. Leave as frigate/reviews unless you changed it.

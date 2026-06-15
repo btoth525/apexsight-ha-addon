@@ -1,9 +1,0 @@
-configuration:
-  admin_username:
-    name: Admin username
-    description: Username for the relay web GUI login.
-  admin_password:
-    name: Admin password
-    description: >-
-      Password for the relay web GUI login. Pick a long one — this protects the
-      page where you upload your Apple APNs key.
