@@ -9,9 +9,11 @@ Public API (called by the iOS app + the Home Assistant bridge addon):
 Admin web GUI (browser, password-protected): mounted at /admin — upload the
 .p8, set Key/Team/Bundle IDs, view devices, send a test push.
 """
+import json
 import os
 import time
 from collections import defaultdict, deque
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -19,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, config, db
+from . import apns, config, db, render
 from .admin import router as admin_router
 
 app = FastAPI(title="ApexSight Push Relay", docs_url=None, redoc_url=None)
@@ -80,6 +82,25 @@ class NotifyIn(BaseModel):
     thumbnail_url: str = ""
     snapshot_path: str = ""
     frigate_token: str = ""
+    collapse_id: str = ""
+    silent: bool = False
+    # Raw event fields — when present the relay renders title/body/media itself
+    # using the household's saved style (set via /v1/style), so the in-app GUI
+    # controls even app-closed notifications.
+    camera_name: str = ""
+    labels: list[str] = []
+    sub_labels: list[str] = []
+    zones: list[str] = []
+    score: Optional[float] = None
+    severity: str = ""
+    detection_id: str = ""
+    frigate_base_url: str = ""
+    stage: str = ""
+
+
+class StyleIn(BaseModel):
+    pairing_code: str
+    style: dict
 
 
 # ---- public API -------------------------------------------------------------
@@ -134,16 +155,60 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     if not db.devices_for(code):
         # Nothing registered under this code yet — not an error the bridge should retry on.
         return {"ok": True, "devices": 0, "sent": 0, "note": "no devices for pairing code"}
+
+    title, text = body.title, body.body
+    snapshot_url, thumbnail_url = body.snapshot_url, body.thumbnail_url
+
+    # Raw event present → render here using the household's saved style (or defaults),
+    # so the app's GUI controls the content even when the app is closed.
+    if body.detection_id or body.labels or body.sub_labels:
+        raw = db.get_config(f"style:{code}")
+        style = {}
+        if raw:
+            try:
+                style = json.loads(raw)
+            except json.JSONDecodeError:
+                style = {}
+        rendered = render.render(
+            {
+                "camera": body.camera,
+                "camera_name": body.camera_name,
+                "labels": body.labels,
+                "sub_labels": body.sub_labels,
+                "zones": body.zones,
+                "score": body.score,
+                "severity": body.severity,
+                "detection_id": body.detection_id,
+                "frigate_base_url": body.frigate_base_url,
+            },
+            style,
+            body.stage or "alert",
+        )
+        title = rendered["title"] or title
+        text = rendered["body"] or text
+        snapshot_url = rendered["snapshot_url"] or snapshot_url
+        thumbnail_url = rendered["thumbnail_url"] or thumbnail_url
+
     payload = apns.build_payload(
-        title=body.title,
-        body=body.body,
+        title=title,
+        body=text,
         camera=body.camera,
         review_id=body.review_id,
         apex_url=body.apex_url,
-        snapshot_url=body.snapshot_url,
-        thumbnail_url=body.thumbnail_url,
+        snapshot_url=snapshot_url,
+        thumbnail_url=thumbnail_url,
         snapshot_path=body.snapshot_path,
         frigate_token=body.frigate_token,
+        silent=body.silent,
     )
-    result = await apns.deliver_to_pairing(code, payload)
+    result = await apns.deliver_to_pairing(code, payload, collapse_id=body.collapse_id)
     return {"ok": result["sent"] > 0 or result["devices"] == 0, **result}
+
+
+@app.post("/v1/style")
+def set_style(body: StyleIn, _: None = Depends(rate_limit)) -> dict:
+    """The iOS app saves its notification style here, keyed by pairing code, so the
+    relay can render app-closed pushes the way the user configured in the GUI."""
+    code = body.pairing_code.upper().strip()
+    db.set_config(f"style:{code}", json.dumps(body.style))
+    return {"ok": True}

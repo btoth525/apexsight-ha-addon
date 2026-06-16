@@ -77,7 +77,9 @@ def is_configured() -> bool:
         return False
 
 
-async def send_to_token(device_token: str, environment: str, payload: dict) -> tuple[bool, str]:
+async def send_to_token(
+    device_token: str, environment: str, payload: dict, collapse_id: str = ""
+) -> tuple[bool, str]:
     """Send one push. Returns (ok, detail). detail is APNs' reason on failure."""
     p8, key_id, team_id, bundle_id, env_mode = _credentials()
     headers = {
@@ -86,6 +88,11 @@ async def send_to_token(device_token: str, environment: str, payload: dict) -> t
         "apns-push-type": "alert",
         "apns-priority": "10",
     }
+    if collapse_id:
+        # APNs caps the collapse identifier at 64 bytes. Reusing it across the
+        # instant alert and the follow-up full-GIF push makes the second one
+        # replace the first in place instead of stacking a duplicate.
+        headers["apns-collapse-id"] = collapse_id[:64]
     url = f"{_host_for(environment, env_mode)}/3/device/{device_token}"
     try:
         async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
@@ -114,18 +121,27 @@ def build_payload(
     thumbnail_url: str = "",
     snapshot_path: str = "",
     frigate_token: str = "",
+    silent: bool = False,
 ) -> dict:
     """Build the APNs payload the ApexSight NotificationService extension expects.
 
     `mutable-content: 1` lets the extension run and attach the snapshot/GIF, so
     the alert renders rich media even when the app is fully closed.
+
+    `silent=True` is used for the follow-up full-event GIF update: it keeps the
+    alert visible (so the extension still runs and swaps in the complete GIF via
+    the shared collapse-id) but drops the sound and uses a passive interruption
+    level so the user isn't buzzed a second time.
     """
     aps = {
         "alert": {"title": title, "body": body},
-        "sound": "default",
         "mutable-content": 1,
         "category": "APEX_FRIGATE_ALERT",
     }
+    if silent:
+        aps["interruption-level"] = "passive"
+    else:
+        aps["sound"] = "default"
     if camera:
         aps["thread-id"] = f"apex-{camera}"
 
@@ -151,7 +167,7 @@ def build_payload(
     return payload
 
 
-async def deliver_to_pairing(pairing_code: str, payload: dict) -> dict:
+async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str = "") -> dict:
     """Fan a payload out to every device registered under a pairing code.
 
     Prunes tokens APNs reports as permanently gone (410 / BadDeviceToken /
@@ -161,7 +177,7 @@ async def deliver_to_pairing(pairing_code: str, payload: dict) -> dict:
     sent, failed, pruned = 0, 0, 0
     errors: list[str] = []
     for row in rows:
-        ok, detail = await send_to_token(row["device_token"], row["environment"], payload)
+        ok, detail = await send_to_token(row["device_token"], row["environment"], payload, collapse_id)
         if ok:
             sent += 1
             continue

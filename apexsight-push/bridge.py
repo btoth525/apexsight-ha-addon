@@ -34,9 +34,11 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or "1883")
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 
-# Review ids we've already pushed, so a review that emits new→update→end only
-# notifies once. Bounded so it can't grow forever.
-_notified: dict[str, float] = {}
+# Per-review notification stages already sent: "alert" (the instant push) and
+# "final" (the follow-up push carrying the complete GIF). Keyed by review id so a
+# review that emits new→update→end fires at most once per stage. TTL-bounded so
+# it can't grow forever.
+_notified: dict[str, dict[str, float]] = {}
 _NOTIFIED_TTL = 3600
 
 
@@ -55,7 +57,7 @@ def _titleize(s: str) -> str:
     return s.replace("_", " ").title() if s else s
 
 
-def _build_alert(after: dict) -> dict | None:
+def _build_alert(after: dict, final: bool = False) -> dict | None:
     review_id = after.get("id")
     camera = after.get("camera", "")
     severity = after.get("severity", "")
@@ -83,37 +85,104 @@ def _build_alert(after: dict) -> dict | None:
 
     payload = {
         "pairing_code": PAIRING_CODE,
+        # title/body are a fallback — the relay re-renders from the raw fields below
+        # using the household's saved style, so the in-app GUI controls the content.
         "title": title,
         "body": body,
         "camera": camera,
         "review_id": review_id,
         "apex_url": f"apex://review?id={review_id}",
+        # Reuse the review id as the APNs collapse id so the follow-up full-GIF
+        # push replaces the instant alert in place rather than stacking a dup.
+        "collapse_id": review_id,
+        # The final update swaps in the complete GIF silently (no second buzz).
+        "silent": final,
+        # Raw event fields for relay-side, style-driven rendering.
+        "camera_name": _titleize(camera),
+        "labels": objects,
+        "sub_labels": sublabels,
+        "zones": zones,
+        "severity": severity,
+        "stage": "final" if final else "alert",
+        "frigate_base_url": FRIGATE_BASE_URL,
     }
-    # Rich media: the first detection's animated GIF (+ static thumbnail fallback).
+    if detections:
+        payload["detection_id"] = detections[0]
+    # Rich media, two-stage (matches the SgtBatten blueprint feel):
+    #   • instant alert  → a tight CROPPED snapshot (bbox) that reads great on the
+    #     lock screen the moment the event starts;
+    #   • final update   → the now-complete animated GIF, swapped in place via the
+    #     shared collapse id (no duplicate notification).
     if FRIGATE_BASE_URL and detections:
         det = detections[0]
-        payload["snapshot_url"] = f"{FRIGATE_BASE_URL}/api/events/{det}/preview.gif"
-        payload["thumbnail_url"] = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg"
+        cropped = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg?bbox=1&crop=1"
+        gif = f"{FRIGATE_BASE_URL}/api/events/{det}/preview.gif"
+        full_snapshot = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg"
+        if final:
+            payload["snapshot_url"] = gif
+            payload["thumbnail_url"] = cropped
+        else:
+            payload["snapshot_url"] = cropped
+            payload["thumbnail_url"] = full_snapshot
     return payload
 
 
-def _should_notify(after: dict, msg_type: str) -> bool:
+def _stages_to_send(after: dict, msg_type: str) -> list[str]:
+    """Decide which notification stages to send for this MQTT update.
+
+    Returns any of "alert" (the instant push) and "final" (the follow-up push
+    carrying the complete GIF, sent once the review has ended).
+    """
     review_id = after.get("id")
     if not review_id:
-        return False
+        return []
     now = time.time()
-    # prune
-    for k in [k for k, t in _notified.items() if now - t > _NOTIFIED_TTL]:
+    # prune anything past the TTL
+    for k in [k for k, v in list(_notified.items()) if now - max(v.values(), default=0) > _NOTIFIED_TTL]:
         _notified.pop(k, None)
-    if review_id in _notified:
-        return False
+    sent = _notified.get(review_id, {})
     detections = (after.get("data", {}) or {}).get("detections", []) or []
-    # Notify as soon as we have a detection (for the GIF), or at the very latest
-    # when the review ends.
-    if detections or msg_type == "end":
-        _notified[review_id] = now
-        return True
-    return False
+
+    stages: list[str] = []
+    # Instant alert as soon as there's a detection (so we have a GIF), or at the
+    # very latest when the review ends.
+    if "alert" not in sent and (detections or msg_type == "end"):
+        stages.append("alert")
+    # A separate "final" update only makes sense if the instant alert already went
+    # out *earlier*, while the event was still in progress — only then is its GIF
+    # partial. If the review ends in the same update that first fires the alert,
+    # that GIF is already complete, so no follow-up is needed.
+    if msg_type == "end" and detections and "alert" in sent and "final" not in sent:
+        stages.append("final")
+
+    if stages:
+        record = _notified.setdefault(review_id, {})
+        for s in stages:
+            record[s] = now
+    return stages
+
+
+def _post_to_relay(payload: dict, stage: str, attempts: int = 3) -> None:
+    """POST one alert to the relay, retrying transient failures with backoff.
+
+    A missed alert is the worst failure mode for a security app, so retry a few
+    times before giving up rather than dropping the event on the first blip.
+    Relay 2xx/4xx are final answers (don't hammer); only 5xx and network errors
+    are retried.
+    """
+    delay = 1.0
+    for attempt in range(1, attempts + 1):
+        try:
+            r = requests.post(f"{RELAY_URL}/v1/notify", json=payload, timeout=10)
+            log(f"forwarded review {payload['review_id']} [{stage}] → {r.status_code} {r.text[:120]}")
+            if r.status_code < 500:
+                return
+            log(f"relay {r.status_code}, retrying ({attempt}/{attempts})")
+        except Exception as exc:
+            log(f"relay POST failed ({attempt}/{attempts}):", exc)
+        if attempt < attempts:
+            time.sleep(delay)
+            delay *= 2
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -132,16 +201,13 @@ def on_message(client, userdata, msg):
         return
     after = event.get("after") or event.get("before") or {}
     msg_type = event.get("type", "")
-    if not _should_notify(after, msg_type):
+    stages = _stages_to_send(after, msg_type)
+    if not stages:
         return
-    payload = _build_alert(after)
-    if not payload:
-        return
-    try:
-        r = requests.post(f"{RELAY_URL}/v1/notify", json=payload, timeout=10)
-        log(f"forwarded review {payload['review_id']} → {r.status_code} {r.text[:120]}")
-    except Exception as exc:
-        log("relay POST failed:", exc)
+    for stage in stages:
+        payload = _build_alert(after, final=(stage == "final"))
+        if payload:
+            _post_to_relay(payload, stage)
 
 
 def main():
