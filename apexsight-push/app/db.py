@@ -29,6 +29,16 @@ def init() -> None:
                 updated_at   INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_devices_pairing ON devices(pairing_code);
+            CREATE TABLE IF NOT EXISTS recap_events (
+                pairing_code TEXT NOT NULL,
+                event_id     TEXT NOT NULL,
+                camera       TEXT,
+                label        TEXT,
+                sub_label    TEXT,
+                ts           REAL NOT NULL,
+                PRIMARY KEY (pairing_code, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_recap_ts ON recap_events(pairing_code, ts);
             """
         )
 
@@ -107,3 +117,19 @@ def all_devices() -> list[sqlite3.Row]:
 def device_count() -> int:
     with _conn() as c:
         return c.execute("SELECT COUNT(*) AS n FROM devices").fetchone()["n"]
+
+
+# ---- recap events (accumulated from the MQTT stream by the bridge) -----------
+
+def recap_events_between(pairing_code: str, start_ts: float, end_ts: float) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT camera, label, sub_label, ts FROM recap_events "
+            "WHERE pairing_code = ? AND ts >= ? AND ts <= ?",
+            (pairing_code, start_ts, end_ts),
+        ).fetchall()
+
+
+def prune_recap_events(before_ts: float) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM recap_events WHERE ts < ?", (before_ts,))

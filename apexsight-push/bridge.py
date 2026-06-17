@@ -17,6 +17,7 @@ addon options + MQTT service):
 """
 import json
 import os
+import sqlite3
 import sys
 import time
 
@@ -28,6 +29,12 @@ PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 FRIGATE_BASE_URL = os.environ.get("FRIGATE_BASE_URL", "").rstrip("/")
 TOPIC = os.environ.get("TOPIC", "frigate/reviews")
 ALERTS_ONLY = os.environ.get("ALERTS_ONLY", "true").lower() in ("true", "1", "yes")
+
+# Frigate's per-object events topic (same prefix as the reviews topic) — accumulated
+# into the shared relay DB so the relay can build the daily recap without querying
+# Frigate over HTTP. The relay reads from the same SQLite file.
+EVENTS_TOPIC = (TOPIC[: -len("/reviews")] + "/events") if TOPIC.endswith("/reviews") else "frigate/events"
+DB_PATH = os.path.join(os.environ.get("APEX_DATA_DIR", "/data"), "relay.db")
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or "1883")
@@ -44,6 +51,46 @@ _NOTIFIED_TTL = 3600
 
 def log(*a):
     print("[bridge]", *a, file=sys.stdout, flush=True)
+
+
+def _ensure_recap_table() -> None:
+    """The relay's db.init() also creates this — but the bridge may write first."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS recap_events ("
+                " pairing_code TEXT NOT NULL, event_id TEXT NOT NULL, camera TEXT,"
+                " label TEXT, sub_label TEXT, ts REAL NOT NULL,"
+                " PRIMARY KEY (pairing_code, event_id))"
+            )
+            conn.commit()
+    except Exception as exc:
+        log("recap table init failed:", exc)
+
+
+def _record_event(after: dict) -> None:
+    """Upsert a Frigate tracked-object event into the shared DB for the daily recap.
+    Upserting by id keeps the latest sub-label (e.g. a person resolving to a face)."""
+    event_id = after.get("id")
+    if not event_id:
+        return
+    sub = after.get("sub_label")
+    if isinstance(sub, list):
+        sub = sub[0] if sub else None
+    ts = after.get("start_time") or time.time()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.execute(
+                "INSERT INTO recap_events(pairing_code, event_id, camera, label, sub_label, ts) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(pairing_code, event_id) DO UPDATE SET "
+                "  camera=excluded.camera, label=excluded.label, "
+                "  sub_label=excluded.sub_label, ts=excluded.ts",
+                (PAIRING_CODE, event_id, after.get("camera"), after.get("label"), sub, float(ts)),
+            )
+            conn.commit()
+    except Exception as exc:
+        log("recap event write failed:", exc)
 
 
 LABEL_EMOJI = {
@@ -106,6 +153,9 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
         "stage": "final" if final else "alert",
         "frigate_base_url": FRIGATE_BASE_URL,
     }
+    plate = data.get("recognized_license_plate") or ""
+    if plate:
+        payload["recognized_license_plate"] = plate
     if detections:
         payload["detection_id"] = detections[0]
     # Rich media, two-stage (matches the SgtBatten blueprint feel):
@@ -187,8 +237,9 @@ def _post_to_relay(payload: dict, stage: str, attempts: int = 3) -> None:
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
-        log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}, subscribing {TOPIC}")
+        log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}, subscribing {TOPIC} + {EVENTS_TOPIC}")
         client.subscribe(TOPIC)
+        client.subscribe(EVENTS_TOPIC)
     else:
         log(f"MQTT connect failed rc={rc}")
 
@@ -200,6 +251,10 @@ def on_message(client, userdata, msg):
         log("bad payload:", exc)
         return
     after = event.get("after") or event.get("before") or {}
+    # The events topic only feeds the daily-recap tally, not notifications.
+    if msg.topic == EVENTS_TOPIC:
+        _record_event(after)
+        return
     msg_type = event.get("type", "")
     stages = _stages_to_send(after, msg_type)
     if not stages:
@@ -216,6 +271,8 @@ def main():
         sys.exit(1)
     if not FRIGATE_BASE_URL:
         log("WARNING: frigate_base_url is empty — notifications will have no image.")
+
+    _ensure_recap_table()
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2) if hasattr(mqtt, "CallbackAPIVersion") else mqtt.Client()
     if MQTT_USER:

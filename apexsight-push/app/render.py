@@ -38,6 +38,22 @@ def _titleize(s: str) -> str:
     return str(s).replace("_", " ").title() if s else ""
 
 
+def _normalize_plate(s: str) -> str:
+    return "".join(ch for ch in str(s).upper() if ch.isalnum())
+
+
+def _known_plate_name(raw: str, known: list) -> str | None:
+    """Friendly name for a recognized plate from the app's plate registry, else None."""
+    norm = _normalize_plate(raw)
+    if not norm:
+        return None
+    for kp in known or []:
+        for p in (kp.get("plates") or []):
+            if _normalize_plate(p) == norm:
+                return kp.get("name")
+    return None
+
+
 def _as_list(v) -> list:
     if v is None:
         return []
@@ -60,6 +76,15 @@ def render(ev: dict, style: dict | None, stage: str) -> dict:
     zones = _as_list(ev.get("zones"))
     severity = ev.get("severity") or "detection"
     camera_name = ev.get("camera_name") or _titleize(ev.get("camera", ""))
+
+    # Recognized plate → your friendly name (headlines the alert), else "Unknown Plate".
+    plate = ev.get("recognized_license_plate")
+    if plate:
+        named = _known_plate_name(plate, s.get("knownPlates"))
+        if named:
+            subs = [named] + subs
+        elif "unknown plate" not in [str(x).lower() for x in subs]:
+            subs = subs + ["Unknown Plate"]
 
     keys = [str(x).lower().strip() for x in (subs + labels) if str(x).strip()]
 

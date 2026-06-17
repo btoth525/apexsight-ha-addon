@@ -9,6 +9,8 @@ Public API (called by the iOS app + the Home Assistant bridge addon):
 Admin web GUI (browser, password-protected): mounted at /admin — upload the
 .p8, set Key/Team/Bundle IDs, view devices, send a test push.
 """
+import asyncio
+import datetime
 import json
 import os
 import time
@@ -21,8 +23,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, config, db, render
+from . import apns, config, db, recap, render
 from .admin import router as admin_router
+
+# Read from the add-on env (run.sh) — used by the daily-recap scheduler.
+PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 
 app = FastAPI(title="ApexSight Push Relay", docs_url=None, redoc_url=None)
 app.add_middleware(SessionMiddleware, secret_key=config.session_secret(), https_only=False)
@@ -33,8 +38,59 @@ app.include_router(admin_router)
 
 
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     db.init()
+    asyncio.create_task(_recap_scheduler())
+
+
+# ---- daily recap scheduler --------------------------------------------------
+
+async def _recap_scheduler() -> None:
+    """Once a minute, send the household's daily recap if it's due and not yet sent
+    today — so the daily summary arrives reliably even with the app fully closed."""
+    while True:
+        try:
+            await _maybe_send_recap()
+        except Exception as exc:
+            print("[recap] error:", exc, flush=True)
+        await asyncio.sleep(60)
+
+
+async def _maybe_send_recap() -> None:
+    if not PAIRING_CODE or not apns.is_configured():
+        return
+    raw = db.get_config(f"recap:{PAIRING_CODE}")
+    if not raw:
+        return
+    try:
+        cfg = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not cfg.get("enabled"):
+        return
+    if not db.devices_for(PAIRING_CODE):
+        return
+
+    # The app syncs the user's UTC offset (seconds) so we evaluate "their" time
+    # without needing a tz database in the container.
+    tz = datetime.timezone(datetime.timedelta(seconds=int(cfg.get("tz_offset", 0))))
+    now = datetime.datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    if db.get_config(f"recap_sent:{PAIRING_CODE}") == today:
+        return
+    target = int(cfg.get("hour", 21)) * 60 + int(cfg.get("minute", 0))
+    if (now.hour * 60 + now.minute) < target:
+        return
+
+    # Build from the events the bridge accumulated off MQTT today (no Frigate query).
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = db.recap_events_between(PAIRING_CODE, midnight.timestamp(), now.timestamp())
+    title, body = recap.format_recap(rows)
+    payload = apns.build_payload(title=title, body=body, apex_url="apex://recap")
+    await apns.deliver_to_pairing(PAIRING_CODE, payload, collapse_id=f"recap-{today}")
+    db.set_config(f"recap_sent:{PAIRING_CODE}", today)
+    db.prune_recap_events(midnight.timestamp() - 2 * 86_400)   # keep ~2 days of history
+    print(f"[recap] sent daily recap to {PAIRING_CODE} for {today} ({len(rows)} events)", flush=True)
 
 
 # ---- naive per-IP rate limiting --------------------------------------------
@@ -95,12 +151,27 @@ class NotifyIn(BaseModel):
     severity: str = ""
     detection_id: str = ""
     frigate_base_url: str = ""
+    recognized_license_plate: str = ""
     stage: str = ""
 
 
 class StyleIn(BaseModel):
     pairing_code: str
     style: dict
+
+
+class GateIn(BaseModel):
+    pairing_code: str
+    disarmed: bool = False
+    snoozed_until: float = 0.0   # epoch seconds; 0 = not snoozed
+
+
+class RecapIn(BaseModel):
+    pairing_code: str
+    enabled: bool = False
+    hour: int = 21
+    minute: int = 0
+    tz_offset: int = 0           # seconds from GMT, so the relay sends at the user's local time
 
 
 # ---- public API -------------------------------------------------------------
@@ -156,6 +227,21 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         # Nothing registered under this code yet — not an error the bridge should retry on.
         return {"ok": True, "devices": 0, "sent": 0, "note": "no devices for pairing code"}
 
+    # Household gate — keeps app-closed pushes consistent with the in-app delivery gate.
+    # When the user has Disarmed or Snoozed (from the app, a widget, Siri or CarPlay,
+    # synced via /v1/gate), suppress delivery instead of buzzing them anyway.
+    gate_raw = db.get_config(f"gate:{code}")
+    if gate_raw:
+        try:
+            gate = json.loads(gate_raw)
+        except json.JSONDecodeError:
+            gate = {}
+        if gate.get("disarmed"):
+            return {"ok": True, "sent": 0, "note": "disarmed"}
+        snoozed_until = gate.get("snoozed_until") or 0
+        if snoozed_until and time.time() < float(snoozed_until):
+            return {"ok": True, "sent": 0, "note": "snoozed"}
+
     title, text = body.title, body.body
     snapshot_url, thumbnail_url = body.snapshot_url, body.thumbnail_url
 
@@ -180,6 +266,7 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
                 "severity": body.severity,
                 "detection_id": body.detection_id,
                 "frigate_base_url": body.frigate_base_url,
+                "recognized_license_plate": body.recognized_license_plate,
             },
             style,
             body.stage or "alert",
@@ -211,4 +298,33 @@ def set_style(body: StyleIn, _: None = Depends(rate_limit)) -> dict:
     relay can render app-closed pushes the way the user configured in the GUI."""
     code = body.pairing_code.upper().strip()
     db.set_config(f"style:{code}", json.dumps(body.style))
+    return {"ok": True}
+
+
+@app.post("/v1/gate")
+def set_gate(body: GateIn, _: None = Depends(rate_limit)) -> dict:
+    """The iOS app mirrors its Disarm / Snooze state here so app-closed pushes are
+    suppressed while disarmed or snoozed, matching the in-app delivery gate."""
+    code = body.pairing_code.upper().strip()
+    db.set_config(
+        f"gate:{code}",
+        json.dumps({"disarmed": bool(body.disarmed), "snoozed_until": float(body.snoozed_until or 0)}),
+    )
+    return {"ok": True}
+
+
+@app.post("/v1/recap")
+def set_recap(body: RecapIn, _: None = Depends(rate_limit)) -> dict:
+    """The iOS app saves its Daily Recap schedule here so the relay can send the
+    summary at the chosen local time even when the app is fully closed."""
+    code = body.pairing_code.upper().strip()
+    db.set_config(
+        f"recap:{code}",
+        json.dumps({
+            "enabled": bool(body.enabled),
+            "hour": int(body.hour),
+            "minute": int(body.minute),
+            "tz_offset": int(body.tz_offset),
+        }),
+    )
     return {"ok": True}

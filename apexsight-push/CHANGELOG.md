@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.0
+
+- **Daily Recap with the app closed.** The relay now sends the once-a-day summary
+  itself at your chosen local time, so it arrives even when the app has been closed
+  for hours (background refresh can't be relied on for a fixed time). The app syncs
+  the schedule via `POST /v1/recap`.
+- **Built entirely from MQTT — no Frigate HTTP query, no extra config or auth.** The
+  bridge now also subscribes to `frigate/events` and accumulates the day's activity
+  into the shared DB; the relay summarizes it (events, who was seen, busiest camera,
+  deliveries) and pushes the recap.
+- The in-app local recap now stands down whenever instant push is configured, so the
+  daily summary is never delivered twice.
+
+## 1.2.0
+
+- **Disarm / Snooze now silence app-closed pushes.** The relay honors a per-household
+  gate the iOS app syncs via the new `POST /v1/gate` endpoint: when you Disarm or
+  Snooze (from the app, a widget, Siri or CarPlay) the relay suppresses delivery
+  instead of pushing anyway — matching the in-app behavior. (Changes made while the
+  app is fully closed take effect on the next time you open it.)
+
 ## 1.1.0
 
 - **App-controlled notification style.** The relay now renders title / body / media
