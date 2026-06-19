@@ -7,11 +7,18 @@ configuration:
     description: >-
       Password for the web GUI login. Pick a long one — it protects the page
       where you upload your Apple APNs key.
+  api_token:
+    name: App API token
+    description: >-
+      Shared secret the ApexSight app + bridge use to authenticate to the relay.
+      Leave blank to have the add-on generate one (shown on the web GUI
+      dashboard), or set your own. Anyone with this token can send pushes — keep
+      it private.
   pairing_code:
     name: Pairing code
     description: >-
-      Pre-filled with the shared household code. Leave as-is for a shared-camera
-      setup; it must match the code shown in the app (Settings → Instant Push).
+      Your household code — it must match the code shown in the app
+      (Settings → Instant Push). There is no shared default; set your own.
   frigate_base_url:
     name: Frigate URL (for the snapshot)
     description: >-
@@ -20,6 +27,12 @@ configuration:
   alerts_only:
     name: Alerts only
     description: On = only Frigate "alert" reviews. Off = also send detections.
+  secure_cookies:
+    name: Secure admin cookies
+    description: >-
+      Mark the admin login cookie HTTPS-only. Turn ON if you reach the web GUI
+      only over HTTPS (through your tunnel). Leave OFF if you use the local
+      "OPEN WEB UI" button, which is plain HTTP.
   topic:
     name: MQTT topic
     description: Frigate review topic. Leave as frigate/reviews unless you changed it.

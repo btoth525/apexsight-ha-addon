@@ -12,14 +12,17 @@ APNs **relay** (with a web GUI to upload your Apple `.p8`) **and** the Frigate
 2. Install **ApexSight Push**.
 3. **Configuration** tab:
    - **Admin username / password** — for the web GUI login.
+   - **App API token** — leave blank to auto-generate (shown on the dashboard),
+     or set your own. The app + bridge use it to authenticate to the relay.
    - **Frigate URL** — where your phone can reach Frigate (for the alert image).
-   - **Pairing code** — leave the default (`APEX-PLEX-5250`) for a shared setup;
-     it must match the app's code (Settings → Instant Push).
+   - **Pairing code** — your household code; it must match the app's code
+     (Settings → Instant Push). There is no shared default.
    - MQTT auto-fills from your HA broker.
 4. **Start**. First launch builds Python — watch the **Log** until you see
    `Uvicorn running on http://0.0.0.0:3421` and `connected to MQTT … subscribing`.
 5. Click **OPEN WEB UI** → sign in → **Settings** → upload your `.p8`, paste your
-   **Key ID** + **Team ID** → Save. Dashboard shows **APNs ● Configured**.
+   **Key ID** + **Team ID** → Save. Dashboard shows **APNs ● Configured**, and
+   the **App API token** to copy into the ApexSight app.
 
 ## Make it reachable from the internet
 
@@ -30,8 +33,12 @@ The iOS app talks to the relay, so it needs a public HTTPS hostname. Point your
 - **Path: leave empty.**
 - Public hostname: e.g. `relay.plexserver525.com`.
 
-Then `https://relay.plexserver525.com/healthz` returns JSON, and the app's Instant
-Push screen turns 🟢.
+Then `https://relay.plexserver525.com/healthz` returns `{"ok": true}`, and the
+app's Instant Push screen turns 🟢.
+
+> **Don't** also port-forward `3421` on your router — reach the relay *only*
+> through the tunnel. See [`../SECURITY.md`](../SECURITY.md) for why, plus how to
+> put Cloudflare Access in front of the admin page.
 
 ### Changing the port
 
@@ -41,8 +48,9 @@ tunnel target should use that same host port.
 
 ## Notes
 
-- Your `.p8`, Key ID and Team ID live only in the add-on's persistent `/data`
-  volume (uploaded via the GUI) — never in this repo.
-- The bridge posts to the relay locally (`127.0.0.1:3421`); the web GUI login is
-  brute-force protected.
+- Your `.p8`, Key ID, Team ID and the API token live only in the add-on's
+  persistent `/data` volume — never in this repo.
+- The public `/v1` API requires the **App API token** (`Authorization: Bearer`);
+  it fails closed without it. The bridge posts locally (`127.0.0.1:3421`) with
+  the same token; the web GUI login is brute-force protected.
 - Builds for `aarch64` (Pi 4/5, most HA OS) and `amd64` (NUC/x86).

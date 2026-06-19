@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.3.0"
+version: "1.4.0"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -19,12 +19,16 @@ ports_description:
   "3421/tcp": Relay API + web GUI — point your Cloudflare Tunnel / proxy at this host port
 # "OPEN WEB UI" button → the admin page on the mapped host port.
 webui: "http://[HOST]:[PORT:3421]/admin"
+# Let the Supervisor restart the add-on if the relay stops answering.
+watchdog: "http://[HOST]:[PORT:3421]/healthz"
 options:
   admin_username: admin
   admin_password: ""
-  pairing_code: "APEX-PLEX-5250"
+  api_token: ""
+  pairing_code: ""
   frigate_base_url: ""
   alerts_only: true
+  secure_cookies: false
   topic: "frigate/reviews"
   mqtt_host: ""
   mqtt_port: 0
@@ -33,9 +37,11 @@ options:
 schema:
   admin_username: str
   admin_password: password
+  api_token: password?
   pairing_code: "match(^APEX-[A-Z0-9]{4}-[A-Z0-9]{4}$)"
   frigate_base_url: url?
   alerts_only: bool
+  secure_cookies: bool
   topic: str
   mqtt_host: str?
   mqtt_port: int?

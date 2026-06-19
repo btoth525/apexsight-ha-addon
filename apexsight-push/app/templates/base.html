@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ApexSight Push Relay</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <script src="/static/app.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -16,7 +17,9 @@
       <a href="/admin">Dashboard</a>
       <a href="/admin/settings">Settings</a>
       <a href="/admin/devices">Devices</a>
-      <a href="/admin/logout" class="muted">Sign out</a>
+      <form method="post" action="/admin/logout" class="logout-form">
+        <button type="submit" class="linkbtn muted">Sign out</button>
+      </form>
     </nav>
     {% endif %}
   </header>

@@ -25,6 +25,7 @@ import paho.mqtt.client as mqtt
 import requests
 
 RELAY_URL = os.environ.get("RELAY_URL", "").rstrip("/")
+RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "")
 PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 FRIGATE_BASE_URL = os.environ.get("FRIGATE_BASE_URL", "").rstrip("/")
 TOPIC = os.environ.get("TOPIC", "frigate/reviews")
@@ -220,10 +221,11 @@ def _post_to_relay(payload: dict, stage: str, attempts: int = 3) -> None:
     Relay 2xx/4xx are final answers (don't hammer); only 5xx and network errors
     are retried.
     """
+    headers = {"Authorization": f"Bearer {RELAY_TOKEN}"} if RELAY_TOKEN else {}
     delay = 1.0
     for attempt in range(1, attempts + 1):
         try:
-            r = requests.post(f"{RELAY_URL}/v1/notify", json=payload, timeout=10)
+            r = requests.post(f"{RELAY_URL}/v1/notify", json=payload, headers=headers, timeout=10)
             log(f"forwarded review {payload['review_id']} [{stage}] → {r.status_code} {r.text[:120]}")
             if r.status_code < 500:
                 return

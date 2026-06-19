@@ -24,6 +24,21 @@
 </div>
 
 <div class="card">
+  <h2>App API token</h2>
+  <p class="muted">Paste this into the ApexSight app (Settings → Instant Push) so it can
+    talk to the relay. Treat it like a password — anyone with it can send pushes.</p>
+  {% if api_token %}
+    <div class="tokenrow">
+      <code class="token" id="apitoken">{{ api_token }}</code>
+      <button type="button" class="small" data-copy="{{ api_token }}">Copy</button>
+    </div>
+  {% else %}
+    <p class="err">● No token configured — set <code>api_token</code> in the add-on options
+      (or let the add-on generate one) and restart.</p>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Send a test push</h2>
   <p class="muted">Enter a pairing code shown in the app (Settings → Instant Push) to verify delivery.</p>
   <form method="post" action="/admin/test" class="row">

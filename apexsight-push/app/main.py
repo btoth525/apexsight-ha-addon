@@ -11,6 +11,7 @@ Admin web GUI (browser, password-protected): mounted at /admin — upload the
 """
 import asyncio
 import datetime
+import hmac
 import json
 import os
 import time
@@ -23,18 +24,56 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, config, db, recap, render
+from . import apns, config, db, net, recap, render
 from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
 PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 
 app = FastAPI(title="ApexSight Push Relay", docs_url=None, redoc_url=None)
-app.add_middleware(SessionMiddleware, secret_key=config.session_secret(), https_only=False)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=config.session_secret(),
+    https_only=config.COOKIE_SECURE,
+    same_site="lax",
+)
 
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 app.include_router(admin_router)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Conservative security headers + a strict CSP for the admin GUI."""
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; form-action 'self'; base-uri 'none'; "
+        "frame-ancestors 'none'",
+    )
+    return resp
+
+
+def require_api_token(request: Request) -> None:
+    """Gate the public /v1 API behind the shared bearer token.
+
+    Fails closed: if no token is configured the API is disabled entirely rather
+    than silently accepting anyone who knows a pairing code.
+    """
+    if not config.API_TOKEN:
+        raise HTTPException(status_code=503, detail="relay API token not configured")
+    auth = request.headers.get("authorization", "")
+    if auth[:7].lower() == "bearer ":
+        provided = auth[7:].strip()
+    else:
+        provided = request.headers.get("x-apex-token", "").strip()
+    if not provided or not hmac.compare_digest(provided, config.API_TOKEN):
+        raise HTTPException(status_code=401, detail="invalid or missing API token")
 
 
 @app.on_event("startup")
@@ -99,7 +138,7 @@ _hits: dict[str, deque] = defaultdict(deque)
 
 
 def rate_limit(request: Request) -> None:
-    ip = request.client.host if request.client else "unknown"
+    ip = net.client_ip(request)
     now = time.time()
     window = _hits[ip]
     while window and now - window[0] > 60:
@@ -178,6 +217,13 @@ class RecapIn(BaseModel):
 
 @app.get("/healthz")
 def healthz() -> dict:
+    """Public liveness probe — intentionally leaks nothing about configuration."""
+    return {"ok": True}
+
+
+@app.get("/v1/status")
+def status(_: None = Depends(require_api_token)) -> dict:
+    """Authenticated status for the app (APNs readiness + device count)."""
     return {"ok": True, "apns_configured": apns.is_configured(), "devices": db.device_count()}
 
 
@@ -187,20 +233,20 @@ def root() -> RedirectResponse:
 
 
 @app.post("/v1/register")
-def register(body: RegisterIn, _: None = Depends(rate_limit)) -> dict:
+def register(body: RegisterIn, _: None = Depends(rate_limit), __: None = Depends(require_api_token)) -> dict:
     env = body.environment if body.environment in ("production", "sandbox") else "production"
     db.upsert_device(body.device_token, body.pairing_code.upper().strip(), env, body.platform)
     return {"ok": True, "pairing_code": body.pairing_code.upper().strip()}
 
 
 @app.post("/v1/unregister")
-def unregister(body: UnregisterIn, _: None = Depends(rate_limit)) -> dict:
+def unregister(body: UnregisterIn, _: None = Depends(rate_limit), __: None = Depends(require_api_token)) -> dict:
     db.delete_device(body.device_token)
     return {"ok": True}
 
 
 @app.post("/v1/test")
-async def test_push(body: TestIn, _: None = Depends(rate_limit)) -> dict:
+async def test_push(body: TestIn, _: None = Depends(rate_limit), __: None = Depends(require_api_token)) -> dict:
     """Send a test push to one device token — powers the in-app Test button."""
     if not apns.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured on relay")
@@ -219,7 +265,7 @@ async def test_push(body: TestIn, _: None = Depends(rate_limit)) -> dict:
 
 
 @app.post("/v1/notify")
-async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
+async def notify(body: NotifyIn, _: None = Depends(rate_limit), __: None = Depends(require_api_token)) -> dict:
     if not apns.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured on relay")
     code = body.pairing_code.upper().strip()
@@ -293,7 +339,7 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
 
 
 @app.post("/v1/style")
-def set_style(body: StyleIn, _: None = Depends(rate_limit)) -> dict:
+def set_style(body: StyleIn, _: None = Depends(rate_limit), __: None = Depends(require_api_token)) -> dict:
     """The iOS app saves its notification style here, keyed by pairing code, so the
     relay can render app-closed pushes the way the user configured in the GUI."""
     code = body.pairing_code.upper().strip()
@@ -302,7 +348,7 @@ def set_style(body: StyleIn, _: None = Depends(rate_limit)) -> dict:
 
 
 @app.post("/v1/gate")
-def set_gate(body: GateIn, _: None = Depends(rate_limit)) -> dict:
+def set_gate(body: GateIn, _: None = Depends(rate_limit), __: None = Depends(require_api_token)) -> dict:
     """The iOS app mirrors its Disarm / Snooze state here so app-closed pushes are
     suppressed while disarmed or snoozed, matching the in-app delivery gate."""
     code = body.pairing_code.upper().strip()
@@ -314,7 +360,7 @@ def set_gate(body: GateIn, _: None = Depends(rate_limit)) -> dict:
 
 
 @app.post("/v1/recap")
-def set_recap(body: RecapIn, _: None = Depends(rate_limit)) -> dict:
+def set_recap(body: RecapIn, _: None = Depends(rate_limit), __: None = Depends(require_api_token)) -> dict:
     """The iOS app saves its Daily Recap schedule here so the relay can send the
     summary at the chosen local time even when the app is fully closed."""
     code = body.pairing_code.upper().strip()

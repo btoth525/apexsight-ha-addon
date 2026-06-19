@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0 — security hardening
+
+- **The public `/v1` API now requires a bearer token.** Every call (register,
+  notify, gate, style, recap, test, unregister, status) must present a shared
+  `Authorization: Bearer <token>`. Previously anyone who knew the pairing code
+  could push arbitrary notifications or **disarm your alerts** via `/v1/gate`.
+  The token is set in the add-on options (`api_token`) or auto-generated and
+  shown on the web GUI dashboard — paste it into the ApexSight app.
+- **No more shared default pairing code.** `pairing_code` is now empty by
+  default and must be set to your own household code.
+- **Real per-client rate limiting** behind a tunnel (was effectively global),
+  and the admin login lockout uses the same real-client-IP logic.
+- **Admin GUI hardening:** strict Content-Security-Policy + `X-Frame-Options`,
+  `X-Content-Type-Options`, `Referrer-Policy`; optional Secure session cookie
+  (`secure_cookies`); logout is now POST-only (no drive-by logout).
+- **`/healthz` no longer leaks** APNs/configuration state — that moved to the
+  authenticated `/v1/status`. Added a Supervisor `watchdog` on `/healthz`.
+- See `SECURITY.md` for the threat model and how to expose the relay safely.
+
 ## 1.3.0
 
 - **Daily Recap with the app closed.** The relay now sends the once-a-day summary

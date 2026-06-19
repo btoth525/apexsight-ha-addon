@@ -2,9 +2,29 @@
 # All-in-one: runs the relay (uvicorn) AND the Frigate bridge in one container.
 # The bridge posts to the relay locally on 127.0.0.1:3421.
 
+# ---- shared API token -------------------------------------------------------
+# Every public /v1 call (from the iOS app + the local bridge) must present this
+# bearer token, so the relay is not controllable by anyone who merely knows the
+# pairing code. Use the value from the add-on options if set; otherwise generate
+# one once and persist it to /data so it is stable across restarts.
+API_TOKEN="$(bashio::config 'api_token')"
+TOKEN_FILE="/data/api.token"
+if [ -z "${API_TOKEN}" ]; then
+  if [ -f "${TOKEN_FILE}" ]; then
+    API_TOKEN="$(cat "${TOKEN_FILE}")"
+  else
+    API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    printf '%s' "${API_TOKEN}" > "${TOKEN_FILE}"
+    chmod 600 "${TOKEN_FILE}"
+    bashio::log.info "Generated a relay API token — copy it from the web GUI dashboard into the ApexSight app."
+  fi
+fi
+
 # ---- relay env --------------------------------------------------------------
 export APEX_ADMIN_USERNAME="$(bashio::config 'admin_username')"
 export APEX_ADMIN_PASSWORD="$(bashio::config 'admin_password')"
+export APEX_API_TOKEN="${API_TOKEN}"
+export APEX_COOKIE_SECURE="$(bashio::config 'secure_cookies')"
 export APEX_PORT="3421"
 export APEX_DATA_DIR="/data"
 export APEX_TEAM_ID="3Q9ZUDN4QZ"
@@ -12,6 +32,7 @@ export APEX_BUNDLE_ID="com.brandontoth.apexsight.native"
 
 # ---- bridge env -------------------------------------------------------------
 export RELAY_URL="http://127.0.0.1:3421"
+export RELAY_TOKEN="${API_TOKEN}"
 export PAIRING_CODE="$(bashio::config 'pairing_code')"
 export FRIGATE_BASE_URL="$(bashio::config 'frigate_base_url')"
 export TOPIC="$(bashio::config 'topic')"

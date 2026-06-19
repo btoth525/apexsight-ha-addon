@@ -14,10 +14,13 @@ Published at **https://github.com/btoth525/apexsight-ha-addon**.
 
 1. HA → **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add the URL above.
 2. Install **ApexSight Push**.
-3. **Configuration** → set admin username/password, your Frigate URL, leave the
-   pairing code default. **Start**.
+3. **Configuration** → set admin username/password, your Frigate URL, and your
+   **pairing code** (must match the app — there is no shared default). Leave
+   `api_token` blank to auto-generate one. **Start**.
 4. **OPEN WEB UI** → sign in → **Settings** → upload your `.p8` + Key/Team IDs.
+   Copy the **App API token** from the dashboard into the ApexSight app.
 5. Point a Cloudflare Tunnel / reverse proxy at `http://<HA-ip>:3421` (path empty).
+   Don't port-forward `3421` directly — see [`SECURITY.md`](SECURITY.md).
 
 Full details in `apexsight-push/README.md`.
 

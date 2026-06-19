@@ -14,7 +14,7 @@ from fastapi import APIRouter, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import apns, config, db
+from . import apns, config, db, net
 
 router = APIRouter(prefix="/admin")
 _templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
@@ -27,18 +27,6 @@ FAIL_WINDOW = 15 * 60
 LOCKOUT = 15 * 60
 _fails: dict[str, deque] = defaultdict(deque)
 _locked_until: dict[str, float] = {}
-
-
-def _client_ip(request: Request) -> str:
-    # Behind a tunnel/proxy the socket peer is the proxy, so prefer the real
-    # client IP from the standard forwarding headers.
-    cf = request.headers.get("cf-connecting-ip")
-    if cf:
-        return cf.strip()
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
 
 
 def _lock_remaining(ip: str) -> int:
@@ -94,7 +82,7 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     if not config.ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="Admin UI disabled: set APEX_ADMIN_PASSWORD.")
 
-    ip = _client_ip(request)
+    ip = net.client_ip(request)
     remaining = _lock_remaining(ip)
     if remaining > 0:
         return _templates.TemplateResponse(
@@ -117,7 +105,7 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     )
 
 
-@router.get("/logout")
+@router.post("/logout")
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse(url="/admin/login", status_code=303)
@@ -133,6 +121,7 @@ def dashboard(request: Request):
             "settings": _settings(),
             "configured": apns.is_configured(),
             "device_count": db.device_count(),
+            "api_token": config.API_TOKEN,
             "flash": request.session.pop("flash", None),
         },
     )

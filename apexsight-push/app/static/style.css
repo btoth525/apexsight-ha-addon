@@ -59,6 +59,15 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .row { display: flex; gap: 10px; align-items: stretch; }
 .row input { margin-top: 0; }
 
+nav .logout-form { display: inline; margin: 0; }
+.linkbtn { background: none; border: none; padding: 0; margin-left: 18px;
+  font: inherit; font-weight: 600; color: var(--text); cursor: pointer; }
+.linkbtn:hover { color: var(--cyan); }
+
+.tokenrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.token { display: inline-block; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 12px; word-break: break-all; font-size: 13px; }
+
 .flash { background: rgba(53,208,224,.12); border: 1px solid var(--cyan);
   color: var(--cyan); padding: 11px 15px; border-radius: 12px; margin-bottom: 18px; font-weight: 700; }
 .err { background: rgba(255,93,108,.12); border: 1px solid var(--red); color: var(--red);

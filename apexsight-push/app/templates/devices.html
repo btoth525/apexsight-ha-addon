@@ -18,7 +18,7 @@
         <td>{{ r['environment'] }}</td>
         <td>{{ r['platform'] or 'ios' }}</td>
         <td>
-          <form method="post" action="/admin/devices/delete" onsubmit="return confirm('Remove this device?')">
+          <form method="post" action="/admin/devices/delete" data-confirm="Remove this device?">
             <input type="hidden" name="device_token" value="{{ r['device_token'] }}" />
             <button type="submit" class="danger small">Remove</button>
           </form>
