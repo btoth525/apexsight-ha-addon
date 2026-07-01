@@ -48,6 +48,39 @@ MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 _notified: dict[str, dict[str, float]] = {}
 _NOTIFIED_TTL = 3600
 
+# HomeKit-style AI-description follow-up: Frigate writes a GenAI description a few seconds AFTER the
+# event (published on `frigate/tracked_object_update`). Send the instant alert first, then a
+# follow-up that REPLACES it in place (shared collapse id) once the description lands. The relay
+# enforces the household's per-camera opt-out (synced from the app).
+DESC_TOPIC = os.environ.get("DESC_TOPIC", "frigate/tracked_object_update")
+AI_DESCRIPTIONS = os.environ.get("AI_DESCRIPTIONS", "true").lower() in ("true", "1", "yes")
+
+# tracked-object (detection) id -> {review_id, title, camera, apex_url, media, _t} from the alert,
+# so a later description update can be matched back to the same notification.
+_pending: dict[str, dict] = {}
+_described: dict[str, float] = {}
+_PENDING_TTL = 900
+
+
+def _concise(desc: str, limit: int = 180) -> str:
+    """Trim a verbose GenAI paragraph to a notification-friendly first sentence."""
+    desc = " ".join((desc or "").split())
+    if not desc:
+        return ""
+    for sep in (". ", "! ", "? "):
+        i = desc.find(sep)
+        if 0 < i <= limit:
+            return desc[: i + 1]
+    return desc if len(desc) <= limit else desc[: limit - 1].rstrip() + "\u2026"
+
+
+def _prune_pending() -> None:
+    now = time.time()
+    for k in [k for k, v in list(_pending.items()) if now - v.get("_t", 0) > _PENDING_TTL]:
+        _pending.pop(k, None)
+    for k in [k for k, t in list(_described.items()) if now - t > _PENDING_TTL]:
+        _described.pop(k, None)
+
 
 def log(*a):
     print("[bridge]", *a, file=sys.stdout, flush=True)
@@ -174,6 +207,19 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
         else:
             payload["snapshot_url"] = cropped
             payload["thumbnail_url"] = full_snapshot
+        if AI_DESCRIPTIONS and not final:
+            _prune_pending()
+            record = {
+                "review_id": review_id,
+                "title": title,
+                "camera": camera,
+                "apex_url": payload["apex_url"],
+                "snapshot_url": gif,
+                "thumbnail_url": cropped,
+                "_t": time.time(),
+            }
+            for _d in detections:
+                _pending[_d] = record
     return payload
 
 
@@ -240,8 +286,45 @@ def on_connect(client, userdata, flags, rc, properties=None):
         log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}, subscribing {TOPIC} + {EVENTS_TOPIC}")
         client.subscribe(TOPIC)
         client.subscribe(EVENTS_TOPIC)
+        if AI_DESCRIPTIONS:
+            client.subscribe(DESC_TOPIC)
+            log(f"subscribing {DESC_TOPIC} for AI descriptions")
     else:
         log(f"MQTT connect failed rc={rc}")
+
+
+def _handle_description(event: dict) -> None:
+    """A GenAI description landed for a tracked object — send a follow-up that replaces the
+    original alert with the description. The relay applies the household's per-camera choice."""
+    if event.get("type") != "description":
+        return
+    eid = event.get("id")
+    desc = _concise(event.get("description", ""))
+    if not eid or not desc:
+        return
+    rec = _pending.get(eid)
+    if not rec:
+        return  # no recent alert for this object
+    now = time.time()
+    if eid in _described and now - _described[eid] < _PENDING_TTL:
+        return
+    _described[eid] = now
+    payload = {
+        "pairing_code": PAIRING_CODE,
+        "title": rec["title"],
+        "body": desc,
+        "camera": rec["camera"],
+        "review_id": rec["review_id"],
+        "apex_url": rec.get("apex_url", ""),
+        "collapse_id": rec["review_id"],   # replace the original alert in place
+        "is_description": True,            # relay honors the per-camera opt-out
+        "silent": True,                    # update quietly (no second buzz)
+    }
+    if rec.get("snapshot_url"):
+        payload["snapshot_url"] = rec["snapshot_url"]
+    if rec.get("thumbnail_url"):
+        payload["thumbnail_url"] = rec["thumbnail_url"]
+    _post_to_relay(payload, "description")
 
 
 def on_message(client, userdata, msg):
@@ -249,6 +332,9 @@ def on_message(client, userdata, msg):
         event = json.loads(msg.payload.decode("utf-8"))
     except Exception as exc:
         log("bad payload:", exc)
+        return
+    if AI_DESCRIPTIONS and msg.topic == DESC_TOPIC:
+        _handle_description(event)
         return
     after = event.get("after") or event.get("before") or {}
     # The events topic only feeds the daily-recap tally, not notifications.

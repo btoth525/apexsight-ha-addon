@@ -140,6 +140,7 @@ class NotifyIn(BaseModel):
     frigate_token: str = ""
     collapse_id: str = ""
     silent: bool = False
+    is_description: bool = False   # follow-up carrying the GenAI description; obeys per-camera opt-out
     # Raw event fields — when present the relay renders title/body/media itself
     # using the household's saved style (set via /v1/style), so the in-app GUI
     # controls even app-closed notifications.
@@ -153,6 +154,11 @@ class NotifyIn(BaseModel):
     frigate_base_url: str = ""
     recognized_license_plate: str = ""
     stage: str = ""
+
+
+class AICamerasIn(BaseModel):
+    pairing_code: str
+    disabled: list[str] = []   # cameras the user turned AI descriptions OFF for (default: all on)
 
 
 class StyleIn(BaseModel):
@@ -242,6 +248,17 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         if snoozed_until and time.time() < float(snoozed_until):
             return {"ok": True, "sent": 0, "note": "snoozed"}
 
+    # Per-camera choice (synced from the app): skip AI-description follow-ups for disabled cameras.
+    if body.is_description and body.camera:
+        raw = db.get_config(f"ai_desc_disabled:{code}", "")
+        if raw:
+            try:
+                disabled = set(json.loads(raw))
+            except Exception:
+                disabled = set()
+            if body.camera in disabled:
+                return {"ok": True, "sent": 0, "note": "ai description disabled for camera"}
+
     title, text = body.title, body.body
     snapshot_url, thumbnail_url = body.snapshot_url, body.thumbnail_url
 
@@ -290,6 +307,14 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     )
     result = await apns.deliver_to_pairing(code, payload, collapse_id=body.collapse_id)
     return {"ok": result["sent"] > 0 or result["devices"] == 0, **result}
+
+
+@app.post("/v1/ai-cameras")
+def ai_cameras(body: AICamerasIn, _: None = Depends(rate_limit)) -> dict:
+    """The app syncs which cameras have AI descriptions in notifications turned OFF, per household."""
+    code = body.pairing_code.upper().strip()
+    db.set_config(f"ai_desc_disabled:{code}", json.dumps(sorted(set(body.disabled))))
+    return {"ok": True, "disabled": sorted(set(body.disabled))}
 
 
 @app.post("/v1/style")
