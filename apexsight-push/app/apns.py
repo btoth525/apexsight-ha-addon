@@ -122,6 +122,7 @@ def build_payload(
     snapshot_path: str = "",
     frigate_token: str = "",
     silent: bool = False,
+    announce: bool = False,
 ) -> dict:
     """Build the APNs payload the ApexSight NotificationService extension expects.
 
@@ -140,6 +141,10 @@ def build_payload(
     }
     if silent:
         aps["interruption-level"] = "passive"
+    elif announce:
+        # Announce-able (read aloud by iOS "Announce Notifications" in CarPlay/AirPods) but no
+        # second buzz — used for the AI-description follow-up.
+        aps["interruption-level"] = "time-sensitive"
     else:
         aps["sound"] = "default"
     if camera:

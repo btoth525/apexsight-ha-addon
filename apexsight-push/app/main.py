@@ -141,6 +141,7 @@ class NotifyIn(BaseModel):
     collapse_id: str = ""
     silent: bool = False
     is_description: bool = False   # follow-up carrying the GenAI description; obeys per-camera opt-out
+    announce: bool = False   # read aloud via iOS Announce Notifications (CarPlay), no second buzz
     # Raw event fields — when present the relay renders title/body/media itself
     # using the household's saved style (set via /v1/style), so the in-app GUI
     # controls even app-closed notifications.
@@ -304,6 +305,7 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         snapshot_path=body.snapshot_path,
         frigate_token=body.frigate_token,
         silent=body.silent,
+        announce=body.announce,
     )
     result = await apns.deliver_to_pairing(code, payload, collapse_id=body.collapse_id)
     return {"ok": result["sent"] > 0 or result["devices"] == 0, **result}

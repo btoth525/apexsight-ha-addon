@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.4.0"
+version: "1.4.1"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push

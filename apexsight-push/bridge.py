@@ -318,7 +318,7 @@ def _handle_description(event: dict) -> None:
         "apex_url": rec.get("apex_url", ""),
         "collapse_id": rec["review_id"],   # replace the original alert in place
         "is_description": True,            # relay honors the per-camera opt-out
-        "silent": True,                    # update quietly (no second buzz)
+        "announce": True,                  # read aloud in CarPlay (no second buzz)
     }
     if rec.get("snapshot_url"):
         payload["snapshot_url"] = rec["snapshot_url"]
