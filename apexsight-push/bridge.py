@@ -137,6 +137,32 @@ def _titleize(s: str) -> str:
     return s.replace("_", " ").title() if s else s
 
 
+def _epoch(eid: str) -> float:
+    """Start epoch baked into a Frigate event id (`1783198550.714144-xxxx`)."""
+    try:
+        return float(eid.split("-")[0])
+    except (ValueError, IndexError):
+        return float("inf")
+
+
+def _primary_detection(data: dict) -> str | None:
+    """The detection whose moment matches the review's canonical thumbnail (`thumb_time`).
+    Frigate re-links long-lived parked tracks into fresh reviews, so `detections[0]` (raw MQTT
+    order) is frequently the WRONG moment — the "wrong snapshot on the notification" bug. Mirror
+    of the iOS app's FrigateClient.primaryDetectionID: the latest detection starting at/just
+    before thumb_time; nearest, then earliest, as fallbacks."""
+    dets = data.get("detections", []) or []
+    if not dets:
+        return None
+    tt = data.get("thumb_time")
+    if tt is not None:
+        at_or_before = [d for d in dets if _epoch(d) <= tt + 1]
+        if at_or_before:
+            return max(at_or_before, key=_epoch)
+        return min(dets, key=lambda d: abs(_epoch(d) - tt))
+    return min(dets, key=_epoch)
+
+
 def _build_alert(after: dict, final: bool = False) -> dict | None:
     review_id = after.get("id")
     camera = after.get("camera", "")
@@ -151,6 +177,7 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
     sublabels = [s for s in (data.get("sub_labels", []) or []) if s]
     zones = data.get("zones", []) or []
     detections = data.get("detections", []) or []
+    det = _primary_detection(data)   # the detection at the review's thumbnail moment
 
     obj = objects[0] if objects else "motion"
     emoji = LABEL_EMOJI.get(obj, "\U0001f4f9")
@@ -189,15 +216,14 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
     plate = data.get("recognized_license_plate") or ""
     if plate:
         payload["recognized_license_plate"] = plate
-    if detections:
-        payload["detection_id"] = detections[0]
+    if det:
+        payload["detection_id"] = det
     # Rich media, two-stage (matches the SgtBatten blueprint feel):
     #   • instant alert  → a tight CROPPED snapshot (bbox) that reads great on the
     #     lock screen the moment the event starts;
     #   • final update   → the now-complete animated GIF, swapped in place via the
     #     shared collapse id (no duplicate notification).
-    if FRIGATE_BASE_URL and detections:
-        det = detections[0]
+    if FRIGATE_BASE_URL and det:
         cropped = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg?bbox=1&crop=1"
         gif = f"{FRIGATE_BASE_URL}/api/events/{det}/preview.gif"
         full_snapshot = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg"
@@ -238,11 +264,17 @@ def _stages_to_send(after: dict, msg_type: str) -> list[str]:
         _notified.pop(k, None)
     sent = _notified.get(review_id, {})
     detections = (after.get("data", {}) or {}).get("detections", []) or []
+    severity = after.get("severity", "")
 
     stages: list[str] = []
     # Instant alert as soon as there's a detection (so we have a GIF), or at the
-    # very latest when the review ends.
-    if "alert" not in sent and (detections or msg_type == "end"):
+    # very latest when the review ends. With ALERTS_ONLY, gate on "alert" severity to
+    # match _build_alert's own filter: otherwise a review first seen as a plain
+    # "detection" would get its "alert" stage stamped as sent below while _build_alert
+    # posts nothing — and when it LATER escalates to "alert", it'd be deduped and the
+    # real alert silently dropped (a missed alert).
+    alert_allowed = (not ALERTS_ONLY) or severity == "alert"
+    if "alert" not in sent and alert_allowed and (detections or msg_type == "end"):
         stages.append("alert")
     # A separate "final" update only makes sense if the instant alert already went
     # out *earlier*, while the event was still in progress — only then is its GIF

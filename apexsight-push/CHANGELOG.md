@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.2
+
+- **Correct snapshot/GIF on notifications.** The bridge picked `detections[0]` (raw MQTT
+  order) for the notification image, which on a multi-detection review is frequently the
+  wrong moment — Frigate re-links long-lived parked-car tracks into fresh reviews. It now
+  selects the detection at the review's canonical thumbnail moment (`thumb_time`), matching
+  the iOS app's own selection. Verified against live reviews (e.g. a 16-detection review went
+  from 32s off to 1s off).
+- **Per-camera notification mute now works with the app closed.** New `POST /v1/muted-cameras`
+  lets the app sync which cameras have notifications turned OFF; the relay suppresses pushes for
+  those cameras at delivery time. Previously the per-camera toggle only gated foreground
+  delivery, so a disabled camera still buzzed when the app was closed.
+- **Fixed a dropped-alert on escalation.** A review first seen as a plain `detection` had its
+  alert stage marked "already sent" while `alerts_only` posted nothing — so when it later
+  escalated to `alert`, the real alert was deduped and never delivered. The alert stage is now
+  gated on `alert` severity (under `alerts_only`), matching the delivery filter.
+
 ## 1.3.0
 
 - **Daily Recap with the app closed.** The relay now sends the once-a-day summary

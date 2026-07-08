@@ -162,6 +162,11 @@ class AICamerasIn(BaseModel):
     disabled: list[str] = []   # cameras the user turned AI descriptions OFF for (default: all on)
 
 
+class MutedCamerasIn(BaseModel):
+    pairing_code: str
+    muted: list[str] = []   # cameras the user turned notifications OFF for entirely (default: all on)
+
+
 class StyleIn(BaseModel):
     pairing_code: str
     style: dict
@@ -249,6 +254,19 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         if snoozed_until and time.time() < float(snoozed_until):
             return {"ok": True, "sent": 0, "note": "snoozed"}
 
+    # Per-camera mute (synced from the app's per-camera notification toggle): a camera the user
+    # switched OFF gets no push at all, app-closed included. The in-app toggle otherwise only
+    # gates foreground delivery, so a closed-app push for a muted camera would slip through.
+    if body.camera:
+        raw = db.get_config(f"muted_cameras:{code}", "")
+        if raw:
+            try:
+                muted = set(json.loads(raw))
+            except Exception:
+                muted = set()
+            if body.camera in muted:
+                return {"ok": True, "sent": 0, "note": "camera muted"}
+
     # Per-camera choice (synced from the app): skip AI-description follow-ups for disabled cameras.
     if body.is_description and body.camera:
         raw = db.get_config(f"ai_desc_disabled:{code}", "")
@@ -317,6 +335,16 @@ def ai_cameras(body: AICamerasIn, _: None = Depends(rate_limit)) -> dict:
     code = body.pairing_code.upper().strip()
     db.set_config(f"ai_desc_disabled:{code}", json.dumps(sorted(set(body.disabled))))
     return {"ok": True, "disabled": sorted(set(body.disabled))}
+
+
+@app.post("/v1/muted-cameras")
+def muted_cameras(body: MutedCamerasIn, _: None = Depends(rate_limit)) -> dict:
+    """The app syncs which cameras have notifications turned OFF entirely, per household, so
+    app-closed pushes for a muted camera are suppressed at the relay (the in-app per-camera
+    toggle otherwise only gates foreground delivery)."""
+    code = body.pairing_code.upper().strip()
+    db.set_config(f"muted_cameras:{code}", json.dumps(sorted(set(body.muted))))
+    return {"ok": True, "muted": sorted(set(body.muted))}
 
 
 @app.post("/v1/style")
