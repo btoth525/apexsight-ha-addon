@@ -26,6 +26,7 @@ def init() -> None:
                 pairing_code TEXT NOT NULL,
                 environment  TEXT NOT NULL DEFAULT 'production',
                 platform     TEXT,
+                device_name  TEXT,
                 updated_at   INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_devices_pairing ON devices(pairing_code);
@@ -41,6 +42,12 @@ def init() -> None:
             CREATE INDEX IF NOT EXISTS idx_recap_ts ON recap_events(pairing_code, ts);
             """
         )
+        # Migration for DBs created before device_name existed (v1.7.0). ADD COLUMN is a
+        # no-op on fresh installs (CREATE TABLE already has it), so swallow the dupe error.
+        try:
+            c.execute("ALTER TABLE devices ADD COLUMN device_name TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 
 @contextmanager
@@ -78,17 +85,37 @@ def all_config() -> dict:
 
 # ---- devices ----------------------------------------------------------------
 
-def upsert_device(device_token: str, pairing_code: str, environment: str, platform: str = "") -> None:
+def upsert_device(
+    device_token: str,
+    pairing_code: str,
+    environment: str,
+    platform: str = "",
+    device_name: str = "",
+) -> None:
     with _conn() as c:
         c.execute(
-            "INSERT INTO devices(device_token, pairing_code, environment, platform, updated_at) "
-            "VALUES(?, ?, ?, ?, ?) "
+            "INSERT INTO devices(device_token, pairing_code, environment, platform, device_name, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(device_token) DO UPDATE SET "
             "  pairing_code = excluded.pairing_code, "
             "  environment  = excluded.environment, "
             "  platform     = excluded.platform, "
+            # Preserve an existing name when this upsert carries none (e.g. a token
+            # refresh re-registers before the app re-syncs the user-set name).
+            "  device_name  = COALESCE(NULLIF(excluded.device_name, ''), devices.device_name), "
             "  updated_at   = excluded.updated_at",
-            (device_token, pairing_code, environment, platform, int(time.time())),
+            (device_token, pairing_code, environment, platform, device_name, int(time.time())),
+        )
+
+
+def set_device_name(device_token: str, device_name: str) -> None:
+    """Update only the phone's display name (+ last-seen) for an already-registered device.
+    Touches nothing else — so a name refresh from the foreground sync can never clobber the
+    device's environment/pairing (that would break APNs delivery)."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE devices SET device_name = ?, updated_at = ? WHERE device_token = ?",
+            (device_name, int(time.time()), device_token),
         )
 
 
@@ -109,7 +136,7 @@ def devices_for(pairing_code: str) -> list[sqlite3.Row]:
 def all_devices() -> list[sqlite3.Row]:
     with _conn() as c:
         return c.execute(
-            "SELECT device_token, pairing_code, environment, platform, updated_at "
+            "SELECT device_token, pairing_code, environment, platform, device_name, updated_at "
             "FROM devices ORDER BY updated_at DESC"
         ).fetchall()
 

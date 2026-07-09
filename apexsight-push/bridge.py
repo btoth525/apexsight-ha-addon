@@ -15,10 +15,12 @@ addon options + MQTT service):
   ALERTS_ONLY        "true" → only severity=alert; else also detections
   MQTT_HOST/PORT/USER/PASSWORD
 """
+import datetime
 import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -39,6 +41,16 @@ EVENTS_TOPIC = (TOPIC[: -len("/reviews")] + "/events") if TOPIC.endswith("/revie
 # restart re-reads the current mode immediately.
 MODE_TOPIC = os.environ.get("MODE_TOPIC", "apexsight/mode")
 DB_PATH = os.path.join(os.environ.get("APEX_DATA_DIR", "/data"), "relay.db")
+
+# Per-phone HA entities (v1.7.0). The relay stores each iPhone's user-set name in the shared DB;
+# the bridge (the only process with an MQTT connection) publishes each phone to Home Assistant via
+# MQTT discovery, so the user sees every registered phone by name — the foundation for the
+# "who armed" / arm-from-app automations. Discovery prefix is HA's default unless overridden.
+DISCOVERY_PREFIX = os.environ.get("MQTT_DISCOVERY_PREFIX", "homeassistant")
+PHONE_STATE_PREFIX = "apexsight/phone"
+PHONE_PUBLISH_INTERVAL = int(os.environ.get("PHONE_PUBLISH_INTERVAL", "30") or "30")
+# object_ids we've published discovery for, so a phone that unregisters gets its entity removed.
+_published_phones: set[str] = set()
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or "1883")
@@ -128,6 +140,99 @@ def _record_event(after: dict) -> None:
             conn.commit()
     except Exception as exc:
         log("recap event write failed:", exc)
+
+
+def _phone_slug(token: str) -> str:
+    """Stable, HA-safe object id fragment from a device token (tokens are hex)."""
+    return "".join(ch for ch in token[:16].lower() if ch.isalnum()) or "phone"
+
+
+def _read_devices() -> list[dict]:
+    """Read registered phones from the shared relay DB. Defensive about the device_name column:
+    on a just-migrated DB the bridge may query a hair before the relay's ALTER TABLE lands."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT device_token, pairing_code, environment, platform, device_name, updated_at "
+                    "FROM devices"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = conn.execute(
+                    "SELECT device_token, pairing_code, environment, platform, updated_at FROM devices"
+                ).fetchall()
+            return [dict(r) for r in rows]
+    except Exception as exc:
+        log("device read failed:", exc)
+        return []
+
+
+def _publish_devices(client) -> None:
+    """Reconcile HA MQTT-discovery entities against the current device list. Each phone is a
+    timestamp sensor (its last-seen), named by the user-set device_name, grouped under one
+    'ApexSight Phones' HA device. Retained so entities survive an HA/bridge restart. Phones that
+    have unregistered get their discovery config cleared (empty retained payload = HA removes it)."""
+    devices = _read_devices()
+    current: set[str] = set()
+    for d in devices:
+        token = d.get("device_token") or ""
+        if not token:
+            continue
+        slug = _phone_slug(token)
+        obj = f"apexsight_phone_{slug}"
+        current.add(obj)
+        name = (d.get("device_name") or "").strip() or f"iPhone {slug[:6]}"
+        state_topic = f"{PHONE_STATE_PREFIX}/{slug}/state"
+        attr_topic = f"{PHONE_STATE_PREFIX}/{slug}/attributes"
+
+        if obj not in _published_phones:
+            config = {
+                "name": name,
+                "unique_id": obj,
+                "object_id": obj,
+                "state_topic": state_topic,
+                "json_attributes_topic": attr_topic,
+                "device_class": "timestamp",
+                "icon": "mdi:cellphone-check",
+                "device": {
+                    "identifiers": ["apexsight_phones"],
+                    "name": "ApexSight Phones",
+                    "manufacturer": "ApexSight",
+                    "model": "Push Relay",
+                },
+            }
+            client.publish(f"{DISCOVERY_PREFIX}/sensor/{obj}/config", json.dumps(config), retain=True)
+            _published_phones.add(obj)
+
+        updated = int(d.get("updated_at") or 0)
+        last_seen_iso = datetime.datetime.fromtimestamp(
+            updated or time.time(), tz=datetime.timezone.utc
+        ).isoformat()
+        attrs = {
+            "name": name,
+            "pairing_code": d.get("pairing_code") or "",
+            "environment": d.get("environment") or "",
+            "platform": d.get("platform") or "",
+            "online": (time.time() - updated) < 900 if updated else False,
+        }
+        client.publish(state_topic, last_seen_iso, retain=True)
+        client.publish(attr_topic, json.dumps(attrs), retain=True)
+
+    # Remove entities for phones that unregistered since we last published.
+    for obj in list(_published_phones - current):
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/{obj}/config", "", retain=True)
+        _published_phones.discard(obj)
+
+
+def _device_publisher(client) -> None:
+    """Background loop: keep the per-phone HA entities in sync with the DB every ~30s."""
+    while True:
+        try:
+            _publish_devices(client)
+        except Exception as exc:
+            log("device publish failed:", exc)
+        time.sleep(PHONE_PUBLISH_INTERVAL)
 
 
 LABEL_EMOJI = {
@@ -425,6 +530,10 @@ def main():
         client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     client.on_connect = on_connect
     client.on_message = on_message
+
+    # Publish/refresh the per-phone HA entities in the background (paho's publish is thread-safe and
+    # queues until the socket is up, so this is safe to start before connect + survives reconnects).
+    threading.Thread(target=_device_publisher, args=(client,), daemon=True).start()
 
     while True:
         try:

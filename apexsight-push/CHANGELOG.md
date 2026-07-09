@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.0
+
+- **Every phone shows up in Home Assistant, by name.** Each iPhone paired to the relay is now
+  published to HA as its own entity via MQTT discovery — grouped under one "ApexSight Phones"
+  device, named whatever you set the phone to in the app ("Brandon's iPhone", "Taylor's iPhone").
+  The entity is a last-seen timestamp sensor with the phone's pairing, environment and online
+  status as attributes. This is the foundation for the "who armed" + arm-from-app automations.
+  - The relay stores each device's name (new `device_name` column; migrated in place); the app
+    sends it on register and keeps it fresh on the foreground sync. A name-only refresh never
+    touches the device's APNs environment.
+  - The bridge (the process with the MQTT connection) reconciles the entities against the device
+    list every ~30s, retained, and clears the entity for any phone that unregisters.
+
 ## 1.6.0
 
 - **House mode → camera alerts.** The relay now applies the home's Alarmo mode (Home / Night /

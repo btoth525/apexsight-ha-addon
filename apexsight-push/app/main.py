@@ -116,6 +116,7 @@ class RegisterIn(BaseModel):
     pairing_code: str = Field(min_length=4, max_length=64)
     environment: str = "production"      # "production" | "sandbox"
     platform: str = "ios"
+    device_name: str = ""                # user-set phone name → per-phone HA entity (see bridge)
 
 
 class UnregisterIn(BaseModel):
@@ -170,6 +171,7 @@ class MutedCamerasIn(BaseModel):
 class DevicePrefsIn(BaseModel):
     device_token: str = Field(min_length=8)
     pairing_code: str = ""
+    device_name: str = ""   # optional; keeps the per-phone HA entity name fresh on the 15s foreground sync
     # Soft-only notification prefs for THIS device: cameras_disabled / objects_disabled /
     # zones_disabled / camera_snoozes / quiet_hours{enabled,start,end} / tz_offset / triggers.
     # NEVER disarmed or global snoozed_until — those stay real-time household state (see gate.py).
@@ -217,7 +219,10 @@ def root() -> RedirectResponse:
 @app.post("/v1/register")
 def register(body: RegisterIn, _: None = Depends(rate_limit)) -> dict:
     env = body.environment if body.environment in ("production", "sandbox") else "production"
-    db.upsert_device(body.device_token, body.pairing_code.upper().strip(), env, body.platform)
+    db.upsert_device(
+        body.device_token, body.pairing_code.upper().strip(), env, body.platform,
+        device_name=(body.device_name or "").strip()[:64],
+    )
     return {"ok": True, "pairing_code": body.pairing_code.upper().strip()}
 
 
@@ -409,6 +414,11 @@ def device_prefs(body: DevicePrefsIn, _: None = Depends(rate_limit)) -> dict:
     prefs.pop("disarmed", None)
     prefs.pop("snoozed_until", None)
     db.set_config(f"prefs:{token}", json.dumps(prefs))
+    # Keep the per-phone HA entity name fresh (and bump updated_at → "last seen") without needing a
+    # full re-register. Name-only update — never touches environment/pairing (see db.set_device_name).
+    name = (body.device_name or "").strip()[:64]
+    if name:
+        db.set_device_name(token, name)
     return {"ok": True}
 
 
