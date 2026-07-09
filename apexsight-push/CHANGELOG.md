@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.1
+
+- **Fix: per-phone entities never appeared.** The bridge published each phone's MQTT discovery
+  config exactly once — but that first publish could fire in the split second before the MQTT
+  socket finished connecting, so it was dropped and the entity never showed up. The bridge now
+  publishes only while actually connected, re-publishes the retained discovery every cycle (and
+  once immediately on each connect), so the entities appear promptly and self-heal across any
+  reconnect or broker restart. Logs `published N phone entities to HA`.
+
 ## 1.7.0
 
 - **Every phone shows up in Home Assistant, by name.** Each iPhone paired to the relay is now

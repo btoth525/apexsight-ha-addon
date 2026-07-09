@@ -186,24 +186,27 @@ def _publish_devices(client) -> None:
         state_topic = f"{PHONE_STATE_PREFIX}/{slug}/state"
         attr_topic = f"{PHONE_STATE_PREFIX}/{slug}/attributes"
 
-        if obj not in _published_phones:
-            config = {
-                "name": name,
-                "unique_id": obj,
-                "object_id": obj,
-                "state_topic": state_topic,
-                "json_attributes_topic": attr_topic,
-                "device_class": "timestamp",
-                "icon": "mdi:cellphone-check",
-                "device": {
-                    "identifiers": ["apexsight_phones"],
-                    "name": "ApexSight Phones",
-                    "manufacturer": "ApexSight",
-                    "model": "Push Relay",
-                },
-            }
-            client.publish(f"{DISCOVERY_PREFIX}/sensor/{obj}/config", json.dumps(config), retain=True)
-            _published_phones.add(obj)
+        # Re-publish the retained discovery config every cycle (idempotent — HA dedupes). Publishing
+        # ONCE was fragile: the first cycle can fire before MQTT finishes connecting, that publish is
+        # dropped, and the entity would then never appear. Republishing self-heals across drops,
+        # reconnects, and a broker restart — and picks up a renamed phone.
+        config = {
+            "name": name,
+            "unique_id": obj,
+            "object_id": obj,
+            "state_topic": state_topic,
+            "json_attributes_topic": attr_topic,
+            "device_class": "timestamp",
+            "icon": "mdi:cellphone-check",
+            "device": {
+                "identifiers": ["apexsight_phones"],
+                "name": "ApexSight Phones",
+                "manufacturer": "ApexSight",
+                "model": "Push Relay",
+            },
+        }
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/{obj}/config", json.dumps(config), retain=True)
+        _published_phones.add(obj)
 
         updated = int(d.get("updated_at") or 0)
         last_seen_iso = datetime.datetime.fromtimestamp(
@@ -226,10 +229,18 @@ def _publish_devices(client) -> None:
 
 
 def _device_publisher(client) -> None:
-    """Background loop: keep the per-phone HA entities in sync with the DB every ~30s."""
+    """Background loop: keep the per-phone HA entities in sync with the DB. Only publishes while the
+    MQTT socket is actually up (a publish issued mid-connect is silently dropped), and re-publishes
+    the retained discovery each cycle so entities self-heal across reconnects."""
+    last_count = -1
     while True:
         try:
-            _publish_devices(client)
+            if client.is_connected():
+                before = set(_published_phones)
+                _publish_devices(client)
+                if len(_published_phones) != last_count or set(_published_phones) != before:
+                    last_count = len(_published_phones)
+                    log(f"published {last_count} phone entit{'y' if last_count == 1 else 'ies'} to HA")
         except Exception as exc:
             log("device publish failed:", exc)
         time.sleep(PHONE_PUBLISH_INTERVAL)
@@ -449,6 +460,12 @@ def on_connect(client, userdata, flags, rc, properties=None):
         if AI_DESCRIPTIONS:
             client.subscribe(DESC_TOPIC)
             log(f"subscribing {DESC_TOPIC} for AI descriptions")
+        # Publish the per-phone HA entities immediately on (re)connect so they appear at once rather
+        # than after the first periodic tick; the background thread then keeps them fresh.
+        try:
+            _publish_devices(client)
+        except Exception as exc:
+            log("initial device publish failed:", exc)
     else:
         log(f"MQTT connect failed rc={rc}")
 
