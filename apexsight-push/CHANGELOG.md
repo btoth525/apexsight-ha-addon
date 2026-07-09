@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.8.1
+
+- **Snappier arm/disarm.** The bridge now checks for a pending app arm/disarm request every 1s
+  (was 2s), so the round trip the app waits on is a second shorter.
+
 ## 1.8.0
 
 - **House Mode + Who-Armed sensors, and arm/disarm from the app.** The relay/bridge now expose the

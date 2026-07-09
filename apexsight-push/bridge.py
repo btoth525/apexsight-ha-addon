@@ -355,7 +355,7 @@ def _mode_request_watcher(client) -> None:
                 _consume_mode_request(client)
         except Exception as exc:
             log("mode request watch failed:", exc)
-        time.sleep(2)
+        time.sleep(1)   # snappy arm/disarm — the request is tiny and rare
 
 
 def _consume_mode_request(client) -> bool:
