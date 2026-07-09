@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.5.0
+
+- **Full per-device notification gate, app-closed.** The relay now evaluates every device's own
+  notification preferences before delivering — per-camera, per-object, and per-zone mutes, quiet
+  hours, per-camera snoozes, and custom triggers (which can re-open a muted combo, exactly like the
+  app). Each device syncs its prefs via `POST /v1/device-prefs` (keyed by device token); the gate
+  mirrors the app's `wouldDeliver` decision. Previously only Disarm, global Snooze, and a whole-camera
+  mute were honored app-closed.
+- **Fail-open by design.** Any uncertainty — no prefs synced yet, malformed data, unknown camera,
+  timezone in doubt — delivers. A missed alert is never acceptable in a security/baby-monitor system;
+  the only way to suppress is an affirmative, confident mute. Disarm and global Snooze-all stay
+  real-time household state (they're settable from Siri/widgets), so a stale per-device blob can
+  never suppress a live alert after a re-arm.
+- Every delivery decision is logged per device (`[gate] <token>… deliver/SUPPRESS: <reason>`) so
+  behavior is auditable in the add-on logs.
+
 ## 1.4.2
 
 - **Correct snapshot/GIF on notifications.** The bridge picked `detections[0]` (raw MQTT

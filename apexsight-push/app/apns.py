@@ -172,23 +172,36 @@ def build_payload(
     return payload
 
 
-async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str = "") -> dict:
+async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str = "", gate=None) -> dict:
     """Fan a payload out to every device registered under a pairing code.
+
+    `gate`, if given, is called per device token → (deliver: bool, reason: str). A device the gate
+    suppresses is skipped (its per-device notification prefs muted this event); the reason is logged
+    so the decision is auditable in the add-on logs. The gate is FAIL-OPEN by contract, so a device
+    is only ever skipped on an affirmative, confident mute.
 
     Prunes tokens APNs reports as permanently gone (410 / BadDeviceToken /
     Unregistered) so the table stays clean.
     """
     rows = db.devices_for(pairing_code)
-    sent, failed, pruned = 0, 0, 0
+    sent, failed, pruned, suppressed = 0, 0, 0, 0
     errors: list[str] = []
     for row in rows:
-        ok, detail = await send_to_token(row["device_token"], row["environment"], payload, collapse_id)
+        token = row["device_token"]
+        if gate is not None:
+            deliver, reason = gate(token)
+            print(f"[gate] {token[:8]}… {'deliver' if deliver else 'SUPPRESS'}: {reason}", flush=True)
+            if not deliver:
+                suppressed += 1
+                continue
+        ok, detail = await send_to_token(token, row["environment"], payload, collapse_id)
         if ok:
             sent += 1
             continue
         failed += 1
         errors.append(detail)
         if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered")):
-            db.delete_device(row["device_token"])
+            db.delete_device(token)
             pruned += 1
-    return {"devices": len(rows), "sent": sent, "failed": failed, "pruned": pruned, "errors": errors}
+    return {"devices": len(rows), "sent": sent, "failed": failed,
+            "pruned": pruned, "suppressed": suppressed, "errors": errors}

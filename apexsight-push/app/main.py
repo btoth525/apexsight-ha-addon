@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, config, db, recap, render
+from . import apns, config, db, gate, recap, render
 from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
@@ -167,6 +167,15 @@ class MutedCamerasIn(BaseModel):
     muted: list[str] = []   # cameras the user turned notifications OFF for entirely (default: all on)
 
 
+class DevicePrefsIn(BaseModel):
+    device_token: str = Field(min_length=8)
+    pairing_code: str = ""
+    # Soft-only notification prefs for THIS device: cameras_disabled / objects_disabled /
+    # zones_disabled / camera_snoozes / quiet_hours{enabled,start,end} / tz_offset / triggers.
+    # NEVER disarmed or global snoozed_until — those stay real-time household state (see gate.py).
+    prefs: dict = {}
+
+
 class StyleIn(BaseModel):
     pairing_code: str
     style: dict
@@ -239,33 +248,26 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         # Nothing registered under this code yet — not an error the bridge should retry on.
         return {"ok": True, "devices": 0, "sent": 0, "note": "no devices for pairing code"}
 
-    # Household gate — keeps app-closed pushes consistent with the in-app delivery gate.
-    # When the user has Disarmed or Snoozed (from the app, a widget, Siri or CarPlay,
-    # synced via /v1/gate), suppress delivery instead of buzzing them anyway.
+    # Household HARD gate — Disarm / global Snooze-all. Set in REAL TIME from six contexts (the app,
+    # a widget, Siri, the watch, CarPlay, a Focus) via /v1/gate, so it stays the household source of
+    # truth for these two and suppresses for ALL devices at once. (Per-device SOFT prefs are applied
+    # below in the delivery loop; disarm/global-snooze deliberately are NOT per-device — see the
+    # soft-only note in gate.py.)
     gate_raw = db.get_config(f"gate:{code}")
     if gate_raw:
         try:
-            gate = json.loads(gate_raw)
+            g = json.loads(gate_raw)
         except json.JSONDecodeError:
-            gate = {}
-        if gate.get("disarmed"):
+            g = {}
+        if g.get("disarmed"):
             return {"ok": True, "sent": 0, "note": "disarmed"}
-        snoozed_until = gate.get("snoozed_until") or 0
+        snoozed_until = g.get("snoozed_until") or 0
         if snoozed_until and time.time() < float(snoozed_until):
             return {"ok": True, "sent": 0, "note": "snoozed"}
 
-    # Per-camera mute (synced from the app's per-camera notification toggle): a camera the user
-    # switched OFF gets no push at all, app-closed included. The in-app toggle otherwise only
-    # gates foreground delivery, so a closed-app push for a muted camera would slip through.
-    if body.camera:
-        raw = db.get_config(f"muted_cameras:{code}", "")
-        if raw:
-            try:
-                muted = set(json.loads(raw))
-            except Exception:
-                muted = set()
-            if body.camera in muted:
-                return {"ok": True, "sent": 0, "note": "camera muted"}
+    # (Per-camera mute is no longer a household early-return — it now rides inside the per-device
+    # soft gate below, so a trigger can re-open it exactly as in the app. The household
+    # muted_cameras:{code} list remains only as a fallback for devices that predate /v1/device-prefs.)
 
     # Per-camera choice (synced from the app): skip AI-description follow-ups for disabled cameras.
     if body.is_description and body.camera:
@@ -325,7 +327,38 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         silent=body.silent,
         announce=body.announce,
     )
-    result = await apns.deliver_to_pairing(code, payload, collapse_id=body.collapse_id)
+    # Per-device SOFT gate: camera / object / zone / quiet-hours / per-camera-snooze / triggers,
+    # each synced per device via /v1/device-prefs and evaluated FAIL-OPEN (see gate.py). The app
+    # gates on the review's first object (AppState.handleReview uses `objects.first`), so mirror
+    # that here. Disarm + global snooze were already handled household-wide above.
+    ev_label = body.labels[0] if body.labels else "object"
+    ev_zones = body.zones or []
+    ev_score = body.score or 0.0
+    now = time.time()
+
+    def device_gate(token: str) -> tuple[bool, str]:
+        prefs_raw = db.get_config(f"prefs:{token}")
+        if prefs_raw:
+            try:
+                return gate.would_deliver(
+                    json.loads(prefs_raw), body.camera, ev_label, ev_zones, ev_score, now
+                )
+            except Exception as exc:  # noqa: BLE001 — FAIL-OPEN: never suppress on a parse error
+                return True, f"fail-open: prefs parse {exc!r}"
+        # Older app that hasn't synced per-device prefs yet → household per-camera mute fallback.
+        if body.camera:
+            raw = db.get_config(f"muted_cameras:{code}", "")
+            if raw:
+                try:
+                    if body.camera in set(json.loads(raw)):
+                        return False, "household camera muted"
+                except Exception:
+                    pass
+        return True, "no per-device prefs"
+
+    result = await apns.deliver_to_pairing(
+        code, payload, collapse_id=body.collapse_id, gate=device_gate
+    )
     return {"ok": result["sent"] > 0 or result["devices"] == 0, **result}
 
 
@@ -345,6 +378,22 @@ def muted_cameras(body: MutedCamerasIn, _: None = Depends(rate_limit)) -> dict:
     code = body.pairing_code.upper().strip()
     db.set_config(f"muted_cameras:{code}", json.dumps(sorted(set(body.muted))))
     return {"ok": True, "muted": sorted(set(body.muted))}
+
+
+@app.post("/v1/device-prefs")
+def device_prefs(body: DevicePrefsIn, _: None = Depends(rate_limit)) -> dict:
+    """Each device syncs its OWN soft notification prefs here (per-camera/object/zone mutes, quiet
+    hours, per-camera snoozes, triggers), keyed by device token, so app-closed pushes are gated per
+    device exactly as the foreground app would. Fired on any settings change and on foreground."""
+    token = body.device_token.strip()
+    prefs = dict(body.prefs or {})
+    # Defense in depth for the soft-only invariant (see gate.py): even if an app build ever includes
+    # them, strip Disarm / global Snooze — a stale copy here would suppress live alerts after a
+    # household re-arm from a widget/Siri. Those two stay real-time household state via /v1/gate.
+    prefs.pop("disarmed", None)
+    prefs.pop("snoozed_until", None)
+    db.set_config(f"prefs:{token}", json.dumps(prefs))
+    return {"ok": True}
 
 
 @app.post("/v1/style")
