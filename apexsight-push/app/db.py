@@ -119,6 +119,15 @@ def set_device_name(device_token: str, device_name: str) -> None:
         )
 
 
+def device_name_for(device_token: str) -> str:
+    """The user-set friendly name for a device token, or '' — used to record WHO armed."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT device_name FROM devices WHERE device_token = ?", (device_token,)
+        ).fetchone()
+        return (row["device_name"] or "") if row else ""
+
+
 def delete_device(device_token: str) -> None:
     with _conn() as c:
         c.execute("DELETE FROM devices WHERE device_token = ?", (device_token,))

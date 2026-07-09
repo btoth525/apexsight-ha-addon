@@ -185,6 +185,16 @@ class ModeIn(BaseModel):
     pairing_code: str = ""
 
 
+class SetModeIn(BaseModel):
+    # The app REQUESTS a house mode change (arm/disarm). Routed to HA (which arms Alarmo) via the
+    # bridge. Arming rides the pairing code; DISARM (mode=home) must carry the Alarmo `code`, which
+    # HA/Alarmo validates server-side — so a leaked pairing code alone can never drop the alarm.
+    mode: str
+    device_token: str = ""
+    pairing_code: str = ""
+    code: str = ""   # Alarmo code; required to disarm. Forwarded to HA→Alarmo, never validated here.
+
+
 class StyleIn(BaseModel):
     pairing_code: str
     style: dict
@@ -436,9 +446,45 @@ def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
 
 @app.get("/v1/mode")
 def get_mode() -> dict:
-    """Current house mode + which cameras it mutes — for the HA bridge / debugging."""
+    """Current house mode + which cameras it mutes — for the app (to reflect state), the HA bridge,
+    and debugging. `armed_by` reports who last requested a change (from the app), for display."""
     mode = db.get_config("house_mode", "") or ""
-    return {"mode": mode, "mutes": gate.MODE_MUTES.get(mode, [])}
+    armed_by = {}
+    raw = db.get_config("armed_by", "")
+    if raw:
+        try:
+            armed_by = json.loads(raw)
+        except json.JSONDecodeError:
+            armed_by = {}
+    return {"mode": mode, "mutes": gate.MODE_MUTES.get(mode, []), "armed_by": armed_by}
+
+
+@app.post("/v1/set-mode")
+def set_mode_request(body: SetModeIn, _: None = Depends(rate_limit)) -> dict:
+    """The app requests an arm/disarm. We persist the request (consume-once via a monotonic seq) for
+    the bridge to publish to HA over MQTT; HA arms Alarmo, whose resulting state flows back through
+    `apexsight/mode` → house_mode → the app + cameras. SECURITY: disarm (mode=home) must carry the
+    Alarmo `code` — validated by Alarmo itself, so the public pairing code alone can't disarm."""
+    mode = (body.mode or "").strip().lower()
+    if mode not in ("home", "away", "night"):
+        raise HTTPException(status_code=400, detail="unknown mode")
+    # Disarm requires the Alarmo code in the request (HA/Alarmo does the actual validation). Reject a
+    # code-less disarm here so a bare pairing-code POST can't even form one.
+    if mode == "home" and not (body.code or "").strip():
+        raise HTTPException(status_code=403, detail="disarm requires the alarm code")
+
+    by = db.device_name_for(body.device_token.strip()) if body.device_token.strip() else ""
+    seq = int(db.get_config("mode_request_seq", "0") or "0") + 1
+    now = time.time()
+    db.set_config("mode_request", json.dumps(
+        {"seq": seq, "mode": mode, "by": by, "code": (body.code or "").strip(), "ts": now}
+    ))
+    db.set_config("mode_request_seq", str(seq))
+    # Record who requested it for the who-armed sensor (the app + HA show this).
+    db.set_config("armed_by", json.dumps({"by": by, "mode": mode, "ts": now}))
+    # Never log the code.
+    print(f"[set-mode] request seq={seq} mode={mode} by={by or '?'}", flush=True)
+    return {"ok": True, "seq": seq, "mode": mode, "by": by}
 
 
 @app.post("/v1/style")

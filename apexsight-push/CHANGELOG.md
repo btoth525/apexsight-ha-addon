@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.8.0
+
+- **House Mode + Who-Armed sensors, and arm/disarm from the app.** The relay/bridge now expose the
+  home's arm stage to HA and accept arm/disarm requests from the iOS app.
+  - **`sensor.apexsight_house_mode`** — Home / Night / Away (the actual arm stage), with the muted
+    cameras for that mode as an attribute. **`sensor.apexsight_armed_by`** — who last set it, and
+    when. Both under a new "ApexSight House" device.
+  - **Richer phone entities.** Each phone now also gets an **online** connectivity binary sensor,
+    and its sensor carries live notification posture — `notifications` (Active / Snoozed /
+    Disarmed), `muted_cameras` count, and `quiet_hours` — real state to automate on.
+  - **Arm/disarm from the app.** New `POST /v1/set-mode`; the bridge forwards each request to HA
+    over `apexsight/mode/set` for an automation to arm Alarmo. Requests are **consume-once** (a
+    monotonic seq, remembered across restarts) so a bridge restart can never re-fire a stale
+    disarm. **Security:** disarming (Home) requires the Alarmo code in the request — validated by
+    Alarmo itself — so the public pairing code alone can never drop the alarm; arming rides the
+    pairing code. The disarm code is scrubbed from storage right after it's forwarded.
+
 ## 1.7.1
 
 - **Fix: per-phone entities never appeared.** The bridge published each phone's MQTT discovery

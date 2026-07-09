@@ -40,6 +40,10 @@ EVENTS_TOPIC = (TOPIC[: -len("/reviews")] + "/events") if TOPIC.endswith("/revie
 # forward it to the relay's /v1/mode so app-closed pushes follow the mode. Retained, so a bridge
 # restart re-reads the current mode immediately.
 MODE_TOPIC = os.environ.get("MODE_TOPIC", "apexsight/mode")
+# App→HA arm/disarm requests. The app POSTs /v1/set-mode; the relay persists a consume-once request;
+# the bridge publishes it here for an HA automation to arm Alarmo. Non-retained (a request is a
+# one-shot command, never a state to replay).
+MODE_SET_TOPIC = os.environ.get("MODE_SET_TOPIC", "apexsight/mode/set")
 DB_PATH = os.path.join(os.environ.get("APEX_DATA_DIR", "/data"), "relay.db")
 
 # Per-phone HA entities (v1.7.0). The relay stores each iPhone's user-set name in the shared DB;
@@ -51,6 +55,12 @@ PHONE_STATE_PREFIX = "apexsight/phone"
 PHONE_PUBLISH_INTERVAL = int(os.environ.get("PHONE_PUBLISH_INTERVAL", "30") or "30")
 # object_ids we've published discovery for, so a phone that unregisters gets its entity removed.
 _published_phones: set[str] = set()
+# HA device groupings (tidy the entities under two devices in the HA UI).
+PHONES_DEVICE = {"identifiers": ["apexsight_phones"], "name": "ApexSight Phones",
+                 "manufacturer": "ApexSight", "model": "Push Relay"}
+HOUSE_DEVICE = {"identifiers": ["apexsight_house"], "name": "ApexSight House",
+                "manufacturer": "ApexSight", "model": "Push Relay"}
+_house_published = False   # publish the house-mode/armed-by discovery once per process
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or "1883")
@@ -147,6 +157,30 @@ def _phone_slug(token: str) -> str:
     return "".join(ch for ch in token[:16].lower() if ch.isalnum()) or "phone"
 
 
+def _get_cfg(key: str, default=None):
+    """Read a value from the relay's shared config table (bridge has no app.db import)."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            r = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+            return r[0] if r else default
+    except Exception as exc:
+        log("cfg read failed:", exc)
+        return default
+
+
+def _set_cfg(key: str, value: str) -> None:
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.execute(
+                "INSERT INTO config(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            conn.commit()
+    except Exception as exc:
+        log("cfg write failed:", exc)
+
+
 def _read_devices() -> list[dict]:
     """Read registered phones from the shared relay DB. Defensive about the device_name column:
     on a just-migrated DB the bridge may query a hair before the relay's ALTER TABLE lands."""
@@ -168,11 +202,90 @@ def _read_devices() -> list[dict]:
         return []
 
 
+def _phone_notification_state(code: str, token: str) -> dict:
+    """Per-phone notification posture, for the entity's attributes — genuinely automatable state:
+    household Disarm/Snooze (from gate:{code}) + this device's muted-camera count and quiet hours
+    (from prefs:{token}). Fail-soft: any missing/bad blob → 'Active' (mirrors the relay's fail-open)."""
+    out = {"notifications": "Active", "muted_cameras": 0, "quiet_hours": False}
+    graw = _get_cfg(f"gate:{code}")
+    if graw:
+        try:
+            g = json.loads(graw)
+            if g.get("disarmed"):
+                out["notifications"] = "Disarmed"
+            elif g.get("snoozed_until", 0) and time.time() < float(g["snoozed_until"]):
+                out["notifications"] = "Snoozed"
+        except Exception:
+            pass
+    praw = _get_cfg(f"prefs:{token}")
+    if praw:
+        try:
+            p = json.loads(praw)
+            out["muted_cameras"] = len(p.get("cameras_disabled", []) or [])
+            out["quiet_hours"] = bool((p.get("quiet_hours", {}) or {}).get("enabled"))
+        except Exception:
+            pass
+    return out
+
+
+def _publish_house_entities(client) -> None:
+    """House-level sensors: the current arm stage (Home/Night/Away) and who last set it. Grouped
+    under an 'ApexSight House' device. This is the headline the user asked for — the entity that
+    shows 'what stage it's armed at', not just a phone's last-seen."""
+    global _house_published
+    mode = (_get_cfg("house_mode", "") or "").strip().lower()
+    label = {"home": "Home", "night": "Night", "away": "Away"}.get(mode, "Unknown")
+    # Which cameras this mode mutes — pulled from the relay (single source of truth = gate.MODE_MUTES)
+    # so this attribute never drifts from the actual delivery filter. Best-effort.
+    mutes = []
+    try:
+        r = requests.get(f"{RELAY_URL}/v1/mode", timeout=5)
+        if r.ok:
+            mutes = r.json().get("mutes", []) or []
+    except Exception:
+        pass
+    armed_by = {}
+    raw = _get_cfg("armed_by")
+    if raw:
+        try:
+            armed_by = json.loads(raw)
+        except Exception:
+            armed_by = {}
+
+    if not _house_published:
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/apexsight_house_mode/config", json.dumps({
+            "name": "House Mode", "unique_id": "apexsight_house_mode", "object_id": "apexsight_house_mode",
+            "state_topic": "apexsight/house/mode", "json_attributes_topic": "apexsight/house/mode_attrs",
+            "icon": "mdi:shield-home", "device": HOUSE_DEVICE,
+        }), retain=True)
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/apexsight_armed_by/config", json.dumps({
+            "name": "Armed By", "unique_id": "apexsight_armed_by", "object_id": "apexsight_armed_by",
+            "state_topic": "apexsight/house/armed_by", "json_attributes_topic": "apexsight/house/armed_by_attrs",
+            "icon": "mdi:account-check", "device": HOUSE_DEVICE,
+        }), retain=True)
+        _house_published = True
+
+    client.publish("apexsight/house/mode", label, retain=True)
+    client.publish("apexsight/house/mode_attrs", json.dumps({
+        "raw_mode": mode or "unknown", "muted_cameras": mutes,
+    }), retain=True)
+    at_iso = ""
+    if armed_by.get("ts"):
+        at_iso = datetime.datetime.fromtimestamp(
+            float(armed_by["ts"]), tz=datetime.timezone.utc
+        ).isoformat()
+    client.publish("apexsight/house/armed_by", (armed_by.get("by") or "—")[:255], retain=True)
+    client.publish("apexsight/house/armed_by_attrs", json.dumps({
+        "mode": armed_by.get("mode", ""), "at": at_iso,
+    }), retain=True)
+
+
 def _publish_devices(client) -> None:
-    """Reconcile HA MQTT-discovery entities against the current device list. Each phone is a
-    timestamp sensor (its last-seen), named by the user-set device_name, grouped under one
-    'ApexSight Phones' HA device. Retained so entities survive an HA/bridge restart. Phones that
-    have unregistered get their discovery config cleared (empty retained payload = HA removes it)."""
+    """Reconcile HA MQTT-discovery entities against the current device list. Publishes the house-level
+    sensors, then each phone as (1) a last-seen timestamp sensor with rich notification-state
+    attributes and (2) an 'online' connectivity binary sensor, grouped under 'ApexSight Phones'.
+    Retained + re-published every cycle so entities self-heal; a phone that unregisters is cleared."""
+    _publish_house_entities(client)
     devices = _read_devices()
     current: set[str] = set()
     for d in devices:
@@ -183,49 +296,88 @@ def _publish_devices(client) -> None:
         obj = f"apexsight_phone_{slug}"
         current.add(obj)
         name = (d.get("device_name") or "").strip() or f"iPhone {slug[:6]}"
+        code = d.get("pairing_code") or ""
         state_topic = f"{PHONE_STATE_PREFIX}/{slug}/state"
         attr_topic = f"{PHONE_STATE_PREFIX}/{slug}/attributes"
+        online_topic = f"{PHONE_STATE_PREFIX}/{slug}/online"
 
         # Re-publish the retained discovery config every cycle (idempotent — HA dedupes). Publishing
         # ONCE was fragile: the first cycle can fire before MQTT finishes connecting, that publish is
         # dropped, and the entity would then never appear. Republishing self-heals across drops,
         # reconnects, and a broker restart — and picks up a renamed phone.
-        config = {
-            "name": name,
-            "unique_id": obj,
-            "object_id": obj,
-            "state_topic": state_topic,
-            "json_attributes_topic": attr_topic,
-            "device_class": "timestamp",
-            "icon": "mdi:cellphone-check",
-            "device": {
-                "identifiers": ["apexsight_phones"],
-                "name": "ApexSight Phones",
-                "manufacturer": "ApexSight",
-                "model": "Push Relay",
-            },
-        }
-        client.publish(f"{DISCOVERY_PREFIX}/sensor/{obj}/config", json.dumps(config), retain=True)
+        client.publish(f"{DISCOVERY_PREFIX}/sensor/{obj}/config", json.dumps({
+            "name": name, "unique_id": obj, "object_id": obj,
+            "state_topic": state_topic, "json_attributes_topic": attr_topic,
+            "device_class": "timestamp", "icon": "mdi:cellphone-check", "device": PHONES_DEVICE,
+        }), retain=True)
+        client.publish(f"{DISCOVERY_PREFIX}/binary_sensor/{obj}_online/config", json.dumps({
+            "name": f"{name} Online", "unique_id": f"{obj}_online", "object_id": f"{obj}_online",
+            "state_topic": online_topic, "device_class": "connectivity",
+            "icon": "mdi:cellphone-wireless", "device": PHONES_DEVICE,
+        }), retain=True)
         _published_phones.add(obj)
 
         updated = int(d.get("updated_at") or 0)
+        online = (time.time() - updated) < 900 if updated else False
         last_seen_iso = datetime.datetime.fromtimestamp(
             updated or time.time(), tz=datetime.timezone.utc
         ).isoformat()
         attrs = {
             "name": name,
-            "pairing_code": d.get("pairing_code") or "",
+            "pairing_code": code,
             "environment": d.get("environment") or "",
             "platform": d.get("platform") or "",
-            "online": (time.time() - updated) < 900 if updated else False,
+            "online": online,
+            **_phone_notification_state(code, token),
         }
         client.publish(state_topic, last_seen_iso, retain=True)
         client.publish(attr_topic, json.dumps(attrs), retain=True)
+        client.publish(online_topic, "ON" if online else "OFF", retain=True)
 
-    # Remove entities for phones that unregistered since we last published.
+    # Remove entities (sensor + online binary_sensor) for phones that unregistered.
     for obj in list(_published_phones - current):
         client.publish(f"{DISCOVERY_PREFIX}/sensor/{obj}/config", "", retain=True)
+        client.publish(f"{DISCOVERY_PREFIX}/binary_sensor/{obj}_online/config", "", retain=True)
         _published_phones.discard(obj)
+
+
+def _mode_request_watcher(client) -> None:
+    """Poll the relay's consume-once arm/disarm request and publish it to HA over MQTT.
+
+    Consume-once via a monotonic seq persisted in the DB: we act only on a seq greater than the last
+    one we published, and remember it across restarts. That's the safety property the advisor called
+    out — a bridge restart must NOT re-fire a stale 'disarm' that would drop an alarm someone armed
+    by keypad in the meantime. After publishing we scrub the Alarmo code from the stored request so
+    the disarm code isn't left sitting at rest."""
+    while True:
+        try:
+            if client.is_connected():
+                _consume_mode_request(client)
+        except Exception as exc:
+            log("mode request watch failed:", exc)
+        time.sleep(2)
+
+
+def _consume_mode_request(client) -> bool:
+    """One consume-once step: publish a not-yet-seen arm/disarm request to HA and mark it consumed.
+    Returns True if a request was published. Restart-safe (seq persisted); scrubs the code after."""
+    raw = _get_cfg("mode_request")
+    if not raw:
+        return False
+    req = json.loads(raw)
+    seq = int(req.get("seq", 0))
+    consumed = int(_get_cfg("mode_request_consumed_seq", "0") or "0")
+    if seq <= consumed:
+        return False
+    client.publish(MODE_SET_TOPIC, json.dumps({
+        "mode": req.get("mode", ""), "by": req.get("by", ""), "code": req.get("code", ""),
+    }), retain=False)
+    _set_cfg("mode_request_consumed_seq", str(seq))
+    if req.get("code"):
+        req["code"] = ""
+        _set_cfg("mode_request", json.dumps(req))
+    log(f"mode request → {req.get('mode')} by {req.get('by') or '?'} (seq {seq})")
+    return True
 
 
 def _device_publisher(client) -> None:
@@ -551,6 +703,8 @@ def main():
     # Publish/refresh the per-phone HA entities in the background (paho's publish is thread-safe and
     # queues until the socket is up, so this is safe to start before connect + survives reconnects).
     threading.Thread(target=_device_publisher, args=(client,), daemon=True).start()
+    # Watch for app arm/disarm requests and forward them to HA (consume-once, restart-safe).
+    threading.Thread(target=_mode_request_watcher, args=(client,), daemon=True).start()
 
     while True:
         try:
