@@ -176,6 +176,13 @@ class DevicePrefsIn(BaseModel):
     prefs: dict = {}
 
 
+class ModeIn(BaseModel):
+    # The house mode (home / night / away) — synced from HA on Alarmo state change. Drives the
+    # house-level camera filter in /v1/notify (see gate.MODE_MUTES).
+    mode: str = ""
+    pairing_code: str = ""
+
+
 class StyleIn(BaseModel):
     pairing_code: str
     style: dict
@@ -264,6 +271,15 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         snoozed_until = g.get("snoozed_until") or 0
         if snoozed_until and time.time() < float(snoozed_until):
             return {"ok": True, "sent": 0, "note": "snoozed"}
+
+    # House mode camera filter — the Alarmo house mode (Home / Night / Away), synced from HA via
+    # /v1/mode, silences camera-detection pushes for cameras that mode mutes (e.g. inside cams while
+    # Home). House-level (all devices), applied before the per-device loop. FAIL-OPEN: unknown/blank
+    # mode or a camera not in that mode's mute-list delivers; Away mutes nothing.
+    house_mode = db.get_config("house_mode", "") or ""
+    if gate.mode_mutes_camera(house_mode, body.camera):
+        print(f"[mode] {house_mode}: {body.camera} muted → suppress all", flush=True)
+        return {"ok": True, "sent": 0, "note": f"mode {house_mode}: camera muted"}
 
     # (Per-camera mute is no longer a household early-return — it now rides inside the per-device
     # soft gate below, so a trigger can re-open it exactly as in the app. The household
@@ -394,6 +410,25 @@ def device_prefs(body: DevicePrefsIn, _: None = Depends(rate_limit)) -> dict:
     prefs.pop("snoozed_until", None)
     db.set_config(f"prefs:{token}", json.dumps(prefs))
     return {"ok": True}
+
+
+@app.post("/v1/mode")
+def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
+    """HA syncs the house mode (home / night / away) here on every Alarmo state change. It drives
+    the house-level camera filter in /v1/notify. Only a known mode is stored; an unrecognized value
+    is ignored so the gate keeps failing open (mode unknown → deliver) rather than muting blindly."""
+    mode = (body.mode or "").strip().lower()
+    if mode in gate.MODE_MUTES:
+        db.set_config("house_mode", mode)
+        return {"ok": True, "mode": mode}
+    return {"ok": False, "note": f"unknown mode '{mode}' ignored (fail-open)"}
+
+
+@app.get("/v1/mode")
+def get_mode() -> dict:
+    """Current house mode + which cameras it mutes — for the HA bridge / debugging."""
+    mode = db.get_config("house_mode", "") or ""
+    return {"mode": mode, "mutes": gate.MODE_MUTES.get(mode, [])}
 
 
 @app.post("/v1/style")

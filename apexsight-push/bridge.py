@@ -34,6 +34,10 @@ ALERTS_ONLY = os.environ.get("ALERTS_ONLY", "true").lower() in ("true", "1", "ye
 # into the shared relay DB so the relay can build the daily recap without querying
 # Frigate over HTTP. The relay reads from the same SQLite file.
 EVENTS_TOPIC = (TOPIC[: -len("/reviews")] + "/events") if TOPIC.endswith("/reviews") else "frigate/events"
+# House mode (home/night/away) — an HA automation publishes it here on Alarmo state change; we
+# forward it to the relay's /v1/mode so app-closed pushes follow the mode. Retained, so a bridge
+# restart re-reads the current mode immediately.
+MODE_TOPIC = os.environ.get("MODE_TOPIC", "apexsight/mode")
 DB_PATH = os.path.join(os.environ.get("APEX_DATA_DIR", "/data"), "relay.db")
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
@@ -313,11 +317,30 @@ def _post_to_relay(payload: dict, stage: str, attempts: int = 3) -> None:
             delay *= 2
 
 
+def _post_mode(mode: str) -> None:
+    """Forward the house mode to the relay's /v1/mode. Best-effort with a couple of retries — a
+    missed mode update just leaves the previous mode in place (fail-open on the relay side)."""
+    mode = (mode or "").strip().lower()
+    if not mode:
+        return
+    for attempt in range(1, 3):
+        try:
+            r = requests.post(f"{RELAY_URL}/v1/mode", json={"mode": mode, "pairing_code": PAIRING_CODE}, timeout=10)
+            log(f"house mode → {mode}: relay {r.status_code} {r.text[:80]}")
+            if r.status_code < 500:
+                return
+        except Exception as exc:
+            log(f"mode POST failed ({attempt}/2):", exc)
+        time.sleep(1.0)
+
+
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}, subscribing {TOPIC} + {EVENTS_TOPIC}")
         client.subscribe(TOPIC)
         client.subscribe(EVENTS_TOPIC)
+        client.subscribe(MODE_TOPIC)
+        log(f"subscribing {MODE_TOPIC} for house mode")
         if AI_DESCRIPTIONS:
             client.subscribe(DESC_TOPIC)
             log(f"subscribing {DESC_TOPIC} for AI descriptions")
@@ -360,6 +383,11 @@ def _handle_description(event: dict) -> None:
 
 
 def on_message(client, userdata, msg):
+    # House mode arrives as a plain string ("home"/"night"/"away"), not JSON — handle it before the
+    # JSON decode below (which would otherwise reject it).
+    if msg.topic == MODE_TOPIC:
+        _post_mode(msg.payload.decode("utf-8", "ignore"))
+        return
     try:
         event = json.loads(msg.payload.decode("utf-8"))
     except Exception as exc:

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.0
+
+- **House mode → camera alerts.** The relay now applies the home's Alarmo mode (Home / Night /
+  Away) as a house-level camera filter on app-closed pushes. Home alerts only Front Driveway +
+  Doorbell; Night adds Side Gate, Backyard and Garage; Away alerts every camera. Frigate keeps
+  recording + detecting everything in all modes — only alerting changes.
+  - HA publishes the mode to MQTT `apexsight/mode` (retained) on each Alarmo state change; the
+    bridge forwards it to the new `POST /v1/mode`; `/v1/notify` suppresses cameras that mode mutes.
+  - Modes are stored as MUTE-lists (a camera you add later defaults to alerting), and the whole
+    layer is FAIL-OPEN: an unknown/blank mode, or an unrecognized value, delivers everything. Away
+    mutes nothing — the safe default. This gates only camera-detection pushes; the alarm-triggered
+    critical alert is a separate HA channel and always fires.
+
 ## 1.5.0
 
 - **Full per-device notification gate, app-closed.** The relay now evaluates every device's own

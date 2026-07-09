@@ -24,6 +24,36 @@ from __future__ import annotations
 from typing import Any
 
 
+# ---------------------------------------------------------------------------
+# House mode camera filter (Home / Night / Away — driven by Alarmo via HA)
+# ---------------------------------------------------------------------------
+# The house mode silences camera-DETECTION pushes for certain cameras. Expressed as MUTE-lists,
+# NOT alert-lists: a camera you add later that isn't listed here defaults to ALERTING (fail-open at
+# the mode layer — a new camera never silently goes dark). Away mutes nothing — the safe default and
+# the state a real departure lands in. This gates ONLY camera-detection pushes; the alarm-TRIGGERED
+# critical alert is a separate HA channel (notify.family_phones) that fires regardless of mode.
+#   Home  (Alarmo disarmed)   → alert: Front_Driveway, doorbell
+#   Night (Alarmo armed_night)→ alert: Front_Driveway, doorbell, Side_Gate, Backyard_Wide, Garage
+#   Away  (Alarmo armed_away)  → alert: all cameras
+MODE_MUTES = {
+    "home":  ["Backyard_Wide", "Garage", "Living_Room_Wide", "Ryleighs_Rm",
+              "Side_Gate", "movie_room", "zachs_room"],
+    "night": ["Living_Room_Wide", "Ryleighs_Rm", "movie_room", "zachs_room"],
+    "away":  [],
+}
+
+
+def mode_mutes_camera(mode: Any, camera: str) -> bool:
+    """True only when `mode` CONFIDENTLY mutes `camera`. Unknown/blank mode, or a camera not in that
+    mode's mute-list → False (deliver). Away → False for everything. FAIL-OPEN at the mode layer."""
+    if not camera:
+        return False
+    muted = MODE_MUTES.get(str(mode or "").strip().lower())
+    if muted is None:
+        return False
+    return camera in muted
+
+
 def _f(v: Any) -> float:
     """Best-effort float; 0.0 on anything unparseable (so a bad snooze value never suppresses)."""
     try:
