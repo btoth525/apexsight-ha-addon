@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.2
+
+- **Fix: House Mode / Armed By sensors could fail to appear.** They published their MQTT discovery
+  config only once — the same connect-race that hid the phone entities in 1.7.0. They now
+  re-publish every cycle (retained, idempotent) so they self-heal, exactly like the phone entities.
+  Entity names trimmed to "Mode" / "Armed By" (the device already reads "ApexSight House").
+
 ## 1.8.1
 
 - **Snappier arm/disarm.** The bridge now checks for a pending app arm/disarm request every 1s

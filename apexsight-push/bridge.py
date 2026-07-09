@@ -60,7 +60,6 @@ PHONES_DEVICE = {"identifiers": ["apexsight_phones"], "name": "ApexSight Phones"
                  "manufacturer": "ApexSight", "model": "Push Relay"}
 HOUSE_DEVICE = {"identifiers": ["apexsight_house"], "name": "ApexSight House",
                 "manufacturer": "ApexSight", "model": "Push Relay"}
-_house_published = False   # publish the house-mode/armed-by discovery once per process
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or "1883")
@@ -232,7 +231,6 @@ def _publish_house_entities(client) -> None:
     """House-level sensors: the current arm stage (Home/Night/Away) and who last set it. Grouped
     under an 'ApexSight House' device. This is the headline the user asked for — the entity that
     shows 'what stage it's armed at', not just a phone's last-seen."""
-    global _house_published
     mode = (_get_cfg("house_mode", "") or "").strip().lower()
     label = {"home": "Home", "night": "Night", "away": "Away"}.get(mode, "Unknown")
     # Which cameras this mode mutes — pulled from the relay (single source of truth = gate.MODE_MUTES)
@@ -252,18 +250,19 @@ def _publish_house_entities(client) -> None:
         except Exception:
             armed_by = {}
 
-    if not _house_published:
-        client.publish(f"{DISCOVERY_PREFIX}/sensor/apexsight_house_mode/config", json.dumps({
-            "name": "House Mode", "unique_id": "apexsight_house_mode", "object_id": "apexsight_house_mode",
-            "state_topic": "apexsight/house/mode", "json_attributes_topic": "apexsight/house/mode_attrs",
-            "icon": "mdi:shield-home", "device": HOUSE_DEVICE,
-        }), retain=True)
-        client.publish(f"{DISCOVERY_PREFIX}/sensor/apexsight_armed_by/config", json.dumps({
-            "name": "Armed By", "unique_id": "apexsight_armed_by", "object_id": "apexsight_armed_by",
-            "state_topic": "apexsight/house/armed_by", "json_attributes_topic": "apexsight/house/armed_by_attrs",
-            "icon": "mdi:account-check", "device": HOUSE_DEVICE,
-        }), retain=True)
-        _house_published = True
+    # Re-publish discovery every cycle (retained, idempotent) so it self-heals across a dropped
+    # publish / reconnect — same fix as the phone entities. (The device name already carries
+    # "ApexSight House", so the entity names are just "Mode" / "Armed By".)
+    client.publish(f"{DISCOVERY_PREFIX}/sensor/apexsight_house_mode/config", json.dumps({
+        "name": "Mode", "unique_id": "apexsight_house_mode",
+        "state_topic": "apexsight/house/mode", "json_attributes_topic": "apexsight/house/mode_attrs",
+        "icon": "mdi:shield-home", "device": HOUSE_DEVICE,
+    }), retain=True)
+    client.publish(f"{DISCOVERY_PREFIX}/sensor/apexsight_armed_by/config", json.dumps({
+        "name": "Armed By", "unique_id": "apexsight_armed_by",
+        "state_topic": "apexsight/house/armed_by", "json_attributes_topic": "apexsight/house/armed_by_attrs",
+        "icon": "mdi:account-check", "device": HOUSE_DEVICE,
+    }), retain=True)
 
     client.publish("apexsight/house/mode", label, retain=True)
     client.publish("apexsight/house/mode_attrs", json.dumps({
