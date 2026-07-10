@@ -65,6 +65,12 @@ class TalkbackError(Exception):
     """Raised when the camera refuses the voice session or is unreachable."""
 
 
+# The camera accepts ONE voice session at a time — serialize all plays through this lock so a
+# concurrent request (app clip + HA say at once) fails fast and clean instead of colliding on the
+# camera (garbled audio / a cut-off clip / a raw 500).
+_session_lock = threading.Lock()
+
+
 def _crc16_kermit(data: bytes) -> int:
     crc = 0xFFFF
     for b in data:
@@ -120,7 +126,8 @@ def _extract_adts_frames(buf: bytes) -> Tuple[List[bytes], bytes]:
     return frames, buf[off:]
 
 
-def _ffmpeg_args(ffmpeg: str, input_args: Sequence[str], volume_gain: float) -> List[str]:
+def _ffmpeg_args(ffmpeg: str, input_args: Sequence[str], volume_gain: float,
+                 max_seconds: float) -> List[str]:
     # -re (in input_args) paces at real time; low-delay flags keep latency down. Output is the
     # camera's required format: AAC-LC ADTS, 16 kHz, mono, 32 kbps.
     vol: List[str] = []
@@ -130,12 +137,18 @@ def _ffmpeg_args(ffmpeg: str, input_args: Sequence[str], volume_gain: float) -> 
                f"volume={volume_gain:.2f}"]
     # NB: no `-flags low_delay` / `-fflags nobuffer` — on modern ffmpeg those break audio-only
     # encoding ("No filtered frames for output stream"), and `-re` already paces at real time.
-    return [
-        ffmpeg, "-hide_banner", "-loglevel", "error",
-        *input_args, *vol,
-        "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "32k", "-ar", "16000", "-ac", "1",
-        "-f", "adts", "pipe:1",
-    ]
+    # A network input (play-url) gets an I/O timeout so a hanging host can't stall ffmpeg forever,
+    # and `-t` hard-caps the output duration so the read loop always reaches EOF.
+    args = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+    input_list = list(input_args)
+    if any(str(a).startswith(("http://", "https://", "rtsp://")) for a in input_list):
+        args += ["-rw_timeout", "10000000"]   # 10s, microseconds
+    args += input_list
+    args += vol
+    args += ["-t", f"{max_seconds:.0f}",
+             "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "32k", "-ar", "16000", "-ac", "1",
+             "-f", "adts", "pipe:1"]
+    return args
 
 
 def play_audio(
@@ -153,6 +166,17 @@ def play_audio(
     run it in a thread from async code. Returns the number of AAC frames sent. Raises
     ``TalkbackError`` if the camera can't be reached or refuses the voice session.
     """
+    # One voice session at a time (camera limitation). Fail fast — the caller surfaces "busy".
+    if not _session_lock.acquire(blocking=False):
+        raise TalkbackError("talkback busy — another clip is already playing at the door")
+    try:
+        return _play_locked(camera_ip, input_args, ffmpeg=ffmpeg, volume_gain=volume_gain,
+                            max_seconds=max_seconds, log=log)
+    finally:
+        _session_lock.release()
+
+
+def _play_locked(camera_ip, input_args, *, ffmpeg, volume_gain, max_seconds, log) -> int:
     session_ts = int(time.time() * 1000)
     ssrc = random.randint(1, 0x7FFFFFFF)
 
@@ -165,60 +189,74 @@ def play_audio(
         raise TalkbackError(f"cannot reach {camera_ip}:{CONTROL_PORT}: {exc}") from exc
 
     try:
-        tcp.sendall(build_packet(TYPE_START_VOICE, session_ts))
-        ack = parse_packet(tcp.recv(1024))
+        # The handshake recv can time out (camera busy / slow) — that's a talkback failure the
+        # caller should see as 502 "camera didn't answer", never a raw 500.
+        try:
+            tcp.sendall(build_packet(TYPE_START_VOICE, session_ts))
+            ack = parse_packet(tcp.recv(1024))
+        except OSError as exc:
+            raise TalkbackError(f"camera didn't answer the voice handshake: {exc}") from exc
         if not ack or ack["type"] != TYPE_ACK or ack["value"] != 0:
             raise TalkbackError(f"voice session rejected: {ack}")
         log(f"[talk] voice session up to {camera_ip} (ssrc={ssrc})")
 
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        proc = subprocess.Popen(
-            _ffmpeg_args(ffmpeg, input_args, volume_gain),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-
-        stop_hb = threading.Event()
-
-        def _heartbeat() -> None:
-            while not stop_hb.wait(HEARTBEAT_INTERVAL):
-                try:
-                    tcp.sendall(build_packet(TYPE_HEARTBEAT, session_ts))
-                except OSError:
-                    break
-
-        hb_thread = threading.Thread(target=_heartbeat, daemon=True)
-        hb_thread.start()
-
-        seq = 0
-        buf = b""
-        started = time.monotonic()
         try:
-            assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read1(4096)  # returns what's available; -re keeps it realtime
-                if not chunk:
-                    break
-                buf += chunk
-                frames, buf = _extract_adts_frames(buf)
-                for frame in frames:
-                    header = _build_rtp_header(seq, seq * SAMPLES_PER_FRAME, ssrc)
-                    udp.sendto(header + frame, (camera_ip, AUDIO_PORT))
-                    seq += 1
-                if time.monotonic() - started > max_seconds:
-                    log(f"[talk] hit max_seconds={max_seconds}, stopping")
-                    break
+            try:
+                proc = subprocess.Popen(
+                    _ffmpeg_args(ffmpeg, input_args, volume_gain, max_seconds),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+            except OSError as exc:   # ffmpeg missing / not executable
+                raise TalkbackError(f"cannot run ffmpeg: {exc}") from exc
+
+            # Backstop for a wedged ffmpeg (input host that accepts but never sends, despite
+            # -rw_timeout): kill it so the read loop below always reaches EOF and this thread
+            # can never be leaked holding the camera's one voice session.
+            killer = threading.Timer(max_seconds + 20, proc.kill)
+            killer.daemon = True
+            killer.start()
+
+            stop_hb = threading.Event()
+
+            def _heartbeat() -> None:
+                while not stop_hb.wait(HEARTBEAT_INTERVAL):
+                    try:
+                        tcp.sendall(build_packet(TYPE_HEARTBEAT, session_ts))
+                    except OSError:
+                        break
+
+            hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+            hb_thread.start()
+
+            seq = 0
+            buf = b""
+            try:
+                assert proc.stdout is not None
+                while True:
+                    chunk = proc.stdout.read1(4096)  # -t caps output, so EOF always arrives
+                    if not chunk:
+                        break
+                    buf += chunk
+                    frames, buf = _extract_adts_frames(buf)
+                    for frame in frames:
+                        header = _build_rtp_header(seq, seq * SAMPLES_PER_FRAME, ssrc)
+                        udp.sendto(header + frame, (camera_ip, AUDIO_PORT))
+                        seq += 1
+            finally:
+                stop_hb.set()
+                killer.cancel()
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    err = proc.stderr.read().decode("utf-8", "ignore").strip() if proc.stderr else ""
+                    if err:
+                        log(f"[talk][ffmpeg] {err}")
+                except OSError:
+                    pass
         finally:
-            stop_hb.set()
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                err = proc.stderr.read().decode("utf-8", "ignore").strip() if proc.stderr else ""
-                if err:
-                    log(f"[talk][ffmpeg] {err}")
-            except OSError:
-                pass
             udp.close()
 
         log(f"[talk] sent {seq} AAC frames (~{seq * SAMPLES_PER_FRAME / 16000:.1f}s)")
@@ -234,21 +272,21 @@ def play_audio(
 
 
 def probe(camera_ip: str) -> bool:
-    """Silent reachability + handshake check (START_VOICE → ACK → STOP_VOICE), no audio."""
-    session_ts = int(time.time() * 1000)
+    """Non-invasive reachability check: TCP connect to the control port and close, WITHOUT the
+    START_VOICE handshake. The camera has exactly ONE voice session — the bridge polls this every
+    ~30s for the HA "Reachable" sensor, and a handshake probe would collide with (or cut off) a
+    real clip playing at the door. A connectable control port is reachable enough."""
+    tcp = None
     try:
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         tcp.settimeout(CONNECT_TIMEOUT)
         tcp.connect((camera_ip, CONTROL_PORT))
-        tcp.sendall(build_packet(TYPE_START_VOICE, session_ts))
-        ack = parse_packet(tcp.recv(1024))
-        ok = bool(ack and ack["type"] == TYPE_ACK and ack["value"] == 0)
-        try:
-            tcp.sendall(build_packet(TYPE_STOP_VOICE, session_ts))
-        except OSError:
-            pass
-        tcp.close()
-        return ok
+        return True
     except OSError:
         return False
+    finally:
+        if tcp is not None:
+            try:
+                tcp.close()
+            except OSError:
+                pass

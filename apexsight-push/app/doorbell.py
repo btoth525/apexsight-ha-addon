@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -25,6 +26,8 @@ except ValueError:
 CLIPS_DIR = DATA_DIR / "doorbell_clips"
 _MANIFEST = CLIPS_DIR / "clips.json"
 MAX_CLIP_BYTES = 8 * 1024 * 1024  # 8 MB — a soundboard clip, not a podcast
+# Serializes manifest read-modify-write (two concurrent saves must not lose a preset).
+_manifest_lock = threading.Lock()
 
 
 def is_configured() -> bool:
@@ -39,8 +42,12 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(data: dict) -> None:
+    """Atomic write (tmp + rename) so a crash mid-write can never truncate the manifest and
+    silently orphan every saved preset."""
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-    _MANIFEST.write_text(json.dumps(data))
+    tmp = _MANIFEST.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, _MANIFEST)
 
 
 def _slugify(name: str) -> str:
@@ -51,18 +58,23 @@ def _slugify(name: str) -> str:
 def save_clip(name: str, data: bytes, ext: str) -> dict:
     """Persist an uploaded clip as a preset. Returns {slug, name}."""
     CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = _load_manifest()
-    slug = _slugify(name)
-    # De-dupe slugs by suffixing if a different name already claims it.
-    base, n = slug, 1
-    while slug in manifest and manifest[slug].get("name") != name:
-        n += 1
-        slug = f"{base}-{n}"
-    safe_ext = re.sub(r"[^a-z0-9]+", "", ext.lower())[:5] or "bin"
-    filename = f"{slug}.{safe_ext}"
-    (CLIPS_DIR / filename).write_bytes(data)
-    manifest[slug] = {"name": name, "filename": filename}
-    _save_manifest(manifest)
+    with _manifest_lock:
+        manifest = _load_manifest()
+        slug = _slugify(name)
+        # De-dupe slugs by suffixing if a different name already claims it.
+        base, n = slug, 1
+        while slug in manifest and manifest[slug].get("name") != name:
+            n += 1
+            slug = f"{base}-{n}"
+        safe_ext = re.sub(r"[^a-z0-9]+", "", ext.lower())[:5] or "bin"
+        filename = f"{slug}.{safe_ext}"
+        # Re-saving the same name with a different format: drop the old file, don't orphan it.
+        old = manifest.get(slug)
+        if old and old.get("filename") and old["filename"] != filename:
+            (CLIPS_DIR / old["filename"]).unlink(missing_ok=True)
+        (CLIPS_DIR / filename).write_bytes(data)
+        manifest[slug] = {"name": name, "filename": filename}
+        _save_manifest(manifest)
     return {"slug": slug, "name": name}
 
 
@@ -80,15 +92,16 @@ def clip_file(slug: str) -> Optional[Path]:
 
 
 def delete_clip(slug: str) -> bool:
-    manifest = _load_manifest()
-    meta = manifest.pop(slug, None)
-    if not meta:
-        return False
-    try:
-        (CLIPS_DIR / meta["filename"]).unlink(missing_ok=True)
-    except OSError:
-        pass
-    _save_manifest(manifest)
+    with _manifest_lock:
+        manifest = _load_manifest()
+        meta = manifest.pop(slug, None)
+        if not meta:
+            return False
+        try:
+            (CLIPS_DIR / meta["filename"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+        _save_manifest(manifest)
     return True
 
 

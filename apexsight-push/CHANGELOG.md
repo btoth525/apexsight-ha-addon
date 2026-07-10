@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.10.1
+
+Hardening pass on 1.10.0's talkback (full audit):
+
+- **Fix: the HA "Reachable" sensor no longer opens a voice session on the camera.** The bridge
+  polls reachability every ~30s; the probe used the real START_VOICE handshake, which could
+  collide with (or cut off) a clip actually playing. It's now a plain TCP connect — non-invasive.
+- **Fix: playing a clip can no longer delay the doorbell RING.** Talkback commands from HA ran on
+  the MQTT loop thread, so a 30s clip blocked ALL message handling — including the ring →
+  CallKit push — until it finished. They now run on worker threads. (Same for the entity publish
+  on reconnect.)
+- **Fix: a hanging play-url source can no longer wedge talkback until restart.** ffmpeg gets a
+  10s network I/O timeout + a hard output-duration cap, plus a kill-timer backstop, so the play
+  loop always terminates and the camera's one voice session is always released.
+- **One clip at a time, cleanly.** Concurrent plays (app clip + HA say at once) used to collide on
+  the camera; the second play now fails fast with 409 "talkback busy".
+- Camera-busy/no-answer handshake failures now return a proper 502 instead of a raw 500; upload
+  size is enforced without buffering an oversized body; preset saves are atomic + lock-protected
+  (a crash can no longer orphan every saved preset); re-saving a preset in a different format no
+  longer strands the old file; talkback endpoints refuse to run if the relay has no pairing code.
+
 ## 1.10.0
 
 - **Talk to the doorbell — play audio to the Aqara G400 speaker.** The relay can now speak the

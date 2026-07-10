@@ -300,21 +300,30 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
 # ---- doorbell talkback (play audio to the Aqara speaker) ---------------------
 
 def _require_pairing(code: str) -> str:
-    """Talkback actuates hardware (the door speaker), so require the household pairing code."""
+    """Talkback actuates hardware (the door speaker), so require the household pairing code.
+    If the relay somehow has NO pairing code configured, refuse outright — never fail open on an
+    endpoint that makes noise at the front door (and that hands URLs to ffmpeg)."""
+    if not PAIRING_CODE:
+        raise HTTPException(status_code=503, detail="relay has no pairing code configured")
     code = (code or "").upper().strip()
-    if PAIRING_CODE and code != PAIRING_CODE:
+    if code != PAIRING_CODE:
         raise HTTPException(status_code=403, detail="bad pairing code")
     return code
 
 
-async def _play_upload(upload: UploadFile) -> int:
-    """Save an uploaded clip to a temp file and play it to the doorbell. Returns frames sent."""
-    data = await upload.read()
+async def _read_clip(upload: UploadFile) -> bytes:
+    """Read an uploaded clip, bounded — never buffer an oversized body into RAM before rejecting."""
+    data = await upload.read(doorbell.MAX_CLIP_BYTES + 1)
     if not data:
         raise HTTPException(status_code=400, detail="empty audio")
     if len(data) > doorbell.MAX_CLIP_BYTES:
         raise HTTPException(status_code=413, detail="clip too large")
-    suffix = os.path.splitext(upload.filename or "")[1][:8] or ".bin"
+    return data
+
+
+async def _play_bytes(data: bytes, filename: str) -> int:
+    """Write clip bytes to a temp file and play them to the doorbell. Returns frames sent."""
+    suffix = os.path.splitext(filename or "")[1][:8] or ".bin"
     tmp = tempfile.NamedTemporaryFile(prefix="apex_talk_", suffix=suffix, delete=False)
     try:
         tmp.write(data)
@@ -347,23 +356,23 @@ async def doorbell_clip(
     _require_pairing(pairing_code)
     if not doorbell.is_configured():
         raise HTTPException(status_code=503, detail="doorbell_ip not set in add-on config")
+    data = await _read_clip(audio)   # read ONCE, bounded; reuse for both save and play
     saved = None
     if save_as.strip():
-        data = await audio.read()
-        await audio.seek(0)
         ext = os.path.splitext(audio.filename or "")[1].lstrip(".") or "bin"
-        saved = doorbell.save_clip(save_as.strip(), data, ext)
+        saved = await run_in_threadpool(doorbell.save_clip, save_as.strip(), data, ext)
     try:
-        frames = await _play_upload(audio)
+        frames = await _play_bytes(data, audio.filename or "")
     except aqara_talk.TalkbackError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        # 409 for "another clip is playing" (retry shortly), 502 for a camera/ffmpeg failure.
+        raise HTTPException(status_code=409 if "busy" in str(exc) else 502, detail=str(exc))
     return {"ok": True, "frames": frames, "saved": saved}
 
 
 @app.get("/v1/doorbell/clips")
 async def doorbell_clips(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
     _require_pairing(pairing_code)
-    return {"ok": True, "clips": doorbell.list_clips()}
+    return {"ok": True, "clips": await run_in_threadpool(doorbell.list_clips)}
 
 
 @app.post("/v1/doorbell/play")
@@ -378,14 +387,15 @@ async def doorbell_play(body: DoorbellPlayIn, _: None = Depends(rate_limit)) -> 
     try:
         frames = await run_in_threadpool(doorbell.play_path, path)
     except aqara_talk.TalkbackError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        # 409 for "another clip is playing" (retry shortly), 502 for a camera/ffmpeg failure.
+        raise HTTPException(status_code=409 if "busy" in str(exc) else 502, detail=str(exc))
     return {"ok": True, "frames": frames}
 
 
 @app.post("/v1/doorbell/delete")
 async def doorbell_delete(body: DoorbellPlayIn, _: None = Depends(rate_limit)) -> dict:
     _require_pairing(body.pairing_code)
-    return {"ok": True, "deleted": doorbell.delete_clip(body.slug)}
+    return {"ok": True, "deleted": await run_in_threadpool(doorbell.delete_clip, body.slug)}
 
 
 @app.post("/v1/doorbell/play-url")
@@ -406,7 +416,8 @@ async def doorbell_play_url(body: DoorbellUrlIn, _: None = Depends(rate_limit)) 
             )
         )
     except aqara_talk.TalkbackError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        # 409 for "another clip is playing" (retry shortly), 502 for a camera/ffmpeg failure.
+        raise HTTPException(status_code=409 if "busy" in str(exc) else 502, detail=str(exc))
     return {"ok": True, "frames": frames}
 
 

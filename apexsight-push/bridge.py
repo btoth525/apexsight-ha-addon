@@ -782,11 +782,15 @@ def on_connect(client, userdata, flags, rc, properties=None):
             client.subscribe(DESC_TOPIC)
             log(f"subscribing {DESC_TOPIC} for AI descriptions")
         # Publish the per-phone HA entities immediately on (re)connect so they appear at once rather
-        # than after the first periodic tick; the background thread then keeps them fresh.
-        try:
-            _publish_devices(client)
-        except Exception as exc:
-            log("initial device publish failed:", exc)
+        # than after the first periodic tick; the background thread then keeps them fresh. On a
+        # WORKER thread — the publish makes blocking HTTP calls to the relay (mode/status/clips),
+        # and this callback runs on paho's network-loop thread right as queued messages arrive.
+        def _initial_publish() -> None:
+            try:
+                _publish_devices(client)
+            except Exception as exc:
+                log("initial device publish failed:", exc)
+        threading.Thread(target=_initial_publish, daemon=True).start()
     else:
         log(f"MQTT connect failed rc={rc}")
 
@@ -836,22 +840,26 @@ def on_message(client, userdata, msg):
         _post_doorbell()
         return
     # Doorbell talkback — play an audio URL (HA TTS/media) or a saved preset clip at the door.
+    # CRITICAL: these run on WORKER THREADS, never inline. A play blocks until the clip finishes
+    # (paced at real time), and this callback runs on paho's single network-loop thread — doing it
+    # inline would stall ALL message handling, including the doorbell RING → CallKit push, for the
+    # length of the clip (and a long stall would blow the MQTT keepalive entirely).
     if msg.topic == DOORBELL_PLAY_URL_TOPIC:
         url = msg.payload.decode("utf-8", "ignore").strip()
-        _post_doorbell_play_url(url)
         _publish_last_talk(client, url[:80] or "URL")
+        threading.Thread(target=_post_doorbell_play_url, args=(url,), daemon=True).start()
         return
     if msg.topic == DOORBELL_PLAY_CLIP_TOPIC:
         slug = msg.payload.decode("utf-8", "ignore").strip()
-        _post_doorbell_play_clip(slug)
         _publish_last_talk(client, slug)
+        threading.Thread(target=_post_doorbell_play_clip, args=(slug,), daemon=True).start()
         return
     if msg.topic == DOORBELL_SAY_TOPIC:
         text = msg.payload.decode("utf-8", "ignore").strip()
-        _post_doorbell_say(text)
-        # Echo into the text entity's state + record it, then clear so the box is ready for the next.
-        client.publish(DOORBELL_SAY_STATE, text[:255], retain=True)
         _publish_last_talk(client, f"say: {text[:60]}")
+        # Clear the text box state so it's ready for the next phrase (Last Talkback keeps the text).
+        client.publish(DOORBELL_SAY_STATE, "", retain=True)
+        threading.Thread(target=_post_doorbell_say, args=(text,), daemon=True).start()
         return
     try:
         event = json.loads(msg.payload.decode("utf-8"))
