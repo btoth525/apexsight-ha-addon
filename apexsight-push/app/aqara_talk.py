@@ -127,10 +127,11 @@ def parse_packet(data: bytes) -> dict | None:
     return {"type": pkt_type, "value": value}
 
 
-def _build_rtp_header(seq: int, timestamp: int, ssrc: int) -> bytes:
-    # V=2, no padding/ext/CSRC; marker 0; dynamic PT 97.
-    return struct.pack(">BBHII", 0x80, RTP_PAYLOAD_TYPE & 0x7F, seq & 0xFFFF,
-                       timestamp & 0xFFFFFFFF, ssrc & 0xFFFFFFFF)
+def _build_rtp_header(seq: int, timestamp: int, ssrc: int, marker: int = 0) -> bytes:
+    # V=2, no padding/ext/CSRC; dynamic PT 97. Marker bit (high bit of byte 2) flags the first
+    # packet of the talkspurt so the camera opens its speaker / resets playout cleanly.
+    return struct.pack(">BBHII", 0x80, ((marker & 1) << 7) | (RTP_PAYLOAD_TYPE & 0x7F),
+                       seq & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc & 0xFFFFFFFF)
 
 
 def _extract_adts_frames(buf: bytes) -> Tuple[List[bytes], bytes]:
@@ -280,19 +281,28 @@ def _play_locked(camera_ip, input_args, *, ffmpeg, volume_gain, max_seconds, log
             hb_thread.start()
 
             seq = 0
+            send_start = [0.0]  # monotonic anchor for the whole stream (set on first packet)
 
             def _emit(frame: bytes) -> None:
+                # Pace to a single real-time schedule: packet N leaves at start + N*64ms. ffmpeg's
+                # `-re` does NOT reliably pace here (it dumps the whole clip in ~30ms), so WE meter
+                # the RTP stream — the camera's jitter buffer is sized for a live ~16 kHz stream and
+                # a flood overruns it, dropping random frames (the "cuts off all over the place"
+                # symptom). Sender-side pacing gives it exactly what it expects.
                 nonlocal seq
-                header = _build_rtp_header(seq, seq * SAMPLES_PER_FRAME, ssrc)
+                now = time.monotonic()
+                if seq == 0:
+                    send_start[0] = now
+                target = send_start[0] + seq * FRAME_SECONDS
+                if target > now:
+                    time.sleep(target - now)
+                header = _build_rtp_header(seq, seq * SAMPLES_PER_FRAME, ssrc, marker=1 if seq == 0 else 0)
                 udp.sendto(header + frame, (camera_ip, AUDIO_PORT))
                 seq += 1
 
             def _emit_silence(seconds: float) -> None:
-                # Paced at real time so the speaker actually warms / the buffer actually drains —
-                # a burst would arrive in ~1ms and defeat the purpose.
                 for i in range(int(seconds / FRAME_SECONDS)):
                     _emit(silence[i % len(silence)])
-                    time.sleep(FRAME_SECONDS)
 
             silence = _silence_frames(ffmpeg)
             if silence:
@@ -303,13 +313,13 @@ def _play_locked(camera_ip, input_args, *, ffmpeg, volume_gain, max_seconds, log
             try:
                 assert proc.stdout is not None
                 while True:
-                    chunk = proc.stdout.read1(4096)  # -t caps output, so EOF always arrives
+                    chunk = proc.stdout.read1(4096)  # ffmpeg bursts into the pipe; _emit meters out
                     if not chunk:
                         break
                     buf += chunk
                     frames, buf = _extract_adts_frames(buf)
                     for frame in frames:
-                        _emit(frame)  # real audio is already real-time paced by ffmpeg -re
+                        _emit(frame)  # real-time paced by _emit's schedule, not by ffmpeg
                         real_frames += 1
             finally:
                 stop_hb.set()

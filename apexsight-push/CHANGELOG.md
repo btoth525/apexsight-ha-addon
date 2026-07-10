@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.10.3
+
+Fix: doorbell talkback cutting off words "all over the place" (sometimes the first word, sometimes
+the last, inconsistently). This is the real cause behind what 1.10.2's silence padding only partly
+masked.
+
+- Root cause: the RTP audio was sent as a **burst**, not a real-time stream. `ffmpeg -re` was
+  supposed to pace the clip to real time but doesn't here — it dumps the entire clip into the pipe
+  in ~30ms — so all ~26 audio packets hit the camera at once. The doorbell's jitter buffer is sized
+  for a live ~16 kHz stream (one 64ms frame every 64ms); a flood overruns it and it drops whatever
+  won't fit, which is why the lost words were random rather than always the first.
+- Fix: the relay now **meters the whole RTP stream itself** on a monotonic schedule — packet N
+  leaves at start + N×64ms — instead of trusting ffmpeg's pacing. Silence lead-in, the clip, and
+  the silence tail are one continuous, evenly-paced stream, exactly what the camera expects.
+- Also sets the RTP **marker bit** on the first packet (start-of-talkspurt), so the camera opens
+  its speaker / resets playout cleanly at the top of each clip.
+
 ## 1.10.2
 
 Fix: doorbell talkback / "Say" no longer cuts off the first and last words.
