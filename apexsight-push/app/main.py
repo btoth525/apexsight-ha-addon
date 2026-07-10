@@ -123,6 +123,17 @@ class UnregisterIn(BaseModel):
     device_token: str
 
 
+class RegisterVoIPIn(BaseModel):
+    voip_token: str = Field(min_length=32)
+    pairing_code: str = Field(min_length=4, max_length=64)
+    environment: str = "production"
+
+
+class DoorbellRingIn(BaseModel):
+    pairing_code: str = ""
+    camera: str = "doorbell"
+
+
 class TestIn(BaseModel):
     device_token: str
     environment: str = "production"
@@ -240,6 +251,37 @@ def register(body: RegisterIn, _: None = Depends(rate_limit)) -> dict:
 def unregister(body: UnregisterIn, _: None = Depends(rate_limit)) -> dict:
     db.delete_device(body.device_token)
     return {"ok": True}
+
+
+@app.post("/v1/register-voip")
+def register_voip(body: RegisterVoIPIn, _: None = Depends(rate_limit)) -> dict:
+    """An iPhone registers its PushKit VoIP token so the relay can ring it (CallKit) on a doorbell
+    press. Separate from the APNs token — VoIP pushes use a different topic + push type."""
+    env = body.environment if body.environment in ("production", "sandbox") else "production"
+    db.upsert_voip(body.voip_token, body.pairing_code.upper().strip(), env)
+    return {"ok": True}
+
+
+@app.post("/v1/doorbell-ring")
+async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> dict:
+    """The HA bridge calls this when the doorbell button is pressed. Sends a VoIP push to every
+    registered phone in the household so CallKit rings them with the live doorbell call."""
+    if not apns.is_configured():
+        raise HTTPException(status_code=503, detail="APNs not configured on relay")
+    code = body.pairing_code.upper().strip() or PAIRING_CODE
+    rows = db.voip_tokens_for(code)
+    payload = {"aps": {"content-available": 1}, "doorbell": True, "camera": body.camera or "doorbell"}
+    sent, failed = 0, 0
+    for row in rows:
+        ok, detail = await apns.send_voip(row["voip_token"], row["environment"], payload)
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+            if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered")):
+                db.delete_voip(row["voip_token"])
+    print(f"[doorbell] ring → {sent} phones (failed {failed})", flush=True)
+    return {"ok": True, "sent": sent, "failed": failed, "phones": len(rows)}
 
 
 @app.post("/v1/test")

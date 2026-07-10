@@ -44,6 +44,9 @@ MODE_TOPIC = os.environ.get("MODE_TOPIC", "apexsight/mode")
 # the bridge publishes it here for an HA automation to arm Alarmo. Non-retained (a request is a
 # one-shot command, never a state to replay).
 MODE_SET_TOPIC = os.environ.get("MODE_SET_TOPIC", "apexsight/mode/set")
+# Doorbell ring — an HA automation publishes here on the doorbell button press; we forward it to the
+# relay's /v1/doorbell-ring, which sends a VoIP push so the phones ring via CallKit.
+DOORBELL_TOPIC = os.environ.get("DOORBELL_TOPIC", "apexsight/doorbell")
 DB_PATH = os.path.join(os.environ.get("APEX_DATA_DIR", "/data"), "relay.db")
 
 # Per-phone HA entities (v1.7.0). The relay stores each iPhone's user-set name in the shared DB;
@@ -601,6 +604,15 @@ def _post_mode(mode: str) -> None:
         time.sleep(1.0)
 
 
+def _post_doorbell() -> None:
+    """Forward a doorbell press to the relay's /v1/doorbell-ring (VoIP push → CallKit ring)."""
+    try:
+        r = requests.post(f"{RELAY_URL}/v1/doorbell-ring", json={"pairing_code": PAIRING_CODE, "camera": "doorbell"}, timeout=10)
+        log(f"doorbell ring → relay {r.status_code} {r.text[:100]}")
+    except Exception as exc:
+        log("doorbell POST failed:", exc)
+
+
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}, subscribing {TOPIC} + {EVENTS_TOPIC}")
@@ -608,6 +620,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
         client.subscribe(EVENTS_TOPIC)
         client.subscribe(MODE_TOPIC)
         log(f"subscribing {MODE_TOPIC} for house mode")
+        client.subscribe(DOORBELL_TOPIC)
+        log(f"subscribing {DOORBELL_TOPIC} for doorbell ring")
         if AI_DESCRIPTIONS:
             client.subscribe(DESC_TOPIC)
             log(f"subscribing {DESC_TOPIC} for AI descriptions")
@@ -660,6 +674,10 @@ def on_message(client, userdata, msg):
     # JSON decode below (which would otherwise reject it).
     if msg.topic == MODE_TOPIC:
         _post_mode(msg.payload.decode("utf-8", "ignore"))
+        return
+    # Doorbell ring — any message on this topic fires the VoIP push (payload content ignored).
+    if msg.topic == DOORBELL_TOPIC:
+        _post_doorbell()
         return
     try:
         event = json.loads(msg.payload.decode("utf-8"))

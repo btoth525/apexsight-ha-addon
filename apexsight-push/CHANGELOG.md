@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.9.0
+
+- **Doorbell ring → a real CallKit call.** When the doorbell button is pressed, the relay now sends
+  a PushKit **VoIP** push so the phones ring with the native full-screen incoming-call screen (works
+  on the Lock Screen), and answering opens ApexSight's live doorbell view + two-way talk.
+  - New `POST /v1/register-voip` (the app registers its VoIP token) and `POST /v1/doorbell-ring`
+    (fans a VoIP push to every phone in the household). The bridge forwards MQTT `apexsight/doorbell`
+    (published by an HA automation on the ring sensor) to it.
+  - VoIP pushes reuse the same `.p8` key but the `<bundle>.voip` topic + `voip` push type; dead
+    VoIP tokens are pruned like APNs tokens.
+
 ## 1.8.2
 
 - **Fix: House Mode / Armed By sensors could fail to appear.** They published their MQTT discovery

@@ -40,6 +40,13 @@ def init() -> None:
                 PRIMARY KEY (pairing_code, event_id)
             );
             CREATE INDEX IF NOT EXISTS idx_recap_ts ON recap_events(pairing_code, ts);
+            CREATE TABLE IF NOT EXISTS voip_tokens (
+                voip_token   TEXT PRIMARY KEY,
+                pairing_code TEXT NOT NULL,
+                environment  TEXT NOT NULL DEFAULT 'production',
+                updated_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_voip_pairing ON voip_tokens(pairing_code);
             """
         )
         # Migration for DBs created before device_name existed (v1.7.0). ADD COLUMN is a
@@ -153,6 +160,34 @@ def all_devices() -> list[sqlite3.Row]:
 def device_count() -> int:
     with _conn() as c:
         return c.execute("SELECT COUNT(*) AS n FROM devices").fetchone()["n"]
+
+
+# ---- VoIP (PushKit) tokens — used to ring a phone via CallKit on a doorbell press ----
+
+def upsert_voip(voip_token: str, pairing_code: str, environment: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO voip_tokens(voip_token, pairing_code, environment, updated_at) "
+            "VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(voip_token) DO UPDATE SET "
+            "  pairing_code = excluded.pairing_code, "
+            "  environment  = excluded.environment, "
+            "  updated_at   = excluded.updated_at",
+            (voip_token, pairing_code, environment, int(time.time())),
+        )
+
+
+def voip_tokens_for(pairing_code: str) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT voip_token, environment FROM voip_tokens WHERE pairing_code = ?",
+            (pairing_code,),
+        ).fetchall()
+
+
+def delete_voip(voip_token: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM voip_tokens WHERE voip_token = ?", (voip_token,))
 
 
 # ---- recap events (accumulated from the MQTT stream by the bridge) -----------
