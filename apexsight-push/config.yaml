@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.9.0"
+version: "1.10.0"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -9,6 +9,8 @@ arch:
 startup: services
 boot: auto
 init: false
+# Lets the add-on call HA's TTS (tts_get_url) so `apexsight/doorbell/say` can speak text at the door.
+homeassistant_api: true
 # Pulls MQTT connection details automatically from the Home Assistant broker.
 services:
   - mqtt:need
@@ -26,6 +28,9 @@ options:
   frigate_base_url: ""
   alerts_only: true
   topic: "frigate/reviews"
+  doorbell_ip: ""
+  doorbell_gain: "3.0"
+  doorbell_tts_engine: "tts.piper"
   mqtt_host: ""
   mqtt_port: 0
   mqtt_user: ""
@@ -37,6 +42,9 @@ schema:
   frigate_base_url: url?
   alerts_only: bool
   topic: str
+  doorbell_ip: str?
+  doorbell_gain: str?
+  doorbell_tts_engine: str?
   mqtt_host: str?
   mqtt_port: int?
   mqtt_user: str?

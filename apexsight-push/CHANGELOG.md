@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.10.0
+
+- **Talk to the doorbell — play audio to the Aqara G400 speaker.** The relay can now speak the
+  Aqara camera's LAN talkback protocol directly (TCP :54324 control + UDP :54323 AAC-LC RTP, no
+  cloud/hub/auth), so the app can send audio to the doorbell. Foundation for two-way talk + a
+  soundboard of pre-recorded/recorded clips.
+  - New endpoints: `POST /v1/doorbell/clip` (upload an audio clip → plays now, optionally saves it
+    as a preset), `GET /v1/doorbell/clips` (list saved presets), `POST /v1/doorbell/play` (play a
+    saved preset), `POST /v1/doorbell/delete`, and `GET /v1/doorbell/status`
+    (configured + reachable). All require the household pairing code; talkback actuates the door
+    speaker so the code is enforced.
+  - Any format the app sends is transcoded with ffmpeg to the camera's required AAC-LC ADTS,
+    16 kHz mono. Saved presets live in the add-on's `/data` volume.
+  - **New options:** `doorbell_ip` (the camera's LAN IP — set this to enable talkback) and
+    `doorbell_gain` (playback loudness multiplier, default `3.0`). ffmpeg is now bundled.
+  - Protocol validated live against a real G400.
+- **Exposed to Home Assistant.** The bridge publishes an "ApexSight Doorbell" device via MQTT
+  discovery so you can talk to the door from HA too: a **Reachable** connectivity sensor, a **Last
+  Talkback** sensor, a **Say** text box (type text → the door speaks it), and a **press-button per
+  saved clip** (press → it speaks at the door). Three command topics let automations speak:
+  `apexsight/doorbell/say` (plain text → local TTS → door), `apexsight/doorbell/play_url` (any
+  audio/TTS media URL), and `apexsight/doorbell/play_clip` (a preset slug). Entities self-heal
+  (retained, republished each cycle).
+- **Local text-to-speech.** With `homeassistant_api: true`, the add-on renders `say` text through
+  Home Assistant's TTS (`tts_get_url`) and plays it at the door — pair it with the **Piper** add-on
+  for a fully-local neural voice (no cloud). Engine is configurable via `doorbell_tts_engine`
+  (default `tts.piper`; also accepts a legacy platform like `google_translate`).
+
 ## 1.9.0
 
 - **Doorbell ring → a real CallKit call.** When the doorbell button is pressed, the relay now sends

@@ -17,6 +17,11 @@ export FRIGATE_BASE_URL="$(bashio::config 'frigate_base_url')"
 export TOPIC="$(bashio::config 'topic')"
 export ALERTS_ONLY="$(bashio::config 'alerts_only')"
 
+# ---- doorbell talkback (play audio to the Aqara doorbell speaker) ------------
+export DOORBELL_IP="$(bashio::config 'doorbell_ip')"
+export DOORBELL_GAIN="$(bashio::config 'doorbell_gain')"
+export DOORBELL_TTS_ENGINE="$(bashio::config 'doorbell_tts_engine')"
+
 if bashio::services.available "mqtt"; then
   export MQTT_HOST="$(bashio::services mqtt 'host')"
   export MQTT_PORT="$(bashio::services mqtt 'port')"

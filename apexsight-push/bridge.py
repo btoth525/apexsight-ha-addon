@@ -18,6 +18,7 @@ addon options + MQTT service):
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -63,6 +64,26 @@ PHONES_DEVICE = {"identifiers": ["apexsight_phones"], "name": "ApexSight Phones"
                  "manufacturer": "ApexSight", "model": "Push Relay"}
 HOUSE_DEVICE = {"identifiers": ["apexsight_house"], "name": "ApexSight House",
                 "manufacturer": "ApexSight", "model": "Push Relay"}
+
+# Doorbell talkback (v1.10.0) — the relay can play audio to the Aqara doorbell speaker. The bridge
+# exposes it to HA: a "reachable" connectivity sensor, a "last talkback" sensor, and a press-button
+# per saved clip; plus command topics an HA automation can publish to (e.g. a TTS media URL).
+DOORBELL_IP = os.environ.get("DOORBELL_IP", "").strip()
+DOORBELL_PLAY_URL_TOPIC = "apexsight/doorbell/play_url"     # payload: an http(s)/rtsp audio URL
+DOORBELL_PLAY_CLIP_TOPIC = "apexsight/doorbell/play_clip"   # payload: a saved-preset slug
+DOORBELL_SAY_TOPIC = "apexsight/doorbell/say"              # payload: plain text → HA TTS → door
+DOORBELL_SAY_STATE = "apexsight/doorbell/say_state"
+DOORBELL_TALK_STATE = "apexsight/doorbell/last_talk"
+# HA TTS: with homeassistant_api:true the add-on gets a SUPERVISOR_TOKEN and can reach HA at
+# http://supervisor/core. We synthesize text with tts_get_url, fetch the audio, and play it at the
+# door via the relay's clip endpoint — so `say` speaks any text in the household's TTS voice.
+HA_CORE_URL = "http://supervisor/core"
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+DOORBELL_TTS_ENGINE = os.environ.get("DOORBELL_TTS_ENGINE", "cloud").strip() or "cloud"
+DOORBELL_REACHABLE_STATE = "apexsight/doorbell/reachable"
+DOORBELL_DEVICE = {"identifiers": ["apexsight_doorbell"], "name": "ApexSight Doorbell",
+                   "manufacturer": "ApexSight", "model": "Talkback"}
+_published_clip_buttons: set[str] = set()
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "core-mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883") or "1883")
@@ -288,6 +309,7 @@ def _publish_devices(client) -> None:
     attributes and (2) an 'online' connectivity binary sensor, grouped under 'ApexSight Phones'.
     Retained + re-published every cycle so entities self-heal; a phone that unregisters is cleared."""
     _publish_house_entities(client)
+    _publish_doorbell_entities(client)
     devices = _read_devices()
     current: set[str] = set()
     for d in devices:
@@ -613,6 +635,134 @@ def _post_doorbell() -> None:
         log("doorbell POST failed:", exc)
 
 
+def _publish_last_talk(client, what: str) -> None:
+    """Update the 'Last Talkback' HA sensor after we send audio to the door."""
+    now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+    client.publish(DOORBELL_TALK_STATE, (what or "audio")[:255], retain=True)
+    client.publish(DOORBELL_TALK_STATE + "_attrs", json.dumps({"at": now}), retain=True)
+
+
+def _post_doorbell_play_url(url: str) -> None:
+    """Play an audio URL at the door (HA TTS / media URL → doorbell speaker)."""
+    if not url:
+        return
+    try:
+        r = requests.post(f"{RELAY_URL}/v1/doorbell/play-url",
+                          json={"pairing_code": PAIRING_CODE, "url": url}, timeout=30)
+        log(f"doorbell play_url → relay {r.status_code} {r.text[:120]}")
+    except Exception as exc:
+        log("doorbell play_url POST failed:", exc)
+
+
+def _post_doorbell_play_clip(slug: str) -> None:
+    """Play a saved preset clip at the door."""
+    if not slug:
+        return
+    try:
+        r = requests.post(f"{RELAY_URL}/v1/doorbell/play",
+                          json={"pairing_code": PAIRING_CODE, "slug": slug}, timeout=30)
+        log(f"doorbell play_clip[{slug}] → relay {r.status_code} {r.text[:120]}")
+    except Exception as exc:
+        log("doorbell play_clip POST failed:", exc)
+
+
+def _post_doorbell_say(text: str) -> None:
+    """Speak arbitrary text at the door: HA TTS (tts_get_url) → fetch audio → relay clip endpoint.
+    Best-effort — if TTS isn't reachable, logs a pointer to the play_url path (which always works)."""
+    text = (text or "").strip()
+    if not text:
+        return
+    if not SUPERVISOR_TOKEN:
+        log("say: no SUPERVISOR_TOKEN (needs homeassistant_api:true) — publish a URL to "
+            f"{DOORBELL_PLAY_URL_TOPIC} instead")
+        return
+    hdr = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
+    # A modern TTS entity (Wyoming/Piper) is addressed by engine_id (e.g. "tts.piper"); the old
+    # built-ins by platform (e.g. "google_translate"). Pick by whether it looks like an entity_id.
+    engine = {"engine_id": DOORBELL_TTS_ENGINE} if "." in DOORBELL_TTS_ENGINE \
+        else {"platform": DOORBELL_TTS_ENGINE}
+    try:
+        r = requests.post(f"{HA_CORE_URL}/api/tts_get_url", headers=hdr,
+                          json={**engine, "message": text, "cache": True}, timeout=20)
+        if not r.ok:
+            log(f"say: tts_get_url {r.status_code} {r.text[:150]} — check doorbell_tts_engine")
+            return
+        path = (r.json() or {}).get("path") or ""
+        if not path:
+            log("say: tts_get_url returned no path")
+            return
+        audio = requests.get(f"{HA_CORE_URL}{path}", headers=hdr, timeout=25)
+        if not audio.ok or not audio.content:
+            log(f"say: fetch tts audio failed {audio.status_code}")
+            return
+        files = {"audio": ("say.mp3", audio.content, "audio/mpeg")}
+        pr = requests.post(f"{RELAY_URL}/v1/doorbell/clip",
+                           data={"pairing_code": PAIRING_CODE}, files=files, timeout=40)
+        log(f"say[{text[:40]!r}] → door {pr.status_code} {pr.text[:120]}")
+    except Exception as exc:
+        log("say failed:", exc)
+
+
+def _publish_doorbell_entities(client) -> None:
+    """Expose the doorbell talkback to HA: a Reachable connectivity sensor, a Last Talkback sensor,
+    and a press-button per saved clip. Retained + republished every cycle so they self-heal."""
+    if not DOORBELL_IP:
+        return
+    client.publish(f"{DISCOVERY_PREFIX}/binary_sensor/apexsight_doorbell_reachable/config", json.dumps({
+        "name": "Reachable", "unique_id": "apexsight_doorbell_reachable",
+        "state_topic": DOORBELL_REACHABLE_STATE, "device_class": "connectivity",
+        "icon": "mdi:bullhorn", "device": DOORBELL_DEVICE,
+    }), retain=True)
+    client.publish(f"{DISCOVERY_PREFIX}/sensor/apexsight_doorbell_talkback/config", json.dumps({
+        "name": "Last Talkback", "unique_id": "apexsight_doorbell_talkback",
+        "state_topic": DOORBELL_TALK_STATE, "json_attributes_topic": DOORBELL_TALK_STATE + "_attrs",
+        "icon": "mdi:message-badge", "device": DOORBELL_DEVICE,
+    }), retain=True)
+    # A text box you can type into (HA UI / dashboard / automation) → the door speaks it via TTS.
+    client.publish(f"{DISCOVERY_PREFIX}/text/apexsight_doorbell_say/config", json.dumps({
+        "name": "Say", "unique_id": "apexsight_doorbell_say",
+        "command_topic": DOORBELL_SAY_TOPIC, "state_topic": DOORBELL_SAY_STATE,
+        "max": 255, "icon": "mdi:bullhorn", "device": DOORBELL_DEVICE,
+    }), retain=True)
+
+    reachable = False
+    try:
+        r = requests.get(f"{RELAY_URL}/v1/doorbell/status",
+                         params={"pairing_code": PAIRING_CODE}, timeout=8)
+        if r.ok:
+            reachable = bool(r.json().get("reachable"))
+    except Exception:
+        pass
+    client.publish(DOORBELL_REACHABLE_STATE, "ON" if reachable else "OFF", retain=True)
+
+    clips = []
+    try:
+        r = requests.get(f"{RELAY_URL}/v1/doorbell/clips",
+                         params={"pairing_code": PAIRING_CODE}, timeout=8)
+        if r.ok:
+            clips = r.json().get("clips", []) or []
+    except Exception:
+        pass
+    current: set[str] = set()
+    for c in clips:
+        slug = c.get("slug")
+        if not slug:
+            continue
+        name = c.get("name", slug)
+        obj = "apexsight_doorbell_clip_" + re.sub(r"[^a-z0-9_]", "_", slug.lower())
+        current.add(obj)
+        client.publish(f"{DISCOVERY_PREFIX}/button/{obj}/config", json.dumps({
+            "name": f"Say: {name}", "unique_id": obj, "object_id": obj,
+            "command_topic": DOORBELL_PLAY_CLIP_TOPIC, "payload_press": slug,
+            "icon": "mdi:bullhorn-variant", "device": DOORBELL_DEVICE,
+        }), retain=True)
+        _published_clip_buttons.add(obj)
+    # Clear buttons for clips the user deleted.
+    for obj in list(_published_clip_buttons - current):
+        client.publish(f"{DISCOVERY_PREFIX}/button/{obj}/config", "", retain=True)
+        _published_clip_buttons.discard(obj)
+
+
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}, subscribing {TOPIC} + {EVENTS_TOPIC}")
@@ -622,6 +772,12 @@ def on_connect(client, userdata, flags, rc, properties=None):
         log(f"subscribing {MODE_TOPIC} for house mode")
         client.subscribe(DOORBELL_TOPIC)
         log(f"subscribing {DOORBELL_TOPIC} for doorbell ring")
+        if DOORBELL_IP:
+            client.subscribe(DOORBELL_PLAY_URL_TOPIC)
+            client.subscribe(DOORBELL_PLAY_CLIP_TOPIC)
+            client.subscribe(DOORBELL_SAY_TOPIC)
+            log(f"subscribing {DOORBELL_PLAY_URL_TOPIC} + {DOORBELL_PLAY_CLIP_TOPIC} + "
+                f"{DOORBELL_SAY_TOPIC} for talkback")
         if AI_DESCRIPTIONS:
             client.subscribe(DESC_TOPIC)
             log(f"subscribing {DESC_TOPIC} for AI descriptions")
@@ -678,6 +834,24 @@ def on_message(client, userdata, msg):
     # Doorbell ring — any message on this topic fires the VoIP push (payload content ignored).
     if msg.topic == DOORBELL_TOPIC:
         _post_doorbell()
+        return
+    # Doorbell talkback — play an audio URL (HA TTS/media) or a saved preset clip at the door.
+    if msg.topic == DOORBELL_PLAY_URL_TOPIC:
+        url = msg.payload.decode("utf-8", "ignore").strip()
+        _post_doorbell_play_url(url)
+        _publish_last_talk(client, url[:80] or "URL")
+        return
+    if msg.topic == DOORBELL_PLAY_CLIP_TOPIC:
+        slug = msg.payload.decode("utf-8", "ignore").strip()
+        _post_doorbell_play_clip(slug)
+        _publish_last_talk(client, slug)
+        return
+    if msg.topic == DOORBELL_SAY_TOPIC:
+        text = msg.payload.decode("utf-8", "ignore").strip()
+        _post_doorbell_say(text)
+        # Echo into the text entity's state + record it, then clear so the box is ready for the next.
+        client.publish(DOORBELL_SAY_STATE, text[:255], retain=True)
+        _publish_last_talk(client, f"say: {text[:60]}")
         return
     try:
         event = json.loads(msg.payload.decode("utf-8"))

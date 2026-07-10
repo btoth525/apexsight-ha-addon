@@ -13,17 +13,20 @@ import asyncio
 import datetime
 import json
 import os
+import tempfile
 import time
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, config, db, gate, recap, render
+from . import apns, aqara_talk, config, db, doorbell, gate, recap, render
 from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
@@ -169,6 +172,16 @@ class NotifyIn(BaseModel):
     stage: str = ""
 
 
+class DoorbellPlayIn(BaseModel):
+    pairing_code: str = ""
+    slug: str = Field(min_length=1, max_length=64)   # which saved talkback preset to play/delete
+
+
+class DoorbellUrlIn(BaseModel):
+    pairing_code: str = ""
+    url: str = Field(min_length=8, max_length=2048)  # http(s)/rtsp audio URL to play at the door
+
+
 class AICamerasIn(BaseModel):
     pairing_code: str
     disabled: list[str] = []   # cameras the user turned AI descriptions OFF for (default: all on)
@@ -282,6 +295,119 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
                 db.delete_voip(row["voip_token"])
     print(f"[doorbell] ring → {sent} phones (failed {failed})", flush=True)
     return {"ok": True, "sent": sent, "failed": failed, "phones": len(rows)}
+
+
+# ---- doorbell talkback (play audio to the Aqara speaker) ---------------------
+
+def _require_pairing(code: str) -> str:
+    """Talkback actuates hardware (the door speaker), so require the household pairing code."""
+    code = (code or "").upper().strip()
+    if PAIRING_CODE and code != PAIRING_CODE:
+        raise HTTPException(status_code=403, detail="bad pairing code")
+    return code
+
+
+async def _play_upload(upload: UploadFile) -> int:
+    """Save an uploaded clip to a temp file and play it to the doorbell. Returns frames sent."""
+    data = await upload.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty audio")
+    if len(data) > doorbell.MAX_CLIP_BYTES:
+        raise HTTPException(status_code=413, detail="clip too large")
+    suffix = os.path.splitext(upload.filename or "")[1][:8] or ".bin"
+    tmp = tempfile.NamedTemporaryFile(prefix="apex_talk_", suffix=suffix, delete=False)
+    try:
+        tmp.write(data)
+        tmp.close()
+        return await run_in_threadpool(doorbell.play_path, Path(tmp.name))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+@app.get("/v1/doorbell/status")
+async def doorbell_status(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
+    """Whether talkback is configured + the doorbell is reachable (powers the app's Talk UI)."""
+    _require_pairing(pairing_code)
+    configured = doorbell.is_configured()
+    return {"ok": True, "configured": configured,
+            "reachable": (await run_in_threadpool(doorbell.reachable)) if configured else False}
+
+
+@app.post("/v1/doorbell/clip")
+async def doorbell_clip(
+    pairing_code: str = Form(""),
+    save_as: str = Form(""),
+    audio: UploadFile = File(...),
+    _: None = Depends(rate_limit),
+) -> dict:
+    """Play an uploaded clip to the doorbell speaker right now; optionally save it as a preset."""
+    _require_pairing(pairing_code)
+    if not doorbell.is_configured():
+        raise HTTPException(status_code=503, detail="doorbell_ip not set in add-on config")
+    saved = None
+    if save_as.strip():
+        data = await audio.read()
+        await audio.seek(0)
+        ext = os.path.splitext(audio.filename or "")[1].lstrip(".") or "bin"
+        saved = doorbell.save_clip(save_as.strip(), data, ext)
+    try:
+        frames = await _play_upload(audio)
+    except aqara_talk.TalkbackError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"ok": True, "frames": frames, "saved": saved}
+
+
+@app.get("/v1/doorbell/clips")
+async def doorbell_clips(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
+    _require_pairing(pairing_code)
+    return {"ok": True, "clips": doorbell.list_clips()}
+
+
+@app.post("/v1/doorbell/play")
+async def doorbell_play(body: DoorbellPlayIn, _: None = Depends(rate_limit)) -> dict:
+    """Play a saved preset by slug."""
+    _require_pairing(body.pairing_code)
+    if not doorbell.is_configured():
+        raise HTTPException(status_code=503, detail="doorbell_ip not set in add-on config")
+    path = doorbell.clip_file(body.slug)
+    if not path:
+        raise HTTPException(status_code=404, detail="clip not found")
+    try:
+        frames = await run_in_threadpool(doorbell.play_path, path)
+    except aqara_talk.TalkbackError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"ok": True, "frames": frames}
+
+
+@app.post("/v1/doorbell/delete")
+async def doorbell_delete(body: DoorbellPlayIn, _: None = Depends(rate_limit)) -> dict:
+    _require_pairing(body.pairing_code)
+    return {"ok": True, "deleted": doorbell.delete_clip(body.slug)}
+
+
+@app.post("/v1/doorbell/play-url")
+async def doorbell_play_url(body: DoorbellUrlIn, _: None = Depends(rate_limit)) -> dict:
+    """Play audio from an http(s)/rtsp URL to the doorbell speaker. This is what the HA bridge
+    calls for `apexsight/doorbell/play_url` — so any HA TTS/media URL can speak at the door."""
+    _require_pairing(body.pairing_code)
+    if not doorbell.is_configured():
+        raise HTTPException(status_code=503, detail="doorbell_ip not set in add-on config")
+    url = body.url.strip()
+    if not url.lower().startswith(("http://", "https://", "rtsp://")):
+        raise HTTPException(status_code=400, detail="url must be http(s) or rtsp")
+    try:
+        frames = await run_in_threadpool(
+            lambda: aqara_talk.play_audio(
+                doorbell.DOORBELL_IP, ["-re", "-i", url],
+                volume_gain=doorbell.DOORBELL_GAIN, log=lambda m: print(m, flush=True),
+            )
+        )
+    except aqara_talk.TalkbackError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"ok": True, "frames": frames}
 
 
 @app.post("/v1/test")
