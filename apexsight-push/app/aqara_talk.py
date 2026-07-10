@@ -27,6 +27,18 @@ RTP_PAYLOAD_TYPE = 97  # AAC dynamic payload type
 HEARTBEAT_INTERVAL = 5.0
 CONNECT_TIMEOUT = 3.0
 SAMPLES_PER_FRAME = 1024  # AAC-LC frame @ 16 kHz
+FRAME_SECONDS = SAMPLES_PER_FRAME / 16000  # ~64 ms per AAC frame
+
+# The Aqara opens its speaker ~0.5-0.8s AFTER the START_VOICE handshake, and it primes on the RTP
+# audio stream itself (not the ACK) — so streaming the real clip immediately swallows the first
+# word, and firing STOP_VOICE the instant ffmpeg hits EOF flushes the decoder buffer before it has
+# played the last word. We bracket the real audio with paced silence: a lead-in warms the speaker
+# while wall-clock elapses, a tail keeps the stream alive so the buffer drains, then a short pause
+# before STOP_VOICE. (An ffmpeg `-af adelay` lead-in was tried and DROPPED under `-re` — it emits
+# non-monotonic DTS and the silence vanishes; sending silence RTP frames is the reliable path.)
+SILENCE_LEAD_SECONDS = 0.8
+SILENCE_TAIL_SECONDS = 0.5
+DRAIN_SECONDS = 0.3
 
 MAGIC = b"\xFE\xEF"
 TYPE_START_VOICE = 0
@@ -124,6 +136,32 @@ def _extract_adts_frames(buf: bytes) -> Tuple[List[bytes], bytes]:
         frames.append(buf[off:off + frame_len])
         off += frame_len
     return frames, buf[off:]
+
+
+_silence_lock = threading.Lock()
+_silence_frames_cache: "List[bytes] | None" = None
+
+
+def _silence_frames(ffmpeg: str) -> List[bytes]:
+    """AAC-LC ADTS silent frames (16 kHz mono, 32 kbps) — encoded exactly like the real audio so
+    the camera decoder sees one continuous stream. Generated once via ffmpeg and cached; returns
+    an empty list (padding simply skipped) if ffmpeg can't be run."""
+    global _silence_frames_cache
+    with _silence_lock:
+        if _silence_frames_cache is None:
+            try:
+                out = subprocess.run(
+                    [ffmpeg, "-hide_banner", "-loglevel", "error",
+                     "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "1.0",
+                     "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "32k",
+                     "-ar", "16000", "-ac", "1", "-f", "adts", "pipe:1"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
+                ).stdout
+                frames, _ = _extract_adts_frames(out)
+                _silence_frames_cache = frames or []
+            except (OSError, subprocess.SubprocessError):
+                _silence_frames_cache = []
+        return _silence_frames_cache
 
 
 def _ffmpeg_args(ffmpeg: str, input_args: Sequence[str], volume_gain: float,
@@ -230,6 +268,25 @@ def _play_locked(camera_ip, input_args, *, ffmpeg, volume_gain, max_seconds, log
             hb_thread.start()
 
             seq = 0
+
+            def _emit(frame: bytes) -> None:
+                nonlocal seq
+                header = _build_rtp_header(seq, seq * SAMPLES_PER_FRAME, ssrc)
+                udp.sendto(header + frame, (camera_ip, AUDIO_PORT))
+                seq += 1
+
+            def _emit_silence(seconds: float) -> None:
+                # Paced at real time so the speaker actually warms / the buffer actually drains —
+                # a burst would arrive in ~1ms and defeat the purpose.
+                for i in range(int(seconds / FRAME_SECONDS)):
+                    _emit(silence[i % len(silence)])
+                    time.sleep(FRAME_SECONDS)
+
+            silence = _silence_frames(ffmpeg)
+            if silence:
+                _emit_silence(SILENCE_LEAD_SECONDS)  # warm the speaker before the first word
+
+            real_frames = 0
             buf = b""
             try:
                 assert proc.stdout is not None
@@ -240,9 +297,8 @@ def _play_locked(camera_ip, input_args, *, ffmpeg, volume_gain, max_seconds, log
                     buf += chunk
                     frames, buf = _extract_adts_frames(buf)
                     for frame in frames:
-                        header = _build_rtp_header(seq, seq * SAMPLES_PER_FRAME, ssrc)
-                        udp.sendto(header + frame, (camera_ip, AUDIO_PORT))
-                        seq += 1
+                        _emit(frame)  # real audio is already real-time paced by ffmpeg -re
+                        real_frames += 1
             finally:
                 stop_hb.set()
                 killer.cancel()
@@ -256,11 +312,18 @@ def _play_locked(camera_ip, input_args, *, ffmpeg, volume_gain, max_seconds, log
                         log(f"[talk][ffmpeg] {err}")
                 except OSError:
                     pass
+
+            # Keep the RTP stream alive past the last word so the camera's decode buffer plays it
+            # out, then pause before STOP_VOICE (the finally below) flushes the speaker.
+            if silence:
+                _emit_silence(SILENCE_TAIL_SECONDS)
+            time.sleep(DRAIN_SECONDS)
         finally:
             udp.close()
 
-        log(f"[talk] sent {seq} AAC frames (~{seq * SAMPLES_PER_FRAME / 16000:.1f}s)")
-        return seq
+        log(f"[talk] sent {real_frames} AAC frames "
+            f"(~{real_frames * SAMPLES_PER_FRAME / 16000:.1f}s) + silence pad")
+        return real_frames
     finally:
         try:
             tcp.sendall(build_packet(TYPE_STOP_VOICE, session_ts))

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.10.2
+
+Fix: doorbell talkback / "Say" no longer cuts off the first and last words.
+
+- The Aqara opens its speaker ~0.5–0.8s **after** the START_VOICE handshake and primes on the RTP
+  audio stream itself, so streaming the clip immediately swallowed the first word; and firing
+  STOP_VOICE the instant ffmpeg reached EOF flushed the decode buffer before it had played the
+  last word. Short phrases (a TTS "hello" or a one-word name) lost roughly half of what was said.
+- The full audio was always transmitted — verified the ffmpeg encode is faithful (a 2.0s source
+  yields 2.1s / 33 frames) — so this was purely a camera playback-window problem, not truncation.
+- Fix: bracket the real audio with **paced AAC silence** — a ~0.8s lead-in warms the speaker while
+  wall-clock elapses, a ~0.5s tail keeps the RTP stream alive so the buffer drains, then a short
+  pause before STOP_VOICE. RTP sequence + timestamps stay continuous across the padding, so the
+  camera sequences playback correctly. (An ffmpeg `-af adelay` lead-in was tried first and rejected:
+  under `-re` it emits non-monotonic DTS and the silence is dropped entirely.)
+- Silence frames are generated once via ffmpeg and cached; if ffmpeg can't run the padding is
+  simply skipped (same behavior as before), never a failure.
+
 ## 1.10.1
 
 Hardening pass on 1.10.0's talkback (full audit):
