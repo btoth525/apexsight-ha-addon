@@ -17,6 +17,9 @@ Fix: doorbell talkback / "Say" no longer cuts off the first and last words.
   under `-re` it emits non-monotonic DTS and the silence is dropped entirely.)
 - Silence frames are generated once via ffmpeg and cached; if ffmpeg can't run the padding is
   simply skipped (same behavior as before), never a failure.
+- The three windows are **tunable from the add-on Configuration tab** — `doorbell_lead_ms` (800),
+  `doorbell_tail_ms` (500), `doorbell_drain_ms` (300) — since the exact warm-up is firmware-
+  dependent. If a word is still clipped, raise the matching value and restart; no rebuild needed.
 
 ## 1.10.1
 

@@ -31,6 +31,9 @@ options:
   doorbell_ip: ""
   doorbell_gain: "3.0"
   doorbell_tts_engine: "tts.piper"
+  doorbell_lead_ms: 800
+  doorbell_tail_ms: 500
+  doorbell_drain_ms: 300
   mqtt_host: ""
   mqtt_port: 0
   mqtt_user: ""
@@ -45,6 +48,9 @@ schema:
   doorbell_ip: str?
   doorbell_gain: str?
   doorbell_tts_engine: str?
+  doorbell_lead_ms: int(0,5000)?
+  doorbell_tail_ms: int(0,5000)?
+  doorbell_drain_ms: int(0,3000)?
   mqtt_host: str?
   mqtt_port: int?
   mqtt_user: str?

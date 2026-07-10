@@ -23,6 +23,23 @@ configuration:
   topic:
     name: MQTT topic
     description: Frigate review topic. Leave as frigate/reviews unless you changed it.
+  doorbell_lead_ms:
+    name: Doorbell warm-up lead (ms)
+    description: >-
+      Silence played to the doorbell speaker BEFORE your words so it's fully awake
+      — the Aqara opens its speaker a beat after the talk session starts. Raise it
+      if the FIRST word is still clipped; lower it if there's too much dead air.
+      Default 800.
+  doorbell_tail_ms:
+    name: Doorbell drain tail (ms)
+    description: >-
+      Silence played AFTER your words so the speaker finishes the last one before
+      the session closes. Raise it if the END is clipped. Default 500.
+  doorbell_drain_ms:
+    name: Doorbell close pause (ms)
+    description: >-
+      Extra pause before hanging up the talk session, so the speaker buffer fully
+      empties. Default 300.
   mqtt_host:
     name: MQTT host (optional)
     description: Leave blank to use the Home Assistant broker automatically.

@@ -21,6 +21,9 @@ export ALERTS_ONLY="$(bashio::config 'alerts_only')"
 export DOORBELL_IP="$(bashio::config 'doorbell_ip')"
 export DOORBELL_GAIN="$(bashio::config 'doorbell_gain')"
 export DOORBELL_TTS_ENGINE="$(bashio::config 'doorbell_tts_engine')"
+export DOORBELL_LEAD_MS="$(bashio::config 'doorbell_lead_ms')"
+export DOORBELL_TAIL_MS="$(bashio::config 'doorbell_tail_ms')"
+export DOORBELL_DRAIN_MS="$(bashio::config 'doorbell_drain_ms')"
 
 if bashio::services.available "mqtt"; then
   export MQTT_HOST="$(bashio::services mqtt 'host')"

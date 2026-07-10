@@ -13,6 +13,7 @@ against a real G400 (START_VOICE → ACK(0) → STOP_VOICE → ACK(0)).
 """
 from __future__ import annotations
 
+import os
 import random
 import socket
 import struct
@@ -20,6 +21,14 @@ import subprocess
 import threading
 import time
 from typing import Callable, List, Sequence, Tuple
+
+
+def _env_ms(name: str, default_ms: int) -> float:
+    """Read a millisecond tunable from the add-on env into seconds; fall back on garbage input."""
+    try:
+        return max(0.0, float(os.environ.get(name, default_ms)) / 1000.0)
+    except (TypeError, ValueError):
+        return default_ms / 1000.0
 
 CONTROL_PORT = 54324
 AUDIO_PORT = 54323
@@ -36,9 +45,12 @@ FRAME_SECONDS = SAMPLES_PER_FRAME / 16000  # ~64 ms per AAC frame
 # while wall-clock elapses, a tail keeps the stream alive so the buffer drains, then a short pause
 # before STOP_VOICE. (An ffmpeg `-af adelay` lead-in was tried and DROPPED under `-re` — it emits
 # non-monotonic DTS and the silence vanishes; sending silence RTP frames is the reliable path.)
-SILENCE_LEAD_SECONDS = 0.8
-SILENCE_TAIL_SECONDS = 0.5
-DRAIN_SECONDS = 0.3
+# Tunable from the add-on config (doorbell_lead_ms / _tail_ms / _drain_ms) so the warm-up window
+# can be dialed in against the real camera without shipping a new build — the exact timing is
+# firmware-dependent. Read once at import (add-on restarts on any option change).
+SILENCE_LEAD_SECONDS = _env_ms("DOORBELL_LEAD_MS", 800)
+SILENCE_TAIL_SECONDS = _env_ms("DOORBELL_TAIL_MS", 500)
+DRAIN_SECONDS = _env_ms("DOORBELL_DRAIN_MS", 300)
 
 MAGIC = b"\xFE\xEF"
 TYPE_START_VOICE = 0
