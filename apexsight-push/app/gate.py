@@ -43,12 +43,28 @@ MODE_MUTES = {
 }
 
 
-def mode_mutes_camera(mode: Any, camera: str) -> bool:
+def resolve_mode_mutes(mode: Any, custom_map: Any = None) -> list:
+    """The muted-camera list for `mode`: the household's custom map (edited in the app's per-mode
+    notification screen, stored relay-side as `mode_map`) when it has a list for this mode, else
+    the built-in defaults. Same fail-open shape: unknown mode → [] (nothing muted)."""
+    m = str(mode or "").strip().lower()
+    if isinstance(custom_map, dict):
+        v = custom_map.get(m)
+        if isinstance(v, list):
+            return [str(c) for c in v if isinstance(c, str) and c]
+    return MODE_MUTES.get(m, [])
+
+
+def mode_mutes_camera(mode: Any, camera: str, custom_map: Any = None) -> bool:
     """True only when `mode` CONFIDENTLY mutes `camera`. Unknown/blank mode, or a camera not in that
-    mode's mute-list → False (deliver). Away → False for everything. FAIL-OPEN at the mode layer."""
+    mode's mute-list → False (deliver). Away's default mutes nothing. FAIL-OPEN at the mode layer.
+    `custom_map` (the household's app-edited per-mode mute lists) overrides the defaults per mode."""
     if not camera:
         return False
-    muted = MODE_MUTES.get(str(mode or "").strip().lower())
+    m = str(mode or "").strip().lower()
+    if isinstance(custom_map, dict) and isinstance(custom_map.get(m), list):
+        return camera in resolve_mode_mutes(m, custom_map)
+    muted = MODE_MUTES.get(m)
     if muted is None:
         return False
     return camera in muted

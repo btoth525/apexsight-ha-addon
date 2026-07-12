@@ -365,6 +365,86 @@ def _publish_devices(client) -> None:
         _published_phones.discard(obj)
 
 
+# Built-in per-mode mute defaults — MUST mirror app/gate.py MODE_MUTES (the relay is the source of
+# truth; this copy only covers the fallback when no custom map is stored, since bridge.py doesn't
+# import the app package). Mute-lists, fail-open: unlisted camera → alerts.
+_MODE_MUTES_DEFAULT = {
+    "home":  ["Backyard_Wide", "Garage", "Living_Room_Wide", "Ryleighs_Rm",
+              "Side_Gate", "movie_room", "zachs_room"],
+    "night": ["Living_Room_Wide", "Ryleighs_Rm", "movie_room", "zachs_room"],
+    "away":  [],
+}
+_ALL_CAMERAS_FALLBACK = ["Front_Driveway", "doorbell", "Side_Gate", "Backyard_Wide", "Garage",
+                         "Living_Room_Wide", "Ryleighs_Rm", "movie_room", "zachs_room"]
+
+
+def _ha_switch(entities, on: bool) -> None:
+    """Flip HA switches via the Core API (batch). Best-effort — a missing entity or transient HA
+    error must never take the sync loop down."""
+    if not entities or not SUPERVISOR_TOKEN:
+        return
+    try:
+        requests.post(
+            f"{HA_CORE_URL}/api/services/switch/turn_{'on' if on else 'off'}",
+            headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+            json={"entity_id": entities}, timeout=15,
+        )
+    except Exception as exc:
+        log(f"frigate switch turn_{'on' if on else 'off'} failed:", exc)
+
+
+def _sync_frigate_alert_switches() -> None:
+    """Make Frigate's per-camera review_alerts/review_detections switches match the current house
+    mode + the household's custom mode map (edited in the app). This is what keeps 'relay and Home
+    Assistant in sync': the relay map is the source of truth, and Frigate stops CREATING alerts for
+    muted cameras so the PWA, HA and the app all agree."""
+    mode = (_get_cfg("house_mode", "") or "").strip().lower()
+    if mode not in _MODE_MUTES_DEFAULT:
+        return                      # unknown mode → leave switches alone (fail-open)
+    custom = {}
+    raw = _get_cfg("mode_map", "")
+    if raw:
+        try:
+            custom = json.loads(raw) or {}
+        except json.JSONDecodeError:
+            custom = {}
+    muted = custom.get(mode) if isinstance(custom.get(mode), list) else _MODE_MUTES_DEFAULT[mode]
+    roster = custom.get("_cameras") if isinstance(custom.get("_cameras"), list) else []
+    if not roster:
+        roster = _ALL_CAMERAS_FALLBACK
+    on_entities, off_entities = [], []
+    for cam in roster:
+        slug = str(cam).strip().lower()
+        if not slug:
+            continue
+        pair = [f"switch.{slug}_review_alerts", f"switch.{slug}_review_detections"]
+        (off_entities if cam in muted else on_entities).extend(pair)
+    _ha_switch(on_entities, True)
+    _ha_switch(off_entities, False)
+    log(f"frigate alert switches synced for mode '{mode}': "
+        f"{len(on_entities)//2} alerting, {len(off_entities)//2} muted")
+
+
+def _frigate_switch_watcher() -> None:
+    """Re-sync Frigate's alert switches whenever the house mode or the household mode map changes
+    (checked every 3s), plus a 10-minute heartbeat so a manual flip or an HA restart self-heals."""
+    last = None
+    last_forced = 0.0
+    while True:
+        try:
+            mode = _get_cfg("house_mode", "") or ""
+            seq = _get_cfg("mode_map_seq", "") or ""
+            key = f"{mode}|{seq}"
+            now = time.time()
+            if key != last or now - last_forced > 600:
+                _sync_frigate_alert_switches()
+                last = key
+                last_forced = now
+        except Exception as exc:
+            log("frigate switch sync failed:", exc)
+        time.sleep(3)
+
+
 def _mode_request_watcher(client) -> None:
     """Poll the relay's consume-once arm/disarm request and publish it to HA over MQTT.
 
@@ -904,6 +984,7 @@ def main():
     threading.Thread(target=_device_publisher, args=(client,), daemon=True).start()
     # Watch for app arm/disarm requests and forward them to HA (consume-once, restart-safe).
     threading.Thread(target=_mode_request_watcher, args=(client,), daemon=True).start()
+    threading.Thread(target=_frigate_switch_watcher, daemon=True).start()
 
     while True:
         try:

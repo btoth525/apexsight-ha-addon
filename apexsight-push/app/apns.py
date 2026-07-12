@@ -226,7 +226,10 @@ async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str 
             continue
         failed += 1
         errors.append(detail)
-        if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered")):
+        # BadEnvironmentKeyInToken = token registered under the wrong APNs environment for this
+        # relay's key — permanent for that registration, never deliverable → prune like 410.
+        if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered",
+                                     "BadEnvironmentKeyInToken")):
             db.delete_device(token)
             pruned += 1
     return {"devices": len(rows), "sent": sent, "failed": failed,

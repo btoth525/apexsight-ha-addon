@@ -253,6 +253,18 @@ class SetModeIn(BaseModel):
     code: str = ""   # Alarmo code; required to disarm. Forwarded to HA→Alarmo, never validated here.
 
 
+class ModeMapIn(BaseModel):
+    # The household's per-mode camera alert matrix, edited in the app (Settings → Notifications →
+    # House Mode Alerts). `mutes` = {mode: [cameras muted in that mode]}; `cameras` = the full roster
+    # the app saw (lets the bridge turn the UNMUTED cameras' Frigate switches back ON). Household-
+    # wide: one map for every phone on the pairing code. `reset:true` restores built-in defaults.
+    pairing_code: str
+    mutes: dict = {}
+    cameras: list = []
+    by: str = ""
+    reset: bool = False
+
+
 class StyleIn(BaseModel):
     pairing_code: str
     style: dict
@@ -508,7 +520,7 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     # Home). House-level (all devices), applied before the per-device loop. FAIL-OPEN: unknown/blank
     # mode or a camera not in that mode's mute-list delivers; Away mutes nothing.
     house_mode = db.get_config("house_mode", "") or ""
-    if gate.mode_mutes_camera(house_mode, body.camera):
+    if gate.mode_mutes_camera(house_mode, body.camera, _load_mode_map()):
         print(f"[mode] {house_mode}: {body.camera} muted → suppress all", flush=True)
         return {"ok": True, "sent": 0, "note": f"mode {house_mode}: camera muted"}
 
@@ -660,10 +672,27 @@ def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
     return {"ok": False, "note": f"unknown mode '{mode}' ignored (fail-open)"}
 
 
+def _load_mode_map() -> dict | None:
+    """The household's custom per-mode mute map ({mode: [cameras]}), or None when unset/corrupt
+    (→ gate falls back to the built-in defaults; fail-open all the way down)."""
+    raw = db.get_config("mode_map", "")
+    if not raw:
+        return None
+    try:
+        m = json.loads(raw)
+        return m if isinstance(m, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 @app.get("/v1/mode")
-def get_mode() -> dict:
+def get_mode(pairing_code: str = "") -> dict:
     """Current house mode + which cameras it mutes — for the app (to reflect state), the HA bridge,
-    and debugging. `armed_by` reports who last requested a change (from the app), for display."""
+    and debugging. `armed_by` reports who last requested a change (from the app), for display.
+    `map` is the EFFECTIVE per-mode mute matrix (household custom map when set, else defaults) plus
+    `map_custom` so the app can show "edited" vs "defaults". When the household `pairing_code` is
+    supplied, also reports the household gate (`snoozed_until`/`disarmed`) so the app can SHOW a
+    loud "notifications are snoozed/off" banner instead of silently dropping alerts."""
     mode = db.get_config("house_mode", "") or ""
     armed_by = {}
     raw = db.get_config("armed_by", "")
@@ -672,7 +701,73 @@ def get_mode() -> dict:
             armed_by = json.loads(raw)
         except json.JSONDecodeError:
             armed_by = {}
-    return {"mode": mode, "mutes": gate.MODE_MUTES.get(mode, []), "armed_by": armed_by}
+    custom = _load_mode_map()
+    mutes_map = {m: gate.resolve_mode_mutes(m, custom) for m in gate.MODE_MUTES}
+    out = {"mode": mode, "mutes": gate.resolve_mode_mutes(mode, custom), "armed_by": armed_by,
+           "map": mutes_map, "map_custom": custom is not None,
+           "cameras": _mode_map_cameras(custom)}
+    code = pairing_code.upper().strip()
+    if code and code == PAIRING_CODE:
+        g = {}
+        graw = db.get_config(f"gate:{code}")
+        if graw:
+            try:
+                g = json.loads(graw)
+            except json.JSONDecodeError:
+                g = {}
+        snoozed = float(g.get("snoozed_until") or 0)
+        out["snoozed_until"] = snoozed if snoozed > time.time() else 0
+        out["disarmed"] = bool(g.get("disarmed"))
+    return out
+
+
+def _mode_map_cameras(custom: dict | None) -> list:
+    """Full camera roster for the mode editor: what the app last sent with the map, else every
+    camera named anywhere in the effective map (so the editor always has rows to show)."""
+    if isinstance(custom, dict) and isinstance(custom.get("_cameras"), list):
+        return [c for c in custom["_cameras"] if isinstance(c, str) and c]
+    names: list = []
+    for m in gate.MODE_MUTES:
+        for c in gate.resolve_mode_mutes(m, custom):
+            if c not in names:
+                names.append(c)
+    return names
+
+
+@app.post("/v1/mode-map")
+def set_mode_map(body: ModeMapIn, _: None = Depends(rate_limit)) -> dict:
+    """Save the household's per-mode camera alert matrix (from the app's House Mode Alerts editor).
+    Household-wide by design — one map per pairing code, every phone follows it. Stored as MUTE
+    lists (fail-open: an unlisted/new camera always alerts). Bumps `mode_map_seq` so the bridge
+    re-syncs Frigate's per-camera alert switches to match."""
+    _require_pairing(body.pairing_code)
+    if body.reset:
+        db.set_config("mode_map", "")
+        db.set_config("mode_map_seq", str(int(time.time())))
+        return {"ok": True, "reset": True, "map": dict(gate.MODE_MUTES)}
+    if not isinstance(body.mutes, dict):
+        raise HTTPException(status_code=400, detail="mutes must be an object of mode → [cameras]")
+    clean: dict = {}
+    for m in gate.MODE_MUTES:                      # only known modes; ignore junk keys
+        v = body.mutes.get(m)
+        if isinstance(v, list):
+            clean[m] = [str(c) for c in v if isinstance(c, str) and c][:64]
+    if not clean:
+        raise HTTPException(status_code=400, detail="no valid mode lists in mutes")
+    # Modes the app didn't send keep their previous custom list (or defaults if none).
+    prev = _load_mode_map() or {}
+    merged = {m: clean.get(m, prev.get(m, gate.MODE_MUTES[m])) for m in gate.MODE_MUTES}
+    if body.cameras:
+        merged["_cameras"] = [str(c) for c in body.cameras if isinstance(c, str) and c][:64]
+    elif isinstance(prev.get("_cameras"), list):
+        merged["_cameras"] = prev["_cameras"]
+    merged["_by"] = (body.by or "")[:64]
+    merged["_at"] = time.time()
+    db.set_config("mode_map", json.dumps(merged))
+    db.set_config("mode_map_seq", str(int(time.time())))
+    print(f"[mode-map] updated by {body.by or '?'}: " +
+          ", ".join(f"{m} mutes {len(merged[m])}" for m in gate.MODE_MUTES), flush=True)
+    return {"ok": True, "map": {m: merged[m] for m in gate.MODE_MUTES}}
 
 
 @app.post("/v1/set-mode")

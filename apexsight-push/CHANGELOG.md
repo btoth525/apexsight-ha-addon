@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.10.5
+
+**Editable per-mode camera alerts (household-wide) + snooze visibility.**
+
+- **New: the house-mode camera alert matrix is now editable from the app** (Settings →
+  Notifications → House Mode Alerts) instead of hardcoded. `POST /v1/mode-map` stores the
+  household's per-mode mute lists (one map per pairing code — every phone follows it);
+  `GET /v1/mode` now returns the full effective matrix (`map`, `map_custom`, `cameras`) so the app
+  can show exactly what alerts in each mode. Fail-open preserved: mute-lists, so a new camera
+  always alerts until explicitly turned off. Reset-to-defaults supported.
+- **New: the bridge mirrors the matrix into Frigate itself.** On every house-mode or map change
+  (and a 10-min self-heal), the bridge flips each camera's `review_alerts`/`review_detections`
+  switches via the HA API so Frigate stops creating alerts for muted cameras — the app, relay,
+  HA and the Frigate PWA all agree. This replaces the hardcoded lists in the
+  "Frigate Alerts Follow House Mode" HA automation (which can be disabled once this runs).
+- **Fix: household snooze/disarm is now VISIBLE.** `GET /v1/mode?pairing_code=…` reports
+  `snoozed_until`/`disarmed`, and the app shows a loud banner ("All notifications snoozed …"),
+  with one tap to resume — a snooze set from Siri/a widget/a partner's phone used to silently
+  eat every alert with no indication anywhere ("why am I not getting notifications").
+- **Fix: dead tokens registered under the wrong APNs environment are pruned** (the
+  `403 BadEnvironmentKeyInToken` device that failed on every single push).
+
 ## 1.10.4
 
 Add: playing a saved doorbell clip now also flips the matching **Doorpanel** screen (screen + voice
