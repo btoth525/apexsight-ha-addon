@@ -378,29 +378,38 @@ _ALL_CAMERAS_FALLBACK = ["Front_Driveway", "doorbell", "Side_Gate", "Backyard_Wi
                          "Living_Room_Wide", "Ryleighs_Rm", "movie_room", "zachs_room"]
 
 
-def _ha_switch(entities, on: bool) -> None:
-    """Flip HA switches via the Core API (batch). Best-effort — a missing entity or transient HA
-    error must never take the sync loop down."""
-    if not entities or not SUPERVISOR_TOKEN:
-        return
+def _ha_switch(entities, on: bool) -> bool:
+    """Flip HA switches via the Core API (batch). Returns True only on a confirmed 2xx — the
+    caller must NOT mark the sync complete on failure, or Frigate's alert switches could sit
+    WRONG (including fail-closed: cameras left muted in Away) until the next heartbeat."""
+    if not entities:
+        return True
+    if not SUPERVISOR_TOKEN:
+        return False
     try:
-        requests.post(
+        r = requests.post(
             f"{HA_CORE_URL}/api/services/switch/turn_{'on' if on else 'off'}",
             headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
             json={"entity_id": entities}, timeout=15,
         )
+        if not (200 <= r.status_code < 300):
+            log(f"frigate switch turn_{'on' if on else 'off'} → HTTP {r.status_code} {r.text[:120]}")
+            return False
+        return True
     except Exception as exc:
         log(f"frigate switch turn_{'on' if on else 'off'} failed:", exc)
+        return False
 
 
-def _sync_frigate_alert_switches() -> None:
+def _sync_frigate_alert_switches() -> bool:
     """Make Frigate's per-camera review_alerts/review_detections switches match the current house
     mode + the household's custom mode map (edited in the app). This is what keeps 'relay and Home
     Assistant in sync': the relay map is the source of truth, and Frigate stops CREATING alerts for
-    muted cameras so the PWA, HA and the app all agree."""
+    muted cameras so the PWA, HA and the app all agree. Returns True only when BOTH batches were
+    confirmed applied — the watcher retries on the next tick otherwise."""
     mode = (_get_cfg("house_mode", "") or "").strip().lower()
     if mode not in _MODE_MUTES_DEFAULT:
-        return                      # unknown mode → leave switches alone (fail-open)
+        return True                 # unknown mode → leave switches alone (fail-open, nothing to do)
     custom = {}
     raw = _get_cfg("mode_map", "")
     if raw:
@@ -419,15 +428,19 @@ def _sync_frigate_alert_switches() -> None:
             continue
         pair = [f"switch.{slug}_review_alerts", f"switch.{slug}_review_detections"]
         (off_entities if cam in muted else on_entities).extend(pair)
-    _ha_switch(on_entities, True)
-    _ha_switch(off_entities, False)
-    log(f"frigate alert switches synced for mode '{mode}': "
-        f"{len(on_entities)//2} alerting, {len(off_entities)//2} muted")
+    ok = _ha_switch(on_entities, True)
+    ok = _ha_switch(off_entities, False) and ok
+    if ok:
+        log(f"frigate alert switches synced for mode '{mode}': "
+            f"{len(on_entities)//2} alerting, {len(off_entities)//2} muted")
+    return ok
 
 
 def _frigate_switch_watcher() -> None:
     """Re-sync Frigate's alert switches whenever the house mode or the household mode map changes
-    (checked every 3s), plus a 10-minute heartbeat so a manual flip or an HA restart self-heals."""
+    (checked every 3s), plus a 10-minute heartbeat so a manual flip or an HA restart self-heals.
+    A FAILED sync (HA restarting, API error) does NOT advance the change marker, so it retries
+    every tick until it lands — never leaves the switches wrong for the whole heartbeat window."""
     last = None
     last_forced = 0.0
     while True:
@@ -437,9 +450,9 @@ def _frigate_switch_watcher() -> None:
             key = f"{mode}|{seq}"
             now = time.time()
             if key != last or now - last_forced > 600:
-                _sync_frigate_alert_switches()
-                last = key
-                last_forced = now
+                if _sync_frigate_alert_switches():
+                    last = key
+                    last_forced = now
         except Exception as exc:
             log("frigate switch sync failed:", exc)
         time.sleep(3)
@@ -719,16 +732,20 @@ _last_ring_ts = 0.0
 
 def _post_doorbell() -> None:
     """Forward a doorbell press to the relay's /v1/doorbell-ring (VoIP push → CallKit ring).
-    Debounced: re-presses within RING_DEBOUNCE_SECONDS of the last forwarded ring are dropped."""
+    Debounced: re-presses within RING_DEBOUNCE_SECONDS of the last SUCCESSFULLY forwarded ring are
+    dropped. The window is only charged on a 2xx — a failed forward (relay restarting, network
+    blip) must NOT start the window, or a visitor's retry press would be silently eaten and the
+    doorbell would ring nobody for the whole window."""
     global _last_ring_ts
     now = time.time()
     if RING_DEBOUNCE_SECONDS > 0 and now - _last_ring_ts < RING_DEBOUNCE_SECONDS:
         log(f"doorbell ring debounced ({now - _last_ring_ts:.0f}s since last — window {RING_DEBOUNCE_SECONDS:.0f}s)")
         return
-    _last_ring_ts = now
     try:
         r = requests.post(f"{RELAY_URL}/v1/doorbell-ring", json={"pairing_code": PAIRING_CODE, "camera": "doorbell"}, timeout=10)
         log(f"doorbell ring → relay {r.status_code} {r.text[:100]}")
+        if 200 <= r.status_code < 300:
+            _last_ring_ts = now
     except Exception as exc:
         log("doorbell POST failed:", exc)
 

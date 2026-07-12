@@ -721,12 +721,19 @@ def get_mode(pairing_code: str = "") -> dict:
     return out
 
 
+# Known camera roster fallback for the mode editor — the always-alerting cameras (Front_Driveway,
+# doorbell) appear in NO mute list, so a union of the mute lists alone would omit exactly them.
+_CAMERA_ROSTER_FALLBACK = ["Front_Driveway", "doorbell", "Side_Gate", "Backyard_Wide", "Garage",
+                           "Living_Room_Wide", "Ryleighs_Rm", "movie_room", "zachs_room"]
+
+
 def _mode_map_cameras(custom: dict | None) -> list:
-    """Full camera roster for the mode editor: what the app last sent with the map, else every
-    camera named anywhere in the effective map (so the editor always has rows to show)."""
+    """Full camera roster for the mode editor: what the app last sent with the map, else the known
+    roster plus every camera named anywhere in the effective map (so the editor always shows every
+    camera — including the never-muted ones a mute-list union would miss)."""
     if isinstance(custom, dict) and isinstance(custom.get("_cameras"), list):
         return [c for c in custom["_cameras"] if isinstance(c, str) and c]
-    names: list = []
+    names: list = list(_CAMERA_ROSTER_FALLBACK)
     for m in gate.MODE_MUTES:
         for c in gate.resolve_mode_mutes(m, custom):
             if c not in names:

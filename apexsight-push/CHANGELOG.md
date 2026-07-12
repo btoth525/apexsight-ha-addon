@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.10.7
+
+Hardening pass from a full audit of 1.10.5/1.10.6 (all confirmed-by-review fixes):
+
+- **Fix: a failed ring forward no longer eats the visitor's retry press.** The debounce window is
+  now only charged on a CONFIRMED 2xx from the relay — previously a relay blip meant the first
+  press rang nobody AND the retry press was debounced, so the doorbell was silent for the whole
+  window.
+- **Fix: a failed Frigate switch sync now retries within seconds instead of being recorded as
+  done.** HA errors (restart, 401/500) were swallowed and the sync marked complete — Frigate's
+  per-camera alert switches could sit wrong (including cameras left MUTED in Away) for up to 10
+  minutes. The watcher now verifies both service calls succeeded and retries every 3s until they do.
+- **Fix: the mode editor's camera roster fallback now includes the never-muted cameras**
+  (Front Driveway, doorbell) — a union of mute lists alone omitted exactly the always-alerting ones.
+
+
 ## 1.10.6
 
 **Doorbell ring debounce — button mashing rings once, not over and over.**
