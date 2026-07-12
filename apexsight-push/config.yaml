@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.10.5"
+version: "1.10.6"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -34,6 +34,7 @@ options:
   doorbell_lead_ms: 800
   doorbell_tail_ms: 500
   doorbell_drain_ms: 300
+  doorbell_ring_debounce: 30
   mqtt_host: ""
   mqtt_port: 0
   mqtt_user: ""
@@ -51,6 +52,7 @@ schema:
   doorbell_lead_ms: int(0,5000)?
   doorbell_tail_ms: int(0,5000)?
   doorbell_drain_ms: int(0,3000)?
+  doorbell_ring_debounce: int(0,120)?
   mqtt_host: str?
   mqtt_port: int?
   mqtt_user: str?

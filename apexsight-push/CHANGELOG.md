@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.10.6
+
+**Doorbell ring debounce — button mashing rings once, not over and over.**
+
+- A visitor re-pressing the doorbell while your phones are already ringing used to restart the
+  CallKit call each press. Re-presses are now dropped at the bridge (no VoIP push is even sent)
+  for `doorbell_ring_debounce` seconds after the last forwarded ring — the industry-standard
+  behavior (Ring/Nest ring once per visit). New option, default **30s**, 0 disables.
+
 ## 1.10.5
 
 **Editable per-mode camera alerts (household-wide) + snooze visibility.**

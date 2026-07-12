@@ -40,6 +40,11 @@ configuration:
     description: >-
       Extra pause before hanging up the talk session, so the speaker buffer fully
       empties. Default 300.
+  doorbell_ring_debounce:
+    name: Doorbell ring debounce (seconds)
+    description: >-
+      A visitor mashing the doorbell rings your phones ONCE — re-presses within this many
+      seconds are ignored, so the call doesn't keep restarting. 0 disables. Default 30.
   mqtt_host:
     name: MQTT host (optional)
     description: Leave blank to use the Home Assistant broker automatically.

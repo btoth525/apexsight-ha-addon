@@ -706,8 +706,26 @@ def _post_mode(mode: str) -> None:
         time.sleep(1.0)
 
 
+# Ring debounce: a visitor mashing the button must ring the phones ONCE, not restart the CallKit
+# call over and over (what Ring/Nest do). The first press in a window rings; re-presses inside the
+# window are dropped HERE so no VoIP push ever reaches the phones (the safest place — the app never
+# has to juggle a duplicate call). The window ≈ how long a CallKit ring lasts (app times out at 45s).
+try:
+    RING_DEBOUNCE_SECONDS = float(os.environ.get("DOORBELL_RING_DEBOUNCE", "30"))
+except ValueError:
+    RING_DEBOUNCE_SECONDS = 30.0
+_last_ring_ts = 0.0
+
+
 def _post_doorbell() -> None:
-    """Forward a doorbell press to the relay's /v1/doorbell-ring (VoIP push → CallKit ring)."""
+    """Forward a doorbell press to the relay's /v1/doorbell-ring (VoIP push → CallKit ring).
+    Debounced: re-presses within RING_DEBOUNCE_SECONDS of the last forwarded ring are dropped."""
+    global _last_ring_ts
+    now = time.time()
+    if RING_DEBOUNCE_SECONDS > 0 and now - _last_ring_ts < RING_DEBOUNCE_SECONDS:
+        log(f"doorbell ring debounced ({now - _last_ring_ts:.0f}s since last — window {RING_DEBOUNCE_SECONDS:.0f}s)")
+        return
+    _last_ring_ts = now
     try:
         r = requests.post(f"{RELAY_URL}/v1/doorbell-ring", json={"pairing_code": PAIRING_CODE, "camera": "doorbell"}, timeout=10)
         log(f"doorbell ring → relay {r.status_code} {r.text[:100]}")

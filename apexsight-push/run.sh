@@ -24,6 +24,7 @@ export DOORBELL_TTS_ENGINE="$(bashio::config 'doorbell_tts_engine')"
 export DOORBELL_LEAD_MS="$(bashio::config 'doorbell_lead_ms')"
 export DOORBELL_TAIL_MS="$(bashio::config 'doorbell_tail_ms')"
 export DOORBELL_DRAIN_MS="$(bashio::config 'doorbell_drain_ms')"
+export DOORBELL_RING_DEBOUNCE="$(bashio::config 'doorbell_ring_debounce')"
 
 if bashio::services.available "mqtt"; then
   export MQTT_HOST="$(bashio::services mqtt 'host')"
