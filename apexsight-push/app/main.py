@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse
@@ -31,6 +32,39 @@ from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
 PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
+
+# --- Doorpanel: pair each response clip with its on-screen takeover ------------------------------
+# The add-on runs inside HA (homeassistant_api: true), so it can press the ESPHome Doorpanel's
+# button entities via the Supervisor core API. Playing one of these saved clips ALSO flips the
+# matching panel screen, so a single tap in the app's soundboard gives screen + voice together.
+HA_CORE_URL = "http://supervisor/core"
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "").strip()
+PANEL_SCREEN_FOR_SLUG = {
+    "recorded-warning":            "button.door_panel_no_soliciting",
+    "not-interested":              "button.door_panel_no_soliciting",
+    "you-were-warned":             "button.door_panel_no_soliciting",
+    "nice-try":                    "button.door_panel_no_soliciting",
+    "be-right-there":              "button.door_panel_screen_be_right_there",
+    "leave-it-at-the-door-please": "button.door_panel_screen_leave_package",
+    "thanks-delivery":             "button.door_panel_screen_thanks_delivery",
+}
+
+
+async def _fire_panel_screen(slug: str) -> None:
+    """Best-effort: press the Doorpanel button mapped to this clip so the on-panel screen matches
+    the spoken clip. Silent no-op when the slug isn't mapped or there's no Supervisor token."""
+    entity = PANEL_SCREEN_FOR_SLUG.get((slug or "").strip())
+    if not entity or not SUPERVISOR_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            await client.post(
+                f"{HA_CORE_URL}/api/services/button/press",
+                headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+                json={"entity_id": entity},
+            )
+    except Exception as exc:  # never let a panel hiccup block the doorbell voice
+        print(f"doorpanel screen fire failed for {slug!r}: {exc}", flush=True)
 
 app = FastAPI(title="ApexSight Push Relay", docs_url=None, redoc_url=None)
 app.add_middleware(SessionMiddleware, secret_key=config.session_secret(), https_only=False)
@@ -384,6 +418,9 @@ async def doorbell_play(body: DoorbellPlayIn, _: None = Depends(rate_limit)) -> 
     path = doorbell.clip_file(body.slug)
     if not path:
         raise HTTPException(status_code=404, detail="clip not found")
+    # Flip the matching Doorpanel screen first so it shows as the voice starts (screen + voice
+    # from one soundboard tap). Best-effort — never blocks or fails the actual playback.
+    await _fire_panel_screen(body.slug)
     try:
         frames = await run_in_threadpool(doorbell.play_path, path)
     except aqara_talk.TalkbackError as exc:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.10.4
+
+Add: playing a saved doorbell clip now also flips the matching **Doorpanel** screen (screen + voice
+from one tap in the app's soundboard). Maps clip slug → panel button via the Supervisor HA API
+(no-op if unmapped or the panel isn't installed). Slugs → screens:
+no-soliciting deterrents (recorded-warning/not-interested/you-were-warned/nice-try) → GO AWAY;
+be-right-there / leave-it-at-the-door-please / thanks-delivery → their friendly screens.
+
+
 ## 1.10.3
 
 Fix: doorbell talkback cutting off words "all over the place" (sometimes the first word, sometimes
