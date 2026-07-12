@@ -661,15 +661,26 @@ def device_prefs(body: DevicePrefsIn, _: None = Depends(rate_limit)) -> dict:
 
 
 @app.post("/v1/mode")
-def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
+async def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
     """HA syncs the house mode (home / night / away) here on every Alarmo state change. It drives
     the house-level camera filter in /v1/notify. Only a known mode is stored; an unrecognized value
-    is ignored so the gate keeps failing open (mode unknown → deliver) rather than muting blindly."""
+    is ignored so the gate keeps failing open (mode unknown → deliver) rather than muting blindly.
+    On an ACTUAL change, fans a silent background push to every phone so the app-closed surfaces
+    (Lock Screen widget, Control Center) update within seconds instead of on the next app open."""
     mode = (body.mode or "").strip().lower()
-    if mode in gate.MODE_MUTES:
-        db.set_config("house_mode", mode)
-        return {"ok": True, "mode": mode}
-    return {"ok": False, "note": f"unknown mode '{mode}' ignored (fail-open)"}
+    if mode not in gate.MODE_MUTES:
+        return {"ok": False, "note": f"unknown mode '{mode}' ignored (fail-open)"}
+    changed = (db.get_config("house_mode", "") or "") != mode
+    db.set_config("house_mode", mode)
+    woken = 0
+    if changed and PAIRING_CODE and apns.is_configured():
+        payload = {"aps": {"content-available": 1}, "house_mode": mode}
+        for row in db.devices_for(PAIRING_CODE):
+            ok, _detail = await apns.send_background(row["device_token"], row["environment"], payload)
+            if ok:
+                woken += 1
+        print(f"[mode] {mode} → woke {woken} phones for widget refresh", flush=True)
+    return {"ok": True, "mode": mode, "woken": woken}
 
 
 def _load_mode_map() -> dict | None:

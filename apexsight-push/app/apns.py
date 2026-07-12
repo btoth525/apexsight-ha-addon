@@ -110,6 +110,32 @@ async def send_to_token(
     return False, f"{resp.status_code} {reason}".strip()
 
 
+async def send_background(device_token: str, environment: str, payload: dict) -> tuple[bool, str]:
+    """Send a SILENT background push (content-available) — wakes the app briefly with no banner.
+    APNs requires push-type `background` + priority `5` for these (a 10 gets rejected/throttled).
+    Used to tell every phone "the house mode changed" so widgets/Lock Screen update app-closed."""
+    p8, key_id, team_id, bundle_id, env_mode = _credentials()
+    headers = {
+        "authorization": f"bearer {_provider_token(p8, key_id, team_id)}",
+        "apns-topic": bundle_id,
+        "apns-push-type": "background",
+        "apns-priority": "5",
+    }
+    url = f"{_host_for(environment, env_mode)}/3/device/{device_token}"
+    try:
+        async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
+            resp = await client.post(url, headers=headers, content=json.dumps(payload))
+    except httpx.HTTPError as exc:
+        return False, f"network error: {exc}"
+    if resp.status_code == 200:
+        return True, "ok"
+    try:
+        reason = resp.json().get("reason", "")
+    except Exception:
+        reason = resp.text.strip()
+    return False, f"{resp.status_code} {reason}".strip()
+
+
 async def send_voip(voip_token: str, environment: str, payload: dict) -> tuple[bool, str]:
     """Send a PushKit VoIP push (rings the phone via CallKit). Uses the same .p8 provider token,
     but the topic is `<bundle>.voip` and the push type is `voip`. Returns (ok, detail)."""

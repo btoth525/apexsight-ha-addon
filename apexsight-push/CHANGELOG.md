@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.10.8
+
+**Widgets follow the house mode with the app closed.**
+
+- When the house mode actually changes, the relay now fans a **silent background push** to every
+  phone — the app wakes for a second, refreshes the shared mode, and repaints the Lock Screen
+  widget + Control Center. Before this, those surfaces only updated when the app was opened
+  (they're fed by the app's foreground poll), so arming from HA/the keypad left them stale.
+- No banner, no sound — it's a content-available push (APNs `background`/priority-5), a few per
+  day at most.
+
+
 ## 1.10.7
 
 Hardening pass from a full audit of 1.10.5/1.10.6 (all confirmed-by-review fixes):
