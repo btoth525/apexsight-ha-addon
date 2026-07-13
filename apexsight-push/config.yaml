@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.10.8"
+version: "1.11.0"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -39,6 +39,8 @@ options:
   mqtt_port: 0
   mqtt_user: ""
   mqtt_password: ""
+  turn_key_id: ""
+  turn_api_token: ""
 schema:
   admin_username: str
   admin_password: password
@@ -57,3 +59,5 @@ schema:
   mqtt_port: int?
   mqtt_user: str?
   mqtt_password: password?
+  turn_key_id: str?
+  turn_api_token: password?

@@ -10,6 +10,12 @@ export APEX_DATA_DIR="/data"
 export APEX_TEAM_ID="3Q9ZUDN4QZ"
 export APEX_BUNDLE_ID="com.brandontoth.apexsight.native"
 
+# ---- Cloudflare Realtime TURN (remote WebRTC relay) -------------------------
+# Mint short-lived TURN creds so live view + two-way talk relay through Cloudflare's
+# edge when the LAN go2rtc candidate is unreachable across the Cloudflare tunnel.
+export TURN_KEY_ID="$(bashio::config 'turn_key_id')"
+export TURN_API_TOKEN="$(bashio::config 'turn_api_token')"
+
 # ---- bridge env -------------------------------------------------------------
 export RELAY_URL="http://127.0.0.1:3421"
 export PAIRING_CODE="$(bashio::config 'pairing_code')"

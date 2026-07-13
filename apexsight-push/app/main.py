@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, aqara_talk, config, db, doorbell, gate, recap, render
+from . import apns, aqara_talk, config, db, doorbell, gate, recap, render, turn
 from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
@@ -169,6 +169,10 @@ class RegisterVoIPIn(BaseModel):
 class DoorbellRingIn(BaseModel):
     pairing_code: str = ""
     camera: str = "doorbell"
+
+
+class TurnCredentialsIn(BaseModel):
+    pairing_code: str = ""
 
 
 class TestIn(BaseModel):
@@ -319,6 +323,25 @@ def register_voip(body: RegisterVoIPIn, _: None = Depends(rate_limit)) -> dict:
     env = body.environment if body.environment in ("production", "sandbox") else "production"
     db.upsert_voip(body.voip_token, body.pairing_code.upper().strip(), env)
     return {"ok": True}
+
+
+@app.post("/v1/turn-credentials")
+async def turn_credentials(body: TurnCredentialsIn, _: None = Depends(rate_limit)) -> list:
+    """Mint short-lived Cloudflare TURN ICE servers so the app's WebRTC (live view + two-way talk)
+    can relay through Cloudflare's edge when away from home. Gated by the household pairing code —
+    only a paired device can mint creds. Returns the ICE-server array the iOS app decodes directly."""
+    _require_pairing(body.pairing_code)
+    if not turn.is_configured():
+        raise HTTPException(status_code=503, detail="TURN not configured on relay")
+    try:
+        servers = await turn.ice_servers()
+    except turn.TurnNotConfigured:
+        raise HTTPException(status_code=503, detail="TURN not configured on relay")
+    except Exception as exc:
+        print(f"[turn] cloudflare mint failed: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail=f"cloudflare turn error: {exc}")
+    print(f"[turn] minted {len(servers)} ICE server group(s) for a paired device", flush=True)
+    return servers
 
 
 @app.post("/v1/doorbell-ring")

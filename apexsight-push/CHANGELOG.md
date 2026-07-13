@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.11.0
+
+**Remote full-res WebRTC via Cloudflare TURN — live view works away from home on Frigate 0.18.**
+
+- Frigate 0.18 removed the go2rtc HLS live route, so live view is now WebRTC-only. WebRTC media
+  can't cross the household's Cloudflare HTTP tunnel — on the LAN it reaches go2rtc's host
+  candidate directly, but away from home that candidate is unreachable, so every remote live tile
+  went black. The app was already built to fetch TURN relay credentials from the relay; that
+  endpoint just didn't exist yet.
+- **New `POST /v1/turn-credentials`** mints short-lived **Cloudflare Realtime TURN** ICE servers
+  (gated by the household pairing code) so the phone can relay full-res, sub-second WebRTC through
+  Cloudflare's edge when direct fails. The relayed media is end-to-end DTLS-encrypted — Cloudflare
+  forwards packets but cannot see the camera. Creds are cached and shared household-wide, re-minted
+  only near expiry, so a wall of phones opening streams doesn't hammer the Cloudflare API.
+- **Setup:** create a TURN key in Cloudflare → Realtime → TURN, then set `turn_key_id` and
+  `turn_api_token` in the add-on Configuration. Free tier is 1,000 GB/month (TURN is only used
+  away from home; on the LAN the connection is direct and free).
+
+
 ## 1.10.8
 
 **Widgets follow the house mode with the app closed.**
