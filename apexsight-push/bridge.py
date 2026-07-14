@@ -672,34 +672,36 @@ def _stages_to_send(after: dict, msg_type: str) -> list[str]:
     if msg_type == "end" and detections and "alert" in sent and "final" not in sent:
         stages.append("final")
 
-    if stages:
-        record = _notified.setdefault(review_id, {})
-        for s in stages:
-            record[s] = now
+    # NB: stages are NOT stamped as "sent" here — the caller stamps a stage only after the relay
+    # confirms it with a 2xx. Stamping before delivery meant a relay restart / 429 permanently
+    # dropped the alert (its later updates saw "alert" in sent and skipped it). See on_message.
     return stages
 
 
-def _post_to_relay(payload: dict, stage: str, attempts: int = 3) -> None:
-    """POST one alert to the relay, retrying transient failures with backoff.
+def _post_to_relay(payload: dict, stage: str, attempts: int = 3) -> bool:
+    """POST one alert to the relay, retrying transient failures with backoff. Returns True only on
+    a confirmed 2xx — the caller stamps the stage as sent only then, so a failed delivery retries on
+    the review's next update instead of being lost.
 
-    A missed alert is the worst failure mode for a security app, so retry a few
-    times before giving up rather than dropping the event on the first blip.
-    Relay 2xx/4xx are final answers (don't hammer); only 5xx and network errors
-    are retried.
+    A missed alert is the worst failure mode for a security app: 5xx, 429 (rate limited) and network
+    errors are all retried. Only a non-429 4xx is a final client error we shouldn't hammer.
     """
     delay = 1.0
     for attempt in range(1, attempts + 1):
         try:
             r = requests.post(f"{RELAY_URL}/v1/notify", json=payload, timeout=10)
             log(f"forwarded review {payload['review_id']} [{stage}] → {r.status_code} {r.text[:120]}")
-            if r.status_code < 500:
-                return
+            if 200 <= r.status_code < 300:
+                return True
+            if r.status_code < 500 and r.status_code != 429:
+                return False   # final client error (e.g. 400) — retrying won't help
             log(f"relay {r.status_code}, retrying ({attempt}/{attempts})")
         except Exception as exc:
             log(f"relay POST failed ({attempt}/{attempts}):", exc)
         if attempt < attempts:
             time.sleep(delay)
             delay *= 2
+    return False
 
 
 def _post_mode(mode: str) -> None:
@@ -993,10 +995,16 @@ def on_message(client, userdata, msg):
     stages = _stages_to_send(after, msg_type)
     if not stages:
         return
+    review_id = after.get("id")
+    now = time.time()
     for stage in stages:
         payload = _build_alert(after, final=(stage == "final"))
-        if payload:
-            _post_to_relay(payload, stage)
+        if not payload:
+            continue
+        # Stamp the stage as sent ONLY after the relay confirms it — a failed/429'd delivery is left
+        # unstamped so the review's next MQTT update retries it instead of silently dropping it.
+        if _post_to_relay(payload, stage) and review_id:
+            _notified.setdefault(review_id, {})[stage] = now
 
 
 def main():

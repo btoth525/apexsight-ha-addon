@@ -11,10 +11,13 @@ Admin web GUI (browser, password-protected): mounted at /admin — upload the
 """
 import asyncio
 import datetime
+import ipaddress
 import json
 import os
+import socket
 import tempfile
 import time
+import urllib.parse
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
@@ -124,10 +127,13 @@ async def _maybe_send_recap() -> None:
     rows = db.recap_events_between(PAIRING_CODE, midnight.timestamp(), now.timestamp())
     title, body = recap.format_recap(rows)
     payload = apns.build_payload(title=title, body=body, apex_url="apex://recap")
-    await apns.deliver_to_pairing(PAIRING_CODE, payload, collapse_id=f"recap-{today}")
-    db.set_config(f"recap_sent:{PAIRING_CODE}", today)
+    result = await apns.deliver_to_pairing(PAIRING_CODE, payload, collapse_id=f"recap-{today}")
+    # Only mark the day done if at least one phone actually got it — otherwise a transient APNs
+    # outage at the scheduled minute would silently skip the recap for the whole day.
+    if result.get("sent", 0) > 0:
+        db.set_config(f"recap_sent:{PAIRING_CODE}", today)
     db.prune_recap_events(midnight.timestamp() - 2 * 86_400)   # keep ~2 days of history
-    print(f"[recap] sent daily recap to {PAIRING_CODE} for {today} ({len(rows)} events)", flush=True)
+    print(f"[recap] daily recap to {PAIRING_CODE} for {today}: {result.get('sent', 0)} sent, {len(rows)} events", flush=True)
 
 
 # ---- naive per-IP rate limiting --------------------------------------------
@@ -135,8 +141,51 @@ async def _maybe_send_recap() -> None:
 _hits: dict[str, deque] = defaultdict(deque)
 
 
+def _real_ip(request: Request) -> str:
+    """The socket peer behind the Cloudflare tunnel is the proxy, not the caller — so trust the
+    standard forwarding headers when present (mirrors admin._client_ip). A request with NO
+    forwarding header is a same-host/loopback caller (the in-house bridge)."""
+    cf = request.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _is_external(request: Request) -> bool:
+    """True when the request arrived through the tunnel (has a forwarding header) rather than from
+    the same host. Used to apply stricter guards to internet-originated calls only."""
+    return bool(request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for"))
+
+
+def _reject_internal_host(url: str) -> None:
+    """SSRF guard for the (pairing-code-gated) play-url endpoint when called from outside: reject a
+    URL whose host resolves to a private / loopback / link-local address, so an external party can't
+    pivot the relay's ffmpeg into the home network. The in-house bridge is exempt (it legitimately
+    plays LAN-hosted Home Assistant TTS)."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not host or host in ("localhost", "supervisor") or host.endswith(".local"):
+        raise HTTPException(status_code=400, detail="url host not allowed")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        raise HTTPException(status_code=400, detail="url host does not resolve")
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise HTTPException(status_code=400, detail="url resolves to a private address")
+
+
 def rate_limit(request: Request) -> None:
-    ip = request.client.host if request.client else "unknown"
+    ip = _real_ip(request)
+    # Never throttle the in-house bridge (loopback, no forwarding header) — it must always deliver.
+    if not _is_external(request) and ip in ("127.0.0.1", "::1", "localhost"):
+        return
     now = time.time()
     window = _hits[ip]
     while window and now - window[0] > 60:
@@ -354,7 +403,9 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
     registered phone in the household so CallKit rings them with the live doorbell call."""
     if not apns.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured on relay")
-    code = body.pairing_code.upper().strip() or PAIRING_CODE
+    # Rings every phone → require the pairing code (the bridge sends it). No fallback to the
+    # household code: a code-less POST must not be able to ring the house.
+    code = _require_pairing(body.pairing_code)
     rows = db.voip_tokens_for(code)
     payload = {"aps": {"content-available": 1}, "doorbell": True, "camera": body.camera or "doorbell"}
     sent, failed = 0, 0
@@ -475,7 +526,7 @@ async def doorbell_delete(body: DoorbellPlayIn, _: None = Depends(rate_limit)) -
 
 
 @app.post("/v1/doorbell/play-url")
-async def doorbell_play_url(body: DoorbellUrlIn, _: None = Depends(rate_limit)) -> dict:
+async def doorbell_play_url(body: DoorbellUrlIn, request: Request, _: None = Depends(rate_limit)) -> dict:
     """Play audio from an http(s)/rtsp URL to the doorbell speaker. This is what the HA bridge
     calls for `apexsight/doorbell/play_url` — so any HA TTS/media URL can speak at the door."""
     _require_pairing(body.pairing_code)
@@ -484,6 +535,10 @@ async def doorbell_play_url(body: DoorbellUrlIn, _: None = Depends(rate_limit)) 
     url = body.url.strip()
     if not url.lower().startswith(("http://", "https://", "rtsp://")):
         raise HTTPException(status_code=400, detail="url must be http(s) or rtsp")
+    # The in-house bridge legitimately plays LAN-hosted HA TTS URLs; an EXTERNAL caller (via the
+    # tunnel) holding only the low-trust pairing code must not be able to SSRF into the home network.
+    if _is_external(request):
+        _reject_internal_host(url)
     try:
         frames = await run_in_threadpool(
             lambda: aqara_talk.play_audio(
@@ -742,6 +797,9 @@ async def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
     is ignored so the gate keeps failing open (mode unknown → deliver) rather than muting blindly.
     On an ACTUAL change, fans a silent background push to every phone so the app-closed surfaces
     (Lock Screen widget, Control Center) update within seconds instead of on the next app open."""
+    # house_mode drives the household camera mute-filter — an unauthenticated setter could silence
+    # every alert. The bridge (the only legitimate caller) already sends the pairing code.
+    _require_pairing(body.pairing_code)
     mode = (body.mode or "").strip().lower()
     if mode not in gate.MODE_MUTES:
         return {"ok": False, "note": f"unknown mode '{mode}' ignored (fail-open)"}
@@ -869,6 +927,9 @@ def set_mode_request(body: SetModeIn, _: None = Depends(rate_limit)) -> dict:
     the bridge to publish to HA over MQTT; HA arms Alarmo, whose resulting state flows back through
     `apexsight/mode` → house_mode → the app + cameras. SECURITY: disarm (mode=home) must carry the
     Alarmo `code` — validated by Alarmo itself, so the public pairing code alone can't disarm."""
+    # Actuates the physical alarm — require the household pairing code for ALL modes (the app sends
+    # it); disarm additionally requires the Alarmo code below.
+    _require_pairing(body.pairing_code)
     mode = (body.mode or "").strip().lower()
     if mode not in ("home", "away", "night"):
         raise HTTPException(status_code=400, detail="unknown mode")
@@ -905,9 +966,16 @@ def set_gate(body: GateIn, _: None = Depends(rate_limit)) -> dict:
     """The iOS app mirrors its Disarm / Snooze state here so app-closed pushes are
     suppressed while disarmed or snoozed, matching the in-app delivery gate."""
     code = body.pairing_code.upper().strip()
+    # Bound the snooze horizon so a leaked pairing code can't silence the household indefinitely by
+    # posting a far-future timestamp. A real in-app snooze is always well under this; `disarmed` is a
+    # deliberate toggle the app re-asserts on every foreground, so it self-heals.
+    snooze = float(body.snoozed_until or 0)
+    max_snooze = time.time() + 24 * 3600
+    if snooze > max_snooze:
+        snooze = max_snooze
     db.set_config(
         f"gate:{code}",
-        json.dumps({"disarmed": bool(body.disarmed), "snoozed_until": float(body.snoozed_until or 0)}),
+        json.dumps({"disarmed": bool(body.disarmed), "snoozed_until": snooze}),
     )
     return {"ok": True}
 

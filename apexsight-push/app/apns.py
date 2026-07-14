@@ -203,6 +203,12 @@ def build_payload(
         aps["thread-id"] = f"apex-{camera}"
 
     payload: dict = {"aps": aps}
+    # The NotificationService extension bumps the app-icon badge per push; a follow-up that REPLACES
+    # an existing alert (the silent final GIF, or the announce-only AI description) must not add to
+    # the count. Flag those so the extension skips the bump (it also only bumps when review_id is set,
+    # which already excludes the recap summary).
+    if silent or announce:
+        payload["no_badge"] = True
     # Mirror the local-notification userInfo contract exactly.
     if review_id:
         payload["review_id"] = review_id

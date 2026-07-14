@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.13.0
+
+**Security + delivery-reliability audit fixes.**
+
+- **Auth gates (were missing):** `/v1/mode` (house mode — drives the camera mute filter),
+  `/v1/set-mode` arming, and `/v1/doorbell-ring` now all require the household pairing code —
+  previously an unauthenticated request could silence every camera alert, arm the alarm, or ring
+  all phones. Legitimate callers (the bridge, the app) already send the code, so nothing breaks.
+  The `/v1/doorbell-ring` fallback to the configured code was removed.
+- **Rate limiter now keys on the real client IP** (`cf-connecting-ip`/`x-forwarded-for`) instead of
+  the shared tunnel address, and never throttles the in-house bridge — so an attacker can no longer
+  exhaust one global bucket and cause the relay to 429 real alerts.
+- **Alert delivery is now confirmed before dedup:** the bridge stamps a review stage as "sent" only
+  after the relay returns 2xx, and retries 429s — previously a relay restart or a rate-limit could
+  permanently drop an alert (its later updates saw it as already sent). This is the worst failure
+  mode for a security app; it's closed.
+- **SSRF guard on `/v1/doorbell/play-url`:** external (tunnelled) callers can no longer point the
+  relay's ffmpeg at private/loopback hosts. The in-house bridge is exempt so LAN-hosted Home
+  Assistant TTS still plays at the door.
+- **Snooze is bounded** (≤24 h) so a leaked pairing code can't silence notifications indefinitely.
+- **Badge accuracy:** replace/announce/final pushes are flagged `no_badge` so the app-icon badge
+  stops over-counting AI-description follow-ups.
+- **Daily recap** is only marked sent when a phone actually received it (retries instead of skipping
+  the day on a transient APNs blip).
+
 ## 1.12.0
 
 **LIVE hold-to-talk to the doorbell speaker — real two-way conversation.**
