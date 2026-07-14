@@ -610,8 +610,10 @@ async def test_push(body: TestIn, _: None = Depends(rate_limit)) -> dict:
         title="\U0001f6a8 ApexSight test alert",
         body="Instant push is working — you'll get alerts with the app closed.",
         camera="relay_test",
-        review_id="relay-test",
-        apex_url="apex://review?id=relay-test",
+        # No review_id: this is a diagnostic, not a real event — so it must not bump the badge
+        # (the extension only bumps when review_id is present) and its tap opens the camera wall
+        # rather than dead-ending on a synthetic review id that 404s.
+        apex_url="apex://cameras",
     )
     ok, detail = await apns.send_to_token(body.device_token, env, payload)
     if not ok:

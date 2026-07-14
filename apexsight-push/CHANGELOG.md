@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.13.1
+
+- **Test push no longer dead-ends or bumps the badge.** The in-app "Test" button's push carried a
+  synthetic `review_id` and an `apex://review?id=relay-test` link — so tapping it opened a review
+  detail that 404s, and the app-icon badge ticked up for a diagnostic. It now drops the review id
+  (no badge bump) and opens the camera wall (`apex://cameras`) on tap.
+
 ## 1.13.0
 
 **Security + delivery-reliability audit fixes.**
