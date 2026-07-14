@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.12.0
+
+**LIVE hold-to-talk to the doorbell speaker — real two-way conversation.**
+
+- **New `POST /v1/doorbell/talk-live`**: pipes the app's live microphone straight to the Aqara
+  doorbell speaker. The app publishes its mic into go2rtc's `apex_talkback` stream over WebRTC,
+  then calls this; the relay pulls that stream (RTSP from the Frigate host, derived from
+  `frigate_base_url`) and streams it to the doorbell over the existing native Aqara LAN talkback
+  protocol. Releasing the talk button ends the publish → the stream EOFs → the session closes
+  cleanly through the normal tail/drain path.
+- Guards: household pairing code required (same as all talkback), waits up to ~3s for the mic
+  publish to actually land in go2rtc before opening the door speaker (no phantom speaker pops),
+  single-session lock shared with clip playback (busy → 409), 120s hard backstop per hold.
+- No `-re` pacing on the live input (it's already real-time), unlike clip playback.
+- Server prerequisite: an `apex_talkback:` stream entry (no sources) in Frigate's go2rtc config —
+  the app's WebRTC publish is the producer (already applied to the household Frigate).
+
 ## 1.11.0
 
 **Remote full-res WebRTC via Cloudflare TURN — live view works away from home on Frigate 0.18.**

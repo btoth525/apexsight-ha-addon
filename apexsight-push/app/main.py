@@ -220,6 +220,10 @@ class DoorbellUrlIn(BaseModel):
     url: str = Field(min_length=8, max_length=2048)  # http(s)/rtsp audio URL to play at the door
 
 
+class DoorbellTalkLiveIn(BaseModel):
+    pairing_code: str = ""
+
+
 class AICamerasIn(BaseModel):
     pairing_code: str
     disabled: list[str] = []   # cameras the user turned AI descriptions OFF for (default: all on)
@@ -489,6 +493,54 @@ async def doorbell_play_url(body: DoorbellUrlIn, _: None = Depends(rate_limit)) 
         )
     except aqara_talk.TalkbackError as exc:
         # 409 for "another clip is playing" (retry shortly), 502 for a camera/ffmpeg failure.
+        raise HTTPException(status_code=409 if "busy" in str(exc) else 502, detail=str(exc))
+    return {"ok": True, "frames": frames}
+
+
+@app.post("/v1/doorbell/talk-live")
+async def doorbell_talk_live(body: DoorbellTalkLiveIn, _: None = Depends(rate_limit)) -> dict:
+    """LIVE hold-to-talk: pipe the app's just-published mic stream (go2rtc `apex_talkback` on the
+    Frigate host) to the doorbell speaker. Flow: the app starts a WebRTC mic publish into
+    apex_talkback, then calls this; releasing the talk button ends the publish, the RTSP stream
+    EOFs, and this returns. Blocking for the talk's duration — the app fires-and-forgets it."""
+    _require_pairing(body.pairing_code)
+    if not doorbell.is_configured():
+        raise HTTPException(status_code=503, detail="doorbell_ip not set in add-on config")
+    frigate = (os.environ.get("FRIGATE_BASE_URL") or "").strip().rstrip("/")
+    if not frigate:
+        raise HTTPException(status_code=503, detail="frigate_base_url not set in add-on config")
+    host = frigate.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    if not host:
+        raise HTTPException(status_code=503, detail="frigate_base_url has no host")
+
+    # Wait briefly for the app's publish to actually land in go2rtc before opening the door
+    # speaker — the app fires this call the moment its WebRTC connect starts, and racing ahead
+    # would play a stream that isn't there yet (speaker warms, then instant EOF).
+    stream_url = f"rtsp://{host}:8554/apex_talkback"
+    async with httpx.AsyncClient(timeout=3.0) as http:
+        for _attempt in range(10):   # up to ~3s
+            try:
+                r = await http.get(f"{frigate}/api/go2rtc/streams")
+                producers = ((r.json() or {}).get("apex_talkback") or {}).get("producers") or []
+                if producers:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+        else:
+            raise HTTPException(status_code=409, detail="no live mic stream published")
+
+    try:
+        frames = await run_in_threadpool(
+            lambda: aqara_talk.play_audio(
+                doorbell.DOORBELL_IP,
+                ["-i", stream_url],          # NO -re: a live source is already real-time paced
+                volume_gain=doorbell.DOORBELL_GAIN,
+                max_seconds=120.0,           # generous backstop; normal end = talk-button release
+                log=lambda m: print(m, flush=True),
+            )
+        )
+    except aqara_talk.TalkbackError as exc:
         raise HTTPException(status_code=409 if "busy" in str(exc) else 502, detail=str(exc))
     return {"ok": True, "frames": frames}
 
