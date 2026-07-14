@@ -193,7 +193,13 @@ def _ffmpeg_args(ffmpeg: str, input_args: Sequence[str], volume_gain: float,
     args = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     input_list = list(input_args)
     if any(str(a).startswith(("http://", "https://", "rtsp://")) for a in input_list):
-        args += ["-rw_timeout", "10000000"]   # 10s, microseconds
+        # I/O timeout so a hanging host can't stall ffmpeg; protocol whitelist (covering every scheme
+        # the legit inputs use: local file, http(s), rtsp) so a malicious redirect on a play-url can't
+        # pivot to file:// (local-file exfil) or other exotic protocols. (A redirect to another
+        # internal HTTP host remains possible — play-url is pairing-gated and external callers are
+        # already host-checked in main.py; that residual is accepted for this low-severity path.)
+        args += ["-rw_timeout", "10000000",   # 10s, microseconds
+                 "-protocol_whitelist", "file,crypto,data,http,https,tcp,tls,rtp,rtsp,udp"]
     args += input_list
     args += vol
     args += ["-t", f"{max_seconds:.0f}",

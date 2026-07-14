@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.14.0
+
+**Second hardening pass (audit findings).**
+
+- **A transient APNs blip no longer silently drops a household's alert.** `/v1/notify` always returned
+  HTTP 200 even when every phone's push failed for a transient reason (APNs timeout / 5xx / 429), so
+  the bridge stamped the review "sent" and — the review having ended — never retried. It now returns
+  503 when every reachable device failed transiently (not a dead-token prune, not a per-device mute),
+  so the bridge's existing retry fires. This was the worst failure mode for a security app.
+- **Daily-recap DoS closed.** `/v1/recap` clamps `tz_offset` to ±24h and `hour`/`minute` to valid
+  ranges — an out-of-range value made `datetime.timezone` raise every scheduler tick and killed the
+  household's recap until manually overwritten.
+- **SQLite WAL + busy timeout**, so a burst of alerts × several phones while the bridge writes recap
+  events can't surface as "database is locked" 500s.
+- **play-url SSRF hardening**: the ffmpeg network input now carries a protocol whitelist so a
+  malicious redirect can't pivot to `file://` (local-file exfil) or exotic schemes.
+- **TURN error no longer leaks the Cloudflare Key ID** to the (paired) caller — logged server-side only.
+
+Known/accepted (not changed): `/v1/gate` can suppress camera-detection pushes with just the pairing
+code — that's the intended "pause my notifications" household toggle (a real break-in still alarms via
+the separate HA critical channel), so it is deliberately NOT gated behind the Alarmo code.
+
 ## 1.13.1
 
 - **Test push no longer dead-ends or bumps the badge.** The in-app "Test" button's push carried a

@@ -391,8 +391,10 @@ async def turn_credentials(body: TurnCredentialsIn, _: None = Depends(rate_limit
     except turn.TurnNotConfigured:
         raise HTTPException(status_code=503, detail="TURN not configured on relay")
     except Exception as exc:
+        # Log the detail server-side only — the exception string can embed the request URL, which
+        # carries the Cloudflare TURN Key ID; don't return it to the (merely paired) caller.
         print(f"[turn] cloudflare mint failed: {exc}", flush=True)
-        raise HTTPException(status_code=502, detail=f"cloudflare turn error: {exc}")
+        raise HTTPException(status_code=502, detail="cloudflare turn error")
     print(f"[turn] minted {len(servers)} ICE server group(s) for a paired device", flush=True)
     return servers
 
@@ -750,6 +752,14 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     result = await apns.deliver_to_pairing(
         code, payload, collapse_id=body.collapse_id, gate=device_gate
     )
+    # If every reachable device failed for a TRANSIENT reason (APNs timeout / 5xx / 429 — NOT a
+    # permanent bad-token prune, and NOT a per-device mute), signal failure so the bridge's retry
+    # fires. Returning 200 here let the bridge stamp the alert "sent" and permanently drop a real
+    # security alert when APNs had a blip (the recap path already guards this; notify did not).
+    transient_failed = result["failed"] - result["pruned"]
+    if result["devices"] > 0 and result["sent"] == 0 and transient_failed > 0:
+        raise HTTPException(status_code=503,
+                            detail=f"all {transient_failed} deliveries failed transiently — retry")
     return {"ok": result["sent"] > 0 or result["devices"] == 0, **result}
 
 
@@ -987,13 +997,16 @@ def set_recap(body: RecapIn, _: None = Depends(rate_limit)) -> dict:
     """The iOS app saves its Daily Recap schedule here so the relay can send the
     summary at the chosen local time even when the app is fully closed."""
     code = body.pairing_code.upper().strip()
+    # Clamp to valid ranges: datetime.timezone rejects an offset of >= +-24h, which would make the
+    # recap scheduler raise every tick and silently kill the household's daily recap forever; an
+    # out-of-range hour/minute would mean it never fires.
     db.set_config(
         f"recap:{code}",
         json.dumps({
             "enabled": bool(body.enabled),
-            "hour": int(body.hour),
-            "minute": int(body.minute),
-            "tz_offset": int(body.tz_offset),
+            "hour": max(0, min(23, int(body.hour))),
+            "minute": max(0, min(59, int(body.minute))),
+            "tz_offset": max(-86399, min(86399, int(body.tz_offset))),
         }),
     )
     return {"ok": True}

@@ -15,6 +15,10 @@ from . import config
 
 def init() -> None:
     with _conn() as c:
+        # WAL lets the bridge process read while the relay writes (and vice versa) without the
+        # "database is locked" errors a burst of alerts × several phones could otherwise surface as
+        # unhandled 500s. Persists on the DB file, so the bridge's connections inherit it too.
+        c.execute("PRAGMA journal_mode=WAL")
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS config (
@@ -59,8 +63,9 @@ def init() -> None:
 
 @contextmanager
 def _conn():
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")   # wait for a competing writer instead of raising at once
     try:
         yield conn
         conn.commit()
