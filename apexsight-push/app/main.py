@@ -242,6 +242,12 @@ def rate_limit(request: Request) -> None:
     if len(window) >= config.RATE_LIMIT_PER_MINUTE:
         raise HTTPException(status_code=429, detail="rate limit exceeded")
     window.append(now)
+    # Opportunistically evict drained buckets so a stream of distinct source IPs (each a fresh
+    # cf-connecting-ip from internet scan traffic) can't grow _hits without bound over the process
+    # lifetime. Only sweeps once the dict is large, so it's cheap on the hot path.
+    if len(_hits) > 512:
+        for stale in [k for k, w in _hits.items() if not w or now - w[-1] > 60]:
+            del _hits[stale]
 
 
 # ---- request models ---------------------------------------------------------
@@ -466,7 +472,7 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
             sent += 1
         else:
             failed += 1
-            if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered")):
+            if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered", "BadEnvironmentKeyInToken")):
                 db.delete_voip(row["voip_token"])
     print(f"[doorbell] ring → {sent} phones (failed {failed})", flush=True)
     return {"ok": True, "sent": sent, "failed": failed, "phones": len(rows)}
@@ -738,26 +744,33 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
                 style = json.loads(raw)
             except json.JSONDecodeError:
                 style = {}
-        rendered = render.render(
-            {
-                "camera": body.camera,
-                "camera_name": body.camera_name,
-                "labels": body.labels,
-                "sub_labels": body.sub_labels,
-                "zones": body.zones,
-                "score": body.score,
-                "severity": body.severity,
-                "detection_id": body.detection_id,
-                "frigate_base_url": body.frigate_base_url,
-                "recognized_license_plate": body.recognized_license_plate,
-            },
-            style,
-            body.stage or "alert",
-        )
-        title = rendered["title"] or title
-        text = rendered["body"] or text
-        snapshot_url = rendered["snapshot_url"] or snapshot_url
-        thumbnail_url = rendered["thumbnail_url"] or thumbnail_url
+        # Guard the render: /v1/style only validates that `style` is a dict, not its shape, so a
+        # malformed stored style (e.g. a list where a map is expected) could raise here and 500 the
+        # whole notify → the bridge would retry 3× and then drop a real alert. On any failure fall
+        # back to the bridge-supplied title/body rather than losing the notification.
+        try:
+            rendered = render.render(
+                {
+                    "camera": body.camera,
+                    "camera_name": body.camera_name,
+                    "labels": body.labels,
+                    "sub_labels": body.sub_labels,
+                    "zones": body.zones,
+                    "score": body.score,
+                    "severity": body.severity,
+                    "detection_id": body.detection_id,
+                    "frigate_base_url": body.frigate_base_url,
+                    "recognized_license_plate": body.recognized_license_plate,
+                },
+                style,
+                body.stage or "alert",
+            )
+            title = rendered["title"] or title
+            text = rendered["body"] or text
+            snapshot_url = rendered["snapshot_url"] or snapshot_url
+            thumbnail_url = rendered["thumbnail_url"] or thumbnail_url
+        except Exception as exc:
+            print(f"[notify] render failed ({exc}); using bridge-supplied title/body", flush=True)
 
     payload = apns.build_payload(
         title=title,
@@ -879,6 +892,10 @@ async def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
             ok, _detail = await apns.send_background(row["device_token"], row["environment"], payload)
             if ok:
                 woken += 1
+            elif any(k in _detail for k in ("410", "BadDeviceToken", "Unregistered", "BadEnvironmentKeyInToken")):
+                # Prune a permanently-dead token here too (parity with deliver_to_pairing) instead of
+                # leaving it to fail every silent widget-refresh push until a real alert prunes it.
+                db.delete_device(row["device_token"])
         print(f"[mode] {mode} → woke {woken} phones for widget refresh", flush=True)
     return {"ok": True, "mode": mode, "woken": woken}
 
