@@ -11,6 +11,7 @@ Admin web GUI (browser, password-protected): mounted at /admin — upload the
 """
 import asyncio
 import datetime
+import hmac
 import ipaddress
 import json
 import os
@@ -25,7 +26,7 @@ from typing import Optional
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
@@ -71,6 +72,26 @@ async def _fire_panel_screen(slug: str) -> None:
 
 app = FastAPI(title="ApexSight Push Relay", docs_url=None, redoc_url=None)
 app.add_middleware(SessionMiddleware, secret_key=config.session_secret(), https_only=False)
+
+# Bound request bodies. Sits above the 8 MB soundboard-clip cap (doorbell.MAX_CLIP_BYTES) so
+# talkback still works, while stopping the JSON endpoints (/v1/notify, /v1/style, /v1/device-prefs…)
+# from parsing/persisting an unbounded body. Content-Length is absent under chunked transfer-
+# encoding, so this is a coarse first line of defense, not a hard limit — the clip path keeps its
+# own streaming size check in _read_clip().
+_MAX_BODY_BYTES = 16 * 1024 * 1024
+
+
+@app.middleware("http")
+async def _limit_body_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            too_big = int(cl) > _MAX_BODY_BYTES
+        except ValueError:
+            return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+        if too_big:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
+    return await call_next(request)
 
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=_static_dir), name="static")
@@ -432,7 +453,9 @@ def _require_pairing(code: str) -> str:
     if not PAIRING_CODE:
         raise HTTPException(status_code=503, detail="relay has no pairing code configured")
     code = (code or "").upper().strip()
-    if code != PAIRING_CODE:
+    # Constant-time compare so the one secret that gates every ring/talk/mode/suppress action
+    # doesn't leak byte-by-byte through response timing.
+    if not hmac.compare_digest(code, PAIRING_CODE):
         raise HTTPException(status_code=403, detail="bad pairing code")
     return code
 
@@ -776,7 +799,10 @@ def muted_cameras(body: MutedCamerasIn, _: None = Depends(rate_limit)) -> dict:
     """The app syncs which cameras have notifications turned OFF entirely, per household, so
     app-closed pushes for a muted camera are suppressed at the relay (the in-app per-camera
     toggle otherwise only gates foreground delivery)."""
-    code = body.pairing_code.upper().strip()
+    # Muting cameras suppresses real app-closed alerts, so require the household code (uniform with
+    # the mode/ring endpoints and fail-safe: refuse if the relay has no code configured) rather than
+    # trusting whatever code the caller names its bucket with.
+    code = _require_pairing(body.pairing_code)
     db.set_config(f"muted_cameras:{code}", json.dumps(sorted(set(body.muted))))
     return {"ok": True, "muted": sorted(set(body.muted))}
 
@@ -863,7 +889,7 @@ def get_mode(pairing_code: str = "") -> dict:
            "map": mutes_map, "map_custom": custom is not None,
            "cameras": _mode_map_cameras(custom)}
     code = pairing_code.upper().strip()
-    if code and code == PAIRING_CODE:
+    if code and PAIRING_CODE and hmac.compare_digest(code, PAIRING_CODE):
         g = {}
         graw = db.get_config(f"gate:{code}")
         if graw:
@@ -977,7 +1003,9 @@ def set_style(body: StyleIn, _: None = Depends(rate_limit)) -> dict:
 def set_gate(body: GateIn, _: None = Depends(rate_limit)) -> dict:
     """The iOS app mirrors its Disarm / Snooze state here so app-closed pushes are
     suppressed while disarmed or snoozed, matching the in-app delivery gate."""
-    code = body.pairing_code.upper().strip()
+    # Disarm/snooze suppress real alerts — require the household code, and fail safe (refuse) if the
+    # relay has none configured, so nothing can silence the house without the secret.
+    code = _require_pairing(body.pairing_code)
     # Bound the snooze horizon so a leaked pairing code can't silence the household indefinitely by
     # posting a far-future timestamp. A real in-app snooze is always well under this; `disarmed` is a
     # deliberate toggle the app re-asserts on every foreground, so it self-heals.
