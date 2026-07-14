@@ -90,6 +90,20 @@ def set_config(key: str, value: str) -> None:
         )
 
 
+def next_mode_request_seq() -> int:
+    """Atomically increment and return the monotonic mode-request seq in a SINGLE statement, so two
+    concurrent /v1/set-mode calls (FastAPI runs the sync endpoint in a threadpool) can't both read
+    the same value and then both write seq N+1 — a duplicate the bridge dedupes on, silently dropping
+    one arm/disarm command."""
+    with _conn() as c:
+        row = c.execute(
+            "INSERT INTO config(key, value) VALUES('mode_request_seq', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+            "RETURNING value"
+        ).fetchone()
+    return int(row["value"])
+
+
 def all_config() -> dict:
     with _conn() as c:
         return {r["key"]: r["value"] for r in c.execute("SELECT key, value FROM config")}

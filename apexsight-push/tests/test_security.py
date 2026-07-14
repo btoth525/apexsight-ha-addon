@@ -58,5 +58,19 @@ check("loopback + no header = in-house bridge (exempt)", m._is_inhouse_bridge(fa
 check("loopback + forwarding header != bridge", not m._is_inhouse_bridge(fake_request("127.0.0.1", {"x-forwarded-for":"1.2.3.4"})))
 check("public peer != in-house bridge", not m._is_inhouse_bridge(fake_request("8.8.8.8")))
 
+# ---- atomic mode-request seq: distinct under concurrency (no dropped arm/disarm) ----------
+import threading as _threading
+import app.db as _db
+_db.set_config("mode_request_seq", "0")
+_out, _lock = [], _threading.Lock()
+def _seq_worker():
+    v = _db.next_mode_request_seq()
+    with _lock:
+        _out.append(v)
+_ts = [_threading.Thread(target=_seq_worker) for _ in range(20)]
+[t.start() for t in _ts]
+[t.join() for t in _ts]
+check("mode-request seq is distinct under 20 concurrent callers", len(set(_out)) == 20)
+
 print("\n%d/%d passed" % (sum(ok), len(ok)))
 raise SystemExit(0 if all(ok) else 1)

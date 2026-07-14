@@ -117,9 +117,17 @@ async def _startup() -> None:
 async def _recap_scheduler() -> None:
     """Once a minute, send the household's daily recap if it's due and not yet sent
     today — so the daily summary arrives reliably even with the app fully closed."""
+    prune_tick = 0
     while True:
         try:
             await _maybe_send_recap()
+            # Prune old recap rows on a fixed cadence REGARDLESS of whether the recap is enabled.
+            # The bridge records every event into recap_events unconditionally, but the prune inside
+            # _maybe_send_recap only runs after its enabled/configured/time early-returns — so a
+            # household that never enables the recap (or hasn't set up APNs) grew the table forever.
+            prune_tick += 1
+            if prune_tick % 60 == 1:   # ~hourly
+                db.prune_recap_events(time.time() - 2 * 86_400)   # keep ~2 days
         except Exception as exc:
             print("[recap] error:", exc, flush=True)
         await asyncio.sleep(60)
@@ -817,14 +825,18 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     result = await apns.deliver_to_pairing(
         code, payload, collapse_id=body.collapse_id, gate=device_gate
     )
-    # If every reachable device failed for a TRANSIENT reason (APNs timeout / 5xx / 429 — NOT a
-    # permanent bad-token prune, and NOT a per-device mute), signal failure so the bridge's retry
-    # fires. Returning 200 here let the bridge stamp the alert "sent" and permanently drop a real
-    # security alert when APNs had a blip (the recap path already guards this; notify did not).
+    # If ANY reachable device failed for a TRANSIENT reason (APNs timeout / 5xx / 429 — NOT a
+    # permanent bad-token prune, and NOT a per-device mute), signal failure so the bridge leaves the
+    # stage unstamped and retries on the review's next update. Previously this only fired when EVERY
+    # device failed, so a single phone's transient APNs blip while the others succeeded permanently
+    # dropped that phone's alert. Fail-open (a dropped security alert is the worst outcome) wins.
+    # TRADEOFF: the bridge re-POSTs the whole pairing, so phones that already got it are re-sent —
+    # collapse_id replaces the banner in place (no visible duplicate), though a non-silent re-send
+    # can re-buzz. Bounded: retries only on subsequent MQTT updates of the same review, not a loop.
     transient_failed = result["failed"] - result["pruned"]
-    if result["devices"] > 0 and result["sent"] == 0 and transient_failed > 0:
+    if result["devices"] > 0 and transient_failed > 0:
         raise HTTPException(status_code=503,
-                            detail=f"all {transient_failed} deliveries failed transiently — retry")
+                            detail=f"{transient_failed} of {result['devices']} deliveries failed transiently — retry")
     return {"ok": result["sent"] > 0 or result["devices"] == 0, **result}
 
 
@@ -1028,12 +1040,13 @@ def set_mode_request(body: SetModeIn, _: None = Depends(rate_limit)) -> dict:
         raise HTTPException(status_code=403, detail="disarm requires the alarm code")
 
     by = db.device_name_for(body.device_token.strip()) if body.device_token.strip() else ""
-    seq = int(db.get_config("mode_request_seq", "0") or "0") + 1
+    # Atomic seq allocation (see db.next_mode_request_seq) — replaces a read-then-write that let two
+    # concurrent requests mint the same seq and drop one command.
+    seq = db.next_mode_request_seq()
     now = time.time()
     db.set_config("mode_request", json.dumps(
         {"seq": seq, "mode": mode, "by": by, "code": (body.code or "").strip(), "ts": now}
     ))
-    db.set_config("mode_request_seq", str(seq))
     # Record who requested it for the who-armed sensor (the app + HA show this).
     db.set_config("armed_by", json.dumps({"by": by, "mode": mode, "ts": now}))
     # Never log the code.

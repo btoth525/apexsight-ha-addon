@@ -77,6 +77,19 @@ def is_configured() -> bool:
         return False
 
 
+_shared_client: Optional[httpx.AsyncClient] = None
+
+
+def _apns_client() -> httpx.AsyncClient:
+    """One long-lived HTTP/2 client, reused across sends. Fanning an alert to N phones then
+    multiplexes over kept-alive connections to APNs — Apple explicitly recommends reusing the
+    connection — instead of doing N TLS handshakes + N fresh HTTP/2 connections per push."""
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(http2=True, timeout=10.0)
+    return _shared_client
+
+
 async def send_to_token(
     device_token: str, environment: str, payload: dict, collapse_id: str = ""
 ) -> tuple[bool, str]:
@@ -95,8 +108,7 @@ async def send_to_token(
         headers["apns-collapse-id"] = collapse_id[:64]
     url = f"{_host_for(environment, env_mode)}/3/device/{device_token}"
     try:
-        async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, content=json.dumps(payload))
+        resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}"
 
@@ -123,8 +135,7 @@ async def send_background(device_token: str, environment: str, payload: dict) ->
     }
     url = f"{_host_for(environment, env_mode)}/3/device/{device_token}"
     try:
-        async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, content=json.dumps(payload))
+        resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}"
     if resp.status_code == 200:
@@ -148,8 +159,7 @@ async def send_voip(voip_token: str, environment: str, payload: dict) -> tuple[b
     }
     url = f"{_host_for(environment, env_mode)}/3/device/{voip_token}"
     try:
-        async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
-            resp = await client.post(url, headers=headers, content=json.dumps(payload))
+        resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}"
     if resp.status_code == 200:
