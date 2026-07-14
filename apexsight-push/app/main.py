@@ -37,6 +37,14 @@ from .admin import router as admin_router
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
 PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 
+# GET /v1/mode exposes live house occupancy (home/away), armed_by, and the camera roster — a
+# burglary-timing oracle if left open. Gating it requires that every caller sends the pairing code;
+# the app does, but OLD app builds' widget/silent-push fetch does not, so enabling this is DEPLOY-
+# COUPLED: turn it on only after the app build that teaches SharedHouseModeFetch to send the code is
+# on every phone, or the Lock Screen widget's mode goes blank. Default off so deploying the relay is
+# always safe; flip REQUIRE_MODE_CODE=true once the app has shipped.
+REQUIRE_MODE_CODE = os.environ.get("REQUIRE_MODE_CODE", "").strip().lower() in ("1", "true", "yes", "on")
+
 # --- Doorpanel: pair each response clip with its on-screen takeover ------------------------------
 # The add-on runs inside HA (homeassistant_api: true), so it can press the ESPHome Doorpanel's
 # button entities via the Supervisor core API. Playing one of these saved clips ALSO flips the
@@ -162,23 +170,43 @@ async def _maybe_send_recap() -> None:
 _hits: dict[str, deque] = defaultdict(deque)
 
 
+def _from_trusted_proxy(request: Request) -> bool:
+    """Whether the SOCKET peer is the local Cloudflare tunnel / same-host proxy — i.e. a
+    private/loopback address. The tunnel is the only way in (the host port isn't exposed to
+    untrusted devices), and it connects from the local network, so only a private-peer request may
+    set the cf-connecting-ip / x-forwarded-for we trust. A public socket peer can't have transited
+    the tunnel, so its forwarding headers are ignored — an attacker can't spoof them to rotate their
+    rate-limit key or masquerade as internal."""
+    host = request.client.host if request.client else ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host in ("localhost",)
+    return ip.is_private or ip.is_loopback
+
+
 def _real_ip(request: Request) -> str:
-    """The socket peer behind the Cloudflare tunnel is the proxy, not the caller — so trust the
-    standard forwarding headers when present (mirrors admin._client_ip). A request with NO
-    forwarding header is a same-host/loopback caller (the in-house bridge)."""
-    cf = request.headers.get("cf-connecting-ip")
-    if cf:
-        return cf.strip()
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
+    """The caller's IP for rate limiting. Trust forwarding headers only from the local tunnel/proxy
+    (mirrors admin._client_ip); otherwise use the socket peer so headers can't be spoofed."""
+    if _from_trusted_proxy(request):
+        cf = request.headers.get("cf-connecting-ip")
+        if cf:
+            return cf.strip()
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
-def _is_external(request: Request) -> bool:
-    """True when the request arrived through the tunnel (has a forwarding header) rather than from
-    the same host. Used to apply stricter guards to internet-originated calls only."""
-    return bool(request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for"))
+def _is_inhouse_bridge(request: Request) -> bool:
+    """The same-host HA bridge: a loopback socket peer with NO forwarding header. It's the only
+    caller exempt from rate limiting and the play-url SSRF guard (it legitimately plays LAN-hosted
+    Home Assistant TTS). Everything else — tunnel app traffic, and any request that somehow arrives
+    directly — is treated as untrusted and gets both guards."""
+    if request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for"):
+        return False
+    host = request.client.host if request.client else ""
+    return host in ("127.0.0.1", "::1", "localhost")
 
 
 def _reject_internal_host(url: str) -> None:
@@ -203,10 +231,10 @@ def _reject_internal_host(url: str) -> None:
 
 
 def rate_limit(request: Request) -> None:
-    ip = _real_ip(request)
-    # Never throttle the in-house bridge (loopback, no forwarding header) — it must always deliver.
-    if not _is_external(request) and ip in ("127.0.0.1", "::1", "localhost"):
+    # Never throttle the in-house bridge — it must always deliver.
+    if _is_inhouse_bridge(request):
         return
+    ip = _real_ip(request)
     now = time.time()
     window = _hits[ip]
     while window and now - window[0] > 60:
@@ -560,9 +588,10 @@ async def doorbell_play_url(body: DoorbellUrlIn, request: Request, _: None = Dep
     url = body.url.strip()
     if not url.lower().startswith(("http://", "https://", "rtsp://")):
         raise HTTPException(status_code=400, detail="url must be http(s) or rtsp")
-    # The in-house bridge legitimately plays LAN-hosted HA TTS URLs; an EXTERNAL caller (via the
-    # tunnel) holding only the low-trust pairing code must not be able to SSRF into the home network.
-    if _is_external(request):
+    # The in-house bridge legitimately plays LAN-hosted HA TTS URLs; every other caller (tunnel app
+    # traffic, or anything arriving directly) holds only the low-trust pairing code and must not be
+    # able to SSRF into the home network — so SSRF-check all of them, exempting only the bridge.
+    if not _is_inhouse_bridge(request):
         _reject_internal_host(url)
     try:
         frames = await run_in_threadpool(
@@ -868,13 +897,19 @@ def _load_mode_map() -> dict | None:
 
 
 @app.get("/v1/mode")
-def get_mode(pairing_code: str = "") -> dict:
+def get_mode(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
     """Current house mode + which cameras it mutes — for the app (to reflect state), the HA bridge,
     and debugging. `armed_by` reports who last requested a change (from the app), for display.
     `map` is the EFFECTIVE per-mode mute matrix (household custom map when set, else defaults) plus
     `map_custom` so the app can show "edited" vs "defaults". When the household `pairing_code` is
     supplied, also reports the household gate (`snoozed_until`/`disarmed`) so the app can SHOW a
     loud "notifications are snoozed/off" banner instead of silently dropping alerts."""
+    code = pairing_code.upper().strip()
+    code_ok = bool(code and PAIRING_CODE and hmac.compare_digest(code, PAIRING_CODE))
+    # Occupancy is sensitive: when REQUIRE_MODE_CODE is enabled, refuse the whole response without a
+    # valid household code (see the flag's note for the deploy-ordering constraint).
+    if REQUIRE_MODE_CODE and not code_ok:
+        raise HTTPException(status_code=403, detail="bad pairing code")
     mode = db.get_config("house_mode", "") or ""
     armed_by = {}
     raw = db.get_config("armed_by", "")
@@ -888,8 +923,7 @@ def get_mode(pairing_code: str = "") -> dict:
     out = {"mode": mode, "mutes": gate.resolve_mode_mutes(mode, custom), "armed_by": armed_by,
            "map": mutes_map, "map_custom": custom is not None,
            "cameras": _mode_map_cameras(custom)}
-    code = pairing_code.upper().strip()
-    if code and PAIRING_CODE and hmac.compare_digest(code, PAIRING_CODE):
+    if code_ok:
         g = {}
         graw = db.get_config(f"gate:{code}")
         if graw:
