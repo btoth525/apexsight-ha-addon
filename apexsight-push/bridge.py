@@ -704,6 +704,20 @@ def _post_to_relay(payload: dict, stage: str, attempts: int = 3) -> bool:
     return False
 
 
+def _forward_stages(after: dict, stages, review_id, now: float) -> None:
+    """Build + POST each alert stage to the relay, stamping a stage as sent ONLY after a confirmed
+    2xx — a failed/429'd delivery is left unstamped so the review's next MQTT update retries it
+    instead of silently dropping it. Runs on a worker thread so a slow relay can't block the bridge's
+    single network-loop thread (see the dispatch site). Concurrent workers only ever write distinct
+    review_id/stage keys of `_notified`, which is safe under the GIL."""
+    for stage in stages:
+        payload = _build_alert(after, final=(stage == "final"))
+        if not payload:
+            continue
+        if _post_to_relay(payload, stage) and review_id:
+            _notified.setdefault(review_id, {})[stage] = now
+
+
 def _post_mode(mode: str) -> None:
     """Forward the house mode to the relay's /v1/mode. Best-effort with a couple of retries — a
     missed mode update just leaves the previous mode in place (fail-open on the relay side)."""
@@ -953,8 +967,10 @@ def on_message(client, userdata, msg):
         _post_mode(msg.payload.decode("utf-8", "ignore"))
         return
     # Doorbell ring — any message on this topic fires the VoIP push (payload content ignored).
+    # Worker thread, like the talkback handlers: the ring's own POST must not block the loop, and it
+    # must not sit behind an in-flight alert forward either (both are now off-thread).
     if msg.topic == DOORBELL_TOPIC:
-        _post_doorbell()
+        threading.Thread(target=_post_doorbell, daemon=True).start()
         return
     # Doorbell talkback — play an audio URL (HA TTS/media) or a saved preset clip at the door.
     # CRITICAL: these run on WORKER THREADS, never inline. A play blocks until the clip finishes
@@ -997,14 +1013,11 @@ def on_message(client, userdata, msg):
         return
     review_id = after.get("id")
     now = time.time()
-    for stage in stages:
-        payload = _build_alert(after, final=(stage == "final"))
-        if not payload:
-            continue
-        # Stamp the stage as sent ONLY after the relay confirms it — a failed/429'd delivery is left
-        # unstamped so the review's next MQTT update retries it instead of silently dropping it.
-        if _post_to_relay(payload, stage) and review_id:
-            _notified.setdefault(review_id, {})[stage] = now
+    # Forward on a WORKER THREAD, like the talkback handlers. _post_to_relay retries transient
+    # failures with backoff (up to ~33s), and doing that inline on paho's single network-loop thread
+    # stalls EVERY other message — including a time-critical doorbell RING — for the whole duration
+    # (and risks blowing the MQTT keepalive). Dispatch and let the loop keep pumping messages.
+    threading.Thread(target=_forward_stages, args=(after, stages, review_id, now), daemon=True).start()
 
 
 def main():
