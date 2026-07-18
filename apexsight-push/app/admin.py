@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from . import apns, config, db
+from .net_trust import real_ip
 
 router = APIRouter(prefix="/admin")
 _templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
@@ -30,15 +31,12 @@ _locked_until: dict[str, float] = {}
 
 
 def _client_ip(request: Request) -> str:
-    # Behind a tunnel/proxy the socket peer is the proxy, so prefer the real
-    # client IP from the standard forwarding headers.
-    cf = request.headers.get("cf-connecting-ip")
-    if cf:
-        return cf.strip()
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    # Behind a tunnel/proxy the socket peer is the proxy, so prefer the real client IP from the
+    # standard forwarding headers — but ONLY when the socket peer is actually the trusted local
+    # tunnel (see net_trust.py). Trusting these headers unconditionally let a caller forge a
+    # fresh fake IP on every login attempt so `_fails[ip]` never accumulated for any one key —
+    # the brute-force lockout below was a no-op against a real attacker.
+    return real_ip(request)
 
 
 def _lock_remaining(ip: str) -> int:
@@ -55,6 +53,14 @@ def _record_failure(ip: str) -> None:
     if len(window) >= MAX_FAILS:
         _locked_until[ip] = now + LOCKOUT
         window.clear()
+    # Mirrors main.py's _hits eviction: only sweeps once the dicts are large, snapshotted with
+    # list(...) first since this can run concurrently across requests.
+    if len(_fails) > 512:
+        for stale in [k for k, w in list(_fails.items()) if not w or now - w[-1] > FAIL_WINDOW]:
+            _fails.pop(stale, None)
+    if len(_locked_until) > 512:
+        for stale in [k for k, until in list(_locked_until.items()) if until <= now]:
+            _locked_until.pop(stale, None)
 
 
 def _clear_failures(ip: str) -> None:
