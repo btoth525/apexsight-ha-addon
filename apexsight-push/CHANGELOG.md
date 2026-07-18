@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.14.1
+
+- **Foreground mute re-check can now see the real object/zone.** `build_payload` forwards
+  `label`/`zones`/`score` in the APNs `userInfo` (mirroring the same fields the per-device gate
+  already evaluated server-side). The app's foreground `willPresent` re-check previously hardcoded
+  a placeholder label since the push carried nothing to check against — a phone that muted a
+  specific object type or zone (not the whole camera) still saw a foreground banner for it.
+
 ## 1.14.0
 
 **Second hardening pass (audit findings).**
