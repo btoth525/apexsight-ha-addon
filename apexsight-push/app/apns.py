@@ -185,6 +185,9 @@ def build_payload(
     frigate_token: str = "",
     silent: bool = False,
     announce: bool = False,
+    labels: list | None = None,
+    zones: list | None = None,
+    score: float = 0.0,
 ) -> dict:
     """Build the APNs payload the ApexSight NotificationService extension expects.
 
@@ -237,6 +240,16 @@ def build_payload(
         payload["thumbnail_url"] = thumbnail_url
     if frigate_token:
         payload["frigate_token"] = frigate_token
+    # Lets the app's foreground re-check (NotificationResponseDelegate.willPresent) evaluate the
+    # SAME per-object/zone mutes the server-side per-device gate already used to decide delivery —
+    # without this, foreground presentation could only honor camera-level mutes (a muted object/zone
+    # would still show a banner while foregrounded). Mirrors the app's own objects.first convention.
+    if labels:
+        payload["label"] = labels[0]
+    if zones:
+        payload["zones"] = zones
+    if score:
+        payload["score"] = score
     return payload
 
 

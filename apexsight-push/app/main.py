@@ -792,6 +792,9 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         frigate_token=body.frigate_token,
         silent=body.silent,
         announce=body.announce,
+        labels=body.labels,
+        zones=body.zones,
+        score=body.score,
     )
     # Per-device SOFT gate: camera / object / zone / quiet-hours / per-camera-snooze / triggers,
     # each synced per device via /v1/device-prefs and evaluated FAIL-OPEN (see gate.py). The app
