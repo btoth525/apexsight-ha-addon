@@ -96,6 +96,11 @@ MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 # it can't grow forever.
 _notified: dict[str, dict[str, float]] = {}
 _NOTIFIED_TTL = 3600
+# Stages currently dispatched to a worker thread but not yet confirmed (2xx) or failed — set
+# right before a worker starts, cleared in its `finally` regardless of outcome. Bounded by the
+# lifetime of an in-flight POST (_post_to_relay's own retry loop, ~33s worst case), so unlike
+# `_notified` it needs no separate TTL sweep.
+_in_flight: dict[str, set[str]] = {}
 
 # HomeKit-style AI-description follow-up: Frigate writes a GenAI description a few seconds AFTER the
 # event (published on `frigate/tracked_object_update`). Send the instant alert first, then a
@@ -652,6 +657,11 @@ def _stages_to_send(after: dict, msg_type: str) -> list[str]:
     for k in [k for k, v in list(_notified.items()) if now - max(v.values(), default=0) > _NOTIFIED_TTL]:
         _notified.pop(k, None)
     sent = _notified.get(review_id, {})
+    # Stages a PRIOR MQTT update already dispatched to a worker thread but hasn't confirmed
+    # (2xx) yet — see _in_flight / _forward_stages. Excluding these (not just `sent`) stops a
+    # rapid run of "update" messages from each spawning a duplicate concurrent "alert" POST for
+    # the same review before the first one confirms.
+    pending = _in_flight.get(review_id, set())
     detections = (after.get("data", {}) or {}).get("detections", []) or []
     severity = after.get("severity", "")
 
@@ -663,13 +673,20 @@ def _stages_to_send(after: dict, msg_type: str) -> list[str]:
     # posts nothing — and when it LATER escalates to "alert", it'd be deduped and the
     # real alert silently dropped (a missed alert).
     alert_allowed = (not ALERTS_ONLY) or severity == "alert"
-    if "alert" not in sent and alert_allowed and (detections or msg_type == "end"):
+    alert_ready = "alert" in sent or "alert" in pending
+    if not alert_ready and alert_allowed and (detections or msg_type == "end"):
         stages.append("alert")
-    # A separate "final" update only makes sense if the instant alert already went
-    # out *earlier*, while the event was still in progress — only then is its GIF
-    # partial. If the review ends in the same update that first fires the alert,
-    # that GIF is already complete, so no follow-up is needed.
-    if msg_type == "end" and detections and "alert" in sent and "final" not in sent:
+        alert_ready = True   # queued in THIS call — _forward_stages sends it first, in order
+    # A separate "final" update only makes sense if the instant alert already went out (or is
+    # queued to go out in this same dispatch — see below) *earlier than the review ending*, while
+    # the event was still in progress — only then is its GIF partial. If the review ends in the
+    # same update that first fires the alert, that GIF is already complete, so no follow-up is
+    # needed. Checking `alert_ready` (sent OR in-flight OR just queued above), not only `"alert"
+    # in sent`, closes a real gap: if `end` arrived before an EARLIER dispatch's alert POST had
+    # confirmed, "final" used to never queue — and the review having ended, nothing ever retried
+    # it, silently losing the GIF upgrade forever.
+    if (msg_type == "end" and detections and alert_ready
+            and "final" not in sent and "final" not in pending):
         stages.append("final")
 
     # NB: stages are NOT stamped as "sent" here — the caller stamps a stage only after the relay
@@ -709,13 +726,30 @@ def _forward_stages(after: dict, stages, review_id, now: float) -> None:
     2xx — a failed/429'd delivery is left unstamped so the review's next MQTT update retries it
     instead of silently dropping it. Runs on a worker thread so a slow relay can't block the bridge's
     single network-loop thread (see the dispatch site). Concurrent workers only ever write distinct
-    review_id/stage keys of `_notified`, which is safe under the GIL."""
-    for stage in stages:
-        payload = _build_alert(after, final=(stage == "final"))
-        if not payload:
-            continue
-        if _post_to_relay(payload, stage) and review_id:
-            _notified.setdefault(review_id, {})[stage] = now
+    review_id/stage keys of `_notified`, which is safe under the GIL.
+
+    Marks `stages` in-flight for the duration so `_stages_to_send` won't let a rapid follow-up MQTT
+    message re-queue a duplicate concurrent dispatch of the same stage for this review."""
+    if review_id:
+        _in_flight.setdefault(review_id, set()).update(stages)
+    try:
+        for stage in stages:
+            payload = _build_alert(after, final=(stage == "final"))
+            if not payload:
+                continue
+            ok = _post_to_relay(payload, stage)
+            if ok and review_id:
+                _notified.setdefault(review_id, {})[stage] = now
+            elif stage == "alert" and "final" in stages:
+                # The instant alert didn't confirm — don't also send the silent GIF-swap "final"
+                # for an alert the phone may never have received. Leave both unstamped so a
+                # future dispatch (or _post_to_relay's own internal retry) can still deliver them.
+                break
+    finally:
+        if review_id:
+            _in_flight.get(review_id, set()).difference_update(stages)
+            if not _in_flight.get(review_id):
+                _in_flight.pop(review_id, None)
 
 
 def _post_mode(mode: str) -> None:
