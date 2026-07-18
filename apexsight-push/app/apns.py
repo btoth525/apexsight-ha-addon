@@ -285,7 +285,10 @@ async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str 
         # relay's key — permanent for that registration, never deliverable → prune like 410.
         if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered",
                                      "BadEnvironmentKeyInToken")):
-            db.delete_device(token)
+            # Conditional on the row's updated_at from our earlier read — a concurrent
+            # re-register between then and now would have already bumped updated_at, so this
+            # prune no-ops instead of deleting the device's fresh registration out from under it.
+            db.delete_device_if_unchanged(token, row["updated_at"])
             pruned += 1
     return {"devices": len(rows), "sent": sent, "failed": failed,
             "pruned": pruned, "suppressed": suppressed, "errors": errors}
