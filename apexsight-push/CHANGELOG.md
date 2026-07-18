@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.15.0
+
+**Hardening pass — admin auth bypass, a disk-fill DoS, and three delivery races.**
+
+- **Admin login lockout was bypassable.** `admin.py`'s brute-force lockout trusted a
+  client-supplied IP header unconditionally — a caller could forge a fresh fake IP on every
+  attempt so the fail2ban-style lockout never triggered against any one key, enabling unlimited
+  password guessing. A successful login exposes the plaintext household pairing code. Fixed by
+  sharing the same trusted-proxy check `main.py`'s rate limiter already had (new `net_trust.py`).
+- **Four endpoints let anyone write to the database with no pairing-code check**:
+  `/v1/style`, `/v1/ai-cameras`, `/v1/recap`, `/v1/device-prefs`. Combined with `/v1/style`'s
+  unbounded body, this was a disk-fill DoS (~1.9GB/min possible from one IP); `/v1/device-prefs`
+  let a leaked device token alone silence that phone's real alerts. All four now require the
+  household pairing code, matching every sibling mutating endpoint.
+- **Rate-limiter crash under load**: the `_hits` eviction sweep could raise "dictionary changed
+  size during iteration" under internet-scan-style traffic (an unhandled 500).
+- **Duplicate alert / lost GIF-upgrade race**: a rapid run of Frigate review updates could
+  dispatch the same alert twice, or silently lose the follow-up complete-GIF push forever if the
+  review ended before the first alert confirmed delivery.
+- **Daily recap could silently skip a day** on a same-day timezone change (travel) that crossed
+  midnight before the scheduled hour — now catches up with a best-effort recap for the missed day.
+- **Dead-token pruning could race a device re-registering** at the same moment, deleting its
+  fresh registration instead of the actually-dead one.
+
 ## 1.14.1
 
 - **Foreground mute re-check can now see the real object/zone.** `build_payload` forwards
