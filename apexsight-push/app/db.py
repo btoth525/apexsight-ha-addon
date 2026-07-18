@@ -159,6 +159,18 @@ def delete_device(device_token: str) -> None:
         c.execute("DELETE FROM devices WHERE device_token = ?", (device_token,))
 
 
+def delete_device_if_unchanged(device_token: str, expected_updated_at) -> None:
+    """Like delete_device, but only deletes the row if it hasn't been touched since the caller's
+    read — for pruning a token APNs reported dead. Without this, a device that re-registers
+    (`upsert_device`, bumping `updated_at`) between the read and the prune would have its FRESH
+    registration silently wiped by a delete that was really only valid against the stale row."""
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM devices WHERE device_token = ? AND updated_at = ?",
+            (device_token, expected_updated_at),
+        )
+
+
 def devices_for(pairing_code: str) -> list[sqlite3.Row]:
     with _conn() as c:
         return c.execute(

@@ -153,6 +153,23 @@ async def _maybe_send_recap() -> None:
     tz = datetime.timezone(datetime.timedelta(seconds=int(cfg.get("tz_offset", 0))))
     now = datetime.datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
+
+    # Catch-up safety net: a large mid-day tz_offset change (travel) can jump `today` forward
+    # across midnight before the PREVIOUS day's target hour was ever reached. Without this, the
+    # scheduler starts evaluating the new date immediately and never notices — it only ever
+    # compares against "today", so that day's recap is silently skipped forever. Detect a date we
+    # last checked but never actually sent, and send a best-effort catch-up for it first.
+    last_checked = db.get_config(f"recap_last_checked:{PAIRING_CODE}")
+    if last_checked and last_checked != today and db.get_config(f"recap_sent:{PAIRING_CODE}") != last_checked:
+        catchup_rows = db.recap_events_between(PAIRING_CODE, now.timestamp() - 86_400, now.timestamp())
+        catchup_title, catchup_body = recap.format_recap(catchup_rows)
+        catchup_payload = apns.build_payload(title=catchup_title, body=catchup_body, apex_url="apex://recap")
+        catchup_result = await apns.deliver_to_pairing(PAIRING_CODE, catchup_payload, collapse_id=f"recap-{last_checked}")
+        if catchup_result.get("sent", 0) > 0:
+            db.set_config(f"recap_sent:{PAIRING_CODE}", last_checked)
+            print(f"[recap] catch-up recap for skipped day {last_checked}: {catchup_result.get('sent', 0)} sent", flush=True)
+    db.set_config(f"recap_last_checked:{PAIRING_CODE}", today)
+
     if db.get_config(f"recap_sent:{PAIRING_CODE}") == today:
         return
     target = int(cfg.get("hour", 21)) * 60 + int(cfg.get("minute", 0))
@@ -178,32 +195,10 @@ async def _maybe_send_recap() -> None:
 _hits: dict[str, deque] = defaultdict(deque)
 
 
-def _from_trusted_proxy(request: Request) -> bool:
-    """Whether the SOCKET peer is the local Cloudflare tunnel / same-host proxy — i.e. a
-    private/loopback address. The tunnel is the only way in (the host port isn't exposed to
-    untrusted devices), and it connects from the local network, so only a private-peer request may
-    set the cf-connecting-ip / x-forwarded-for we trust. A public socket peer can't have transited
-    the tunnel, so its forwarding headers are ignored — an attacker can't spoof them to rotate their
-    rate-limit key or masquerade as internal."""
-    host = request.client.host if request.client else ""
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return host in ("localhost",)
-    return ip.is_private or ip.is_loopback
-
-
-def _real_ip(request: Request) -> str:
-    """The caller's IP for rate limiting. Trust forwarding headers only from the local tunnel/proxy
-    (mirrors admin._client_ip); otherwise use the socket peer so headers can't be spoofed."""
-    if _from_trusted_proxy(request):
-        cf = request.headers.get("cf-connecting-ip")
-        if cf:
-            return cf.strip()
-        xff = request.headers.get("x-forwarded-for")
-        if xff:
-            return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+from .net_trust import is_trusted_proxy as _from_trusted_proxy, real_ip as _real_ip
+# ^ shared with admin.py (see net_trust.py) so the login lockout and the rate limiter can never
+# drift apart on what counts as a trusted proxy — aliased under the old names since tests and the
+# rest of this file already refer to them as _from_trusted_proxy/_real_ip.
 
 
 def _is_inhouse_bridge(request: Request) -> bool:
@@ -252,10 +247,14 @@ def rate_limit(request: Request) -> None:
     window.append(now)
     # Opportunistically evict drained buckets so a stream of distinct source IPs (each a fresh
     # cf-connecting-ip from internet scan traffic) can't grow _hits without bound over the process
-    # lifetime. Only sweeps once the dict is large, so it's cheap on the hot path.
+    # lifetime. Only sweeps once the dict is large, so it's cheap on the hot path. This endpoint
+    # runs in FastAPI's threadpool (many concurrent workers) — snapshot with list(...) before
+    # iterating, else another request's `_hits[ip]` defaultdict auto-vivify can mutate the dict
+    # mid-iteration ("dictionary changed size during iteration"). `.pop(key, None)` instead of
+    # `del` so a concurrent sweep that already evicted the same key can't KeyError either.
     if len(_hits) > 512:
-        for stale in [k for k, w in _hits.items() if not w or now - w[-1] > 60]:
-            del _hits[stale]
+        for stale in [k for k, w in list(_hits.items()) if not w or now - w[-1] > 60]:
+            _hits.pop(stale, None)
 
 
 # ---- request models ---------------------------------------------------------
@@ -846,7 +845,7 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
 @app.post("/v1/ai-cameras")
 def ai_cameras(body: AICamerasIn, _: None = Depends(rate_limit)) -> dict:
     """The app syncs which cameras have AI descriptions in notifications turned OFF, per household."""
-    code = body.pairing_code.upper().strip()
+    code = _require_pairing(body.pairing_code)
     db.set_config(f"ai_desc_disabled:{code}", json.dumps(sorted(set(body.disabled))))
     return {"ok": True, "disabled": sorted(set(body.disabled))}
 
@@ -869,6 +868,12 @@ def device_prefs(body: DevicePrefsIn, _: None = Depends(rate_limit)) -> dict:
     """Each device syncs its OWN soft notification prefs here (per-camera/object/zone mutes, quiet
     hours, per-camera snoozes, triggers), keyed by device token, so app-closed pushes are gated per
     device exactly as the foreground app would. Fired on any settings change and on foreground."""
+    # These prefs are consumed FAIL-CLOSED by gate.py (an affirmative mute/quiet-hours/snooze
+    # suppresses delivery) — unlike every sibling mutating endpoint, this one had no pairing check
+    # at all, so anyone who obtained a device token (a bearer secret, but not the household secret)
+    # could silently mute that phone's real alerts. Require the same household code the storage key
+    # (device_token) doesn't otherwise need, uniform with muted-cameras/gate/mode.
+    _require_pairing(body.pairing_code)
     token = body.device_token.strip()
     prefs = dict(body.prefs or {})
     # Defense in depth for the soft-only invariant (see gate.py): even if an app build ever includes
@@ -910,7 +915,8 @@ async def set_mode(body: ModeIn, _: None = Depends(rate_limit)) -> dict:
             elif any(k in _detail for k in ("410", "BadDeviceToken", "Unregistered", "BadEnvironmentKeyInToken")):
                 # Prune a permanently-dead token here too (parity with deliver_to_pairing) instead of
                 # leaving it to fail every silent widget-refresh push until a real alert prunes it.
-                db.delete_device(row["device_token"])
+                # Conditional on this loop's own read of updated_at, same race guard as apns.py.
+                db.delete_device_if_unchanged(row["device_token"], row["updated_at"])
         print(f"[mode] {mode} → woke {woken} phones for widget refresh", flush=True)
     return {"ok": True, "mode": mode, "woken": woken}
 
@@ -1061,7 +1067,7 @@ def set_mode_request(body: SetModeIn, _: None = Depends(rate_limit)) -> dict:
 def set_style(body: StyleIn, _: None = Depends(rate_limit)) -> dict:
     """The iOS app saves its notification style here, keyed by pairing code, so the
     relay can render app-closed pushes the way the user configured in the GUI."""
-    code = body.pairing_code.upper().strip()
+    code = _require_pairing(body.pairing_code)
     db.set_config(f"style:{code}", json.dumps(body.style))
     return {"ok": True}
 
@@ -1091,7 +1097,7 @@ def set_gate(body: GateIn, _: None = Depends(rate_limit)) -> dict:
 def set_recap(body: RecapIn, _: None = Depends(rate_limit)) -> dict:
     """The iOS app saves its Daily Recap schedule here so the relay can send the
     summary at the chosen local time even when the app is fully closed."""
-    code = body.pairing_code.upper().strip()
+    code = _require_pairing(body.pairing_code)
     # Clamp to valid ranges: datetime.timezone rejects an offset of >= +-24h, which would make the
     # recap scheduler raise every tick and silently kill the household's daily recap forever; an
     # out-of-range hour/minute would mean it never fires.
