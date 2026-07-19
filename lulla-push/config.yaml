@@ -1,0 +1,48 @@
+name: Lulla Push + Sync
+version: "0.1.0"
+slug: lulla_push
+description: Self-hosted household sync + APNs relay for the Lulla baby tracker.
+url: https://github.com/btoth525/apexsight-ha-addon/tree/main/lulla-push
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+init: false
+# Pulls MQTT connection details automatically from the Home Assistant broker (push side).
+services:
+  - mqtt:need
+# Cloudflare Tunnel → lulla.plexserver525.com → this host port.
+ports:
+  "6969/tcp": 6969
+ports_description:
+  "6969/tcp": Sync + relay API + web GUI — point your Cloudflare Tunnel at this host port
+webui: "http://[HOST]:[PORT:6969]/healthz"
+options:
+  admin_username: admin
+  admin_password: ""
+  pairing_code: "LULLA-TOTH-0001"
+  apns_environment: auto
+  quiet_hours_start: "22:00"
+  quiet_hours_end: "07:00"
+  nap_aware: true
+  nap_state_topic: "lulla/nap_state"
+  mqtt_host: ""
+  mqtt_port: 0
+  mqtt_user: ""
+  mqtt_password: ""
+  log_level: info
+schema:
+  admin_username: str
+  admin_password: password
+  pairing_code: "match(^LULLA-[A-Z0-9]{4}-[A-Z0-9]{4}$)"
+  apns_environment: "list(auto|prod|sandbox)"
+  quiet_hours_start: str
+  quiet_hours_end: str
+  nap_aware: bool
+  nap_state_topic: str
+  mqtt_host: str?
+  mqtt_port: int?
+  mqtt_user: str?
+  mqtt_password: password?
+  log_level: "list(debug|info|warning|error)"
