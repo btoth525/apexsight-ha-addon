@@ -67,6 +67,26 @@ def _owlet_role(entity_id: str) -> Optional[str]:
     return "sock_on"   # any remaining owlet-ish binary_sensor: treat as the connected flag
 
 
+def _guess_baby_name(entity_id: str, friendly_name: Optional[str]) -> Optional[str]:
+    """HA's Owlet integration names the device "<Kid's Name> Sock" (a possessive like
+    "Ryleigh's" has its apostrophe sanitized away, leaving "Ryleighs"), then suffixes each
+    entity with its sensor type, e.g. "Ryleighs Sock Heart Rate". Recover the kid's name as
+    a best-guess suggestion — the app always shows it as an editable prefill during
+    onboarding, never a silent override of anything the user typed."""
+    raw = friendly_name or entity_id.split(".", 1)[-1].replace("_", " ")
+    lower = raw.lower()
+    idx = lower.find("sock")
+    if idx <= 0:
+        return None
+    prefix = raw[:idx].strip()
+    if not prefix:
+        return None
+    if prefix.lower().endswith("s") and len(prefix) > 1:
+        prefix = prefix[:-1]
+    prefix = prefix.strip()
+    return prefix.title() if prefix else None
+
+
 def _apply_owlet(vitals: dict, role: str, state: str) -> None:
     try:
         if role == "hr":
@@ -86,42 +106,48 @@ def _apply_owlet(vitals: dict, role: str, state: str) -> None:
 
 
 def classify(states: list[dict]) -> dict:
-    """Pure function: HA `GET /states` response → {vitals, nursery}. No network, fully
-    unit-testable. `connected` is added by the async wrapper (it reflects the API call,
-    not the classification)."""
+    """Pure function: HA `GET /states` response → {vitals, nursery, baby_name}. No network,
+    fully unit-testable. `connected` is added by the async wrapper (it reflects the API
+    call, not the classification)."""
     vitals = {"bpm": None, "spo2": None, "skin_temp_f": None, "battery_pct": None,
               "sock_on": False, "charging": False}
-    saw_owlet = False
+    saw_owlet_data = False   # at least one owlet reading is actually available
+    baby_name: Optional[str] = None
     nursery: list[dict] = []
 
     for s in states:
         entity_id = s.get("entity_id", "")
         state = s.get("state", "")
         attrs = s.get("attributes") or {}
-        if state in ("unavailable", "unknown"):
-            continue
+        friendly_name = attrs.get("friendly_name") or entity_id
 
         role = _owlet_role(entity_id)
         if role:
-            saw_owlet = True
-            _apply_owlet(vitals, role, state)
+            # The device's NAME is static — worth reading even while the sock itself is
+            # offline/unavailable, unlike the readings below which need a live value.
+            if baby_name is None:
+                baby_name = _guess_baby_name(entity_id, friendly_name)
+            if state not in ("unavailable", "unknown"):
+                saw_owlet_data = True
+                _apply_owlet(vitals, role, state)
             continue
 
-        name = (attrs.get("friendly_name") or entity_id)
-        if "nursery" not in name.lower() and "nursery" not in entity_id.lower():
+        if state in ("unavailable", "unknown"):
+            continue
+        if "nursery" not in friendly_name.lower() and "nursery" not in entity_id.lower():
             continue
         domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
         is_toggle = domain in ("switch", "light", "input_boolean", "fan")
         unit = attrs.get("unit_of_measurement") or ""
         nursery.append({
             "id": entity_id,
-            "label": name,
+            "label": friendly_name,
             "value": ("On" if state == "on" else "Off") if is_toggle else f"{state}{unit}",
             "is_toggle": is_toggle,
             "is_on": state == "on",
         })
 
-    return {"vitals": vitals if saw_owlet else None, "nursery": nursery}
+    return {"vitals": vitals if saw_owlet_data else None, "nursery": nursery, "baby_name": baby_name}
 
 
 # ---- async wrappers (network) -----------------------------------------------
@@ -129,7 +155,7 @@ def classify(states: list[dict]) -> dict:
 async def state() -> dict:
     states = await _get("/states")
     if states is None:
-        return {"connected": False, "vitals": None, "nursery": []}
+        return {"connected": False, "vitals": None, "nursery": [], "baby_name": None}
     result = classify(states)
     result["connected"] = True
     return result

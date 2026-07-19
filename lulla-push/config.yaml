@@ -1,5 +1,5 @@
 name: Lulla Push + Sync
-version: "0.2.0"
+version: "0.3.0"
 slug: lulla_push
 description: Self-hosted household sync + APNs relay for the Lulla baby tracker.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/lulla-push

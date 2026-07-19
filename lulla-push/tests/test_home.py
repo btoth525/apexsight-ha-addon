@@ -1,5 +1,5 @@
 """Pure classification tests for app/home.py — no network, no Supervisor needed."""
-from app.home import classify
+from app.home import _guess_baby_name, classify
 
 
 def s(entity_id, state, **attrs):
@@ -82,3 +82,49 @@ def test_owlet_takes_priority_over_nursery_match():
     out = classify([s("sensor.nursery_owlet_heart_rate", "140")])
     assert out["vitals"]["bpm"] == 140
     assert out["nursery"] == []
+
+
+# ---- baby-name guessing (pull the name from the sock) ------------------------
+
+def test_guess_baby_name_strips_possessive_s():
+    assert _guess_baby_name("sensor.x", "Ryleighs  Sock  Heart Rate") == "Ryleigh"
+
+
+def test_guess_baby_name_from_entity_id_when_no_friendly_name():
+    assert _guess_baby_name("sensor.ryleighs_sock_heart_rate", None) == "Ryleigh"
+
+
+def test_guess_baby_name_handles_short_non_possessive_name():
+    # A 2-letter name ending in "s" (rare, but don't truncate to 1 char nonsensically) —
+    # still strips per the possessive heuristic; this is a best-guess, not exact science.
+    assert _guess_baby_name("sensor.x", "Gus Sock Battery") == "Gu"
+
+
+def test_guess_baby_name_none_when_sock_not_in_name():
+    assert _guess_baby_name("sensor.owlet_battery", "Owlet Battery") is None
+
+
+def test_guess_baby_name_none_when_sock_is_the_whole_name():
+    assert _guess_baby_name("sensor.x", "Sock Battery") is None
+
+
+def test_classify_surfaces_baby_name_from_owlet_entities():
+    states = [
+        s("sensor.ryleighs_sock_battery_percentage", "100", friendly_name="Ryleighs  Sock  Battery percentage"),
+        s("binary_sensor.ryleighs_sock_charging", "on", friendly_name="Ryleighs  Sock  Charging"),
+    ]
+    out = classify(states)
+    assert out["baby_name"] == "Ryleigh"
+
+
+def test_classify_derives_name_even_when_all_owlet_entities_unavailable():
+    # The device's name is static — worth reading even while the sock is fully offline.
+    states = [s("sensor.ryleighs_sock_heart_rate", "unavailable", friendly_name="Ryleighs  Sock  Heart Rate")]
+    out = classify(states)
+    assert out["vitals"] is None            # no live reading
+    assert out["baby_name"] == "Ryleigh"     # but the name is still recoverable
+
+
+def test_classify_no_owlet_entities_baby_name_is_none():
+    out = classify([s("light.kitchen", "on")])
+    assert out["baby_name"] is None
