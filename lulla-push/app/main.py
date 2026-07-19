@@ -15,12 +15,25 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import apns, config, db, routing
+from . import apns, config, db, home, routing, security
 
 app = FastAPI(title="Lulla Push + Sync Relay", docs_url=None, redoc_url=None)
+
+# Public-internet auth hardening (this relay is reachable via the Cloudflare Tunnel):
+# slow brute force against the pairing code well below its 36^8 keyspace, and never leak
+# it via timing. Exempt only the test harness's ACCEPT_ANY_PAIRING mode, which registers
+# many households per run and is never reachable outside `swift test`.
+_register_limiter = security.RateLimiter(max_attempts=10, window_seconds=300)
+_admin_limiter = security.RateLimiter(max_attempts=5, window_seconds=300)
+
+
+def _client_key(request: Request) -> str:
+    # Honor Cloudflare's real-client-IP header when present (the tunnel proxies from it),
+    # else fall back to the socket peer.
+    return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
 
 
 @app.on_event("startup")
@@ -38,10 +51,12 @@ class APNsConfigBody(BaseModel):
 
 
 @app.post("/v1/admin/apns")
-async def set_apns_config(body: APNsConfigBody):
+async def set_apns_config(body: APNsConfigBody, request: Request):
     """One-shot APNs credential load (stand-in for the admin GUI). Pairing-code protected;
     the .p8 lands only in /data (db.config), never in the repo."""
-    if body.pairing_code.upper().strip() != config.PAIRING_CODE:
+    if not _admin_limiter.allow(_client_key(request)):
+        raise HTTPException(status_code=429, detail="too many attempts, try again later")
+    if not security.safe_equals(body.pairing_code.upper().strip(), config.PAIRING_CODE):
         raise HTTPException(status_code=403, detail="pairing code mismatch")
     db.set_config("apns_p8", body.p8)
     db.set_config("apns_key_id", body.key_id)
@@ -110,12 +125,14 @@ async def healthz():
 
 
 @app.post("/v1/register")
-async def register(body: RegisterBody):
+async def register(body: RegisterBody, request: Request):
     code = body.pairing_code.upper().strip()
     if config.ACCEPT_ANY_PAIRING:
         household = code                       # TEST mode: pairing code IS the household
     else:
-        if code != config.PAIRING_CODE:
+        if not _register_limiter.allow(_client_key(request)):
+            raise HTTPException(status_code=429, detail="too many attempts, try again later")
+        if not security.safe_equals(code, config.PAIRING_CODE):
             raise HTTPException(status_code=403, detail="pairing code mismatch")
         household = config.PAIRING_CODE
     token = db.register_device(household, body.device_id, body.device_name)
@@ -152,6 +169,26 @@ async def sync_pull(since: int = 0, limit: int = 500, household: str = Depends(_
 @app.get("/v1/sync/state")
 async def sync_state(household: str = Depends(_household)):
     return db.state(household)
+
+
+# ---- the house (Phase 5, §6) — read straight from HA, zero app-side setup ---
+
+class ToggleBody(BaseModel):
+    entity_id: str
+
+
+@app.get("/v1/home/state")
+async def home_state(household: str = Depends(_household)):
+    """Owlet vitals + the nursery strip, auto-discovered by entity name. `connected` tells
+    the app whether this add-on could reach Home Assistant's own API at all — independent
+    of whether any matching entities exist yet."""
+    return await home.state()
+
+
+@app.post("/v1/home/toggle")
+async def home_toggle(body: ToggleBody, household: str = Depends(_household)):
+    ok = await home.toggle(body.entity_id)
+    return {"ok": ok}
 
 
 # ---- push / eventing (Phase 6.5, plan §7) -----------------------------------

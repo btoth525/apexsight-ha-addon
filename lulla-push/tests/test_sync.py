@@ -44,6 +44,15 @@ def test_register_requires_pairing_code(client):
     assert r.status_code == 403
 
 
+def test_register_rate_limited_after_repeated_wrong_codes(client):
+    # Default limiter allows 10 attempts / 5 min from one client key; the 11th 403 becomes
+    # a 429 — brute-forcing the pairing code gets throttled, not just rejected.
+    last = None
+    for _ in range(11):
+        last = client.post("/v1/register", json={"pairing_code": "WRONG", "device_id": "brute"})
+    assert last.status_code == 429
+
+
 def test_sync_requires_bearer(client):
     assert client.get("/v1/sync/pull").status_code == 401
     assert client.post("/v1/sync/push", json={"records": []}).status_code == 401
