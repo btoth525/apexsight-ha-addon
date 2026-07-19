@@ -28,6 +28,29 @@ async def _startup() -> None:
     db.init()
 
 
+class APNsConfigBody(BaseModel):
+    pairing_code: str
+    p8: str
+    key_id: str
+    team_id: str
+    bundle_id: str
+    env_mode: str = "auto"
+
+
+@app.post("/v1/admin/apns")
+async def set_apns_config(body: APNsConfigBody):
+    """One-shot APNs credential load (stand-in for the admin GUI). Pairing-code protected;
+    the .p8 lands only in /data (db.config), never in the repo."""
+    if body.pairing_code.upper().strip() != config.PAIRING_CODE:
+        raise HTTPException(status_code=403, detail="pairing code mismatch")
+    db.set_config("apns_p8", body.p8)
+    db.set_config("apns_key_id", body.key_id)
+    db.set_config("apns_team_id", body.team_id)
+    db.set_config("apns_bundle_id", body.bundle_id)
+    db.set_config("apns_env_mode", body.env_mode)
+    return {"ok": True, "apns_configured": True}
+
+
 # ---- models -----------------------------------------------------------------
 
 class RegisterBody(BaseModel):
