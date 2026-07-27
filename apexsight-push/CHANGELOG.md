@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.16.0
+
+**One phone's iOS Focus no longer silences the whole household.**
+
+- **A Focus (Do Not Disturb, Sleep, Driving…) was making a house-wide security decision.**
+  The app's Focus filter wrote the HOUSEHOLD gate (`/v1/gate`), so when one person's Do Not
+  Disturb turned on, camera alerts stopped for *every* phone on the pairing code — for eight
+  hours, with nothing on screen explaining why. A Focus belongs to one person's device.
+  `/v1/device-prefs` now takes a `focus_snoozed_until` field stored per device token, and
+  `gate.would_deliver` honors it as a per-device hard mute ("focus snooze"). The household gate
+  is untouched by a Focus.
+- The Focus mute is stored under its own `focus:{token}` key, NOT inside the soft-prefs blob.
+  Two different processes write these (the app posts the full prefs blob; the Focus filter runs
+  in the widget extension and knows only the deadline), and `/v1/device-prefs` replaces what it
+  stores — one shared key would have let a Focus write wipe the phone's camera mutes and
+  triggers. Both fields are now optional and absent means "don't touch", so neither writer can
+  clobber the other. The horizon is clamped to 24h like the household snooze, so a Focus whose
+  "ended" callback never arrives can't mute a phone indefinitely.
+- **The household gate now records WHO silenced it and WHEN** (`by` / `at`, surfaced as
+  `gate_by` / `gate_at` on `GET /v1/mode`). A household snooze can come from any phone, a
+  widget, Siri, the watch or CarPlay, and until now nothing recorded which — "why did my
+  notifications stop?" could only be answered by reading the relay by hand. Attribution is
+  stamped only while the gate is actually suppressing, and cleared on resume.
+- New `tests/test_focus_snooze.py` (21 checks) pins the per-device separation, the
+  no-clobber invariant in both directions, the clamp, and the attribution lifecycle.
+
 ## 1.15.0
 
 **Hardening pass — admin auth bypass, a disk-fill DoS, and three delivery races.**

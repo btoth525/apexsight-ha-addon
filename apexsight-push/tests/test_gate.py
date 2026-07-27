@@ -43,6 +43,27 @@ check("global snooze in the past -> deliver (expired)",
 check("global snooze malformed (non-numeric) -> deliver",
       gate.would_deliver({"snoozed_until": "not-a-number"}, "front_door", "person", [], 0.9, NOW)[0])
 
+# Per-device Focus mute. The whole point of this key is that it is NOT the household gate: one
+# phone's Do Not Disturb must silence only that phone. These pin the hard-mute behavior and the
+# fail-open direction; the "personal, not household" half is enforced by /v1/device-prefs storing
+# it per device token (and by nothing ever copying it into gate:{code}).
+check("focus snooze in the future -> suppress",
+      not gate.would_deliver({"focus_snoozed_until": NOW + 60}, "front_door", "person", [], 0.9, NOW)[0])
+check("focus snooze reports its own reason (not 'global snooze')",
+      gate.would_deliver({"focus_snoozed_until": NOW + 60}, "front_door", "person", [], 0.9, NOW)[1] == "focus snooze")
+check("focus snooze expired -> deliver",
+      gate.would_deliver({"focus_snoozed_until": NOW - 60}, "front_door", "person", [], 0.9, NOW)[0])
+check("focus snooze zero -> deliver",
+      gate.would_deliver({"focus_snoozed_until": 0}, "front_door", "person", [], 0.9, NOW)[0])
+check("focus snooze malformed (non-numeric) -> deliver (fail-open)",
+      gate.would_deliver({"focus_snoozed_until": "not-a-number"}, "front_door", "person", [], 0.9, NOW)[0])
+check("focus snooze absent -> deliver",
+      gate.would_deliver({"cameras_disabled": []}, "front_door", "person", [], 0.9, NOW)[0])
+check("focus snooze is a HARD mute — a matching trigger cannot re-open it",
+      not gate.would_deliver({"focus_snoozed_until": NOW + 60,
+                              "triggers": [{"enabled": True, "name": "any", "cameras": [], "labels": []}]},
+                             "front_door", "person", [], 0.9, NOW)[0])
+
 check("camera snooze in the future for THIS camera -> suppress",
       not gate.would_deliver({"camera_snoozes": {"front_door": NOW + 60}}, "front_door", "person", [], 0.9, NOW)[0])
 check("camera snooze for a DIFFERENT camera -> deliver",

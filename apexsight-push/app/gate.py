@@ -131,9 +131,10 @@ def _trigger_matches(t: dict, camera: str, label: str, zones: list[str], score: 
 def would_deliver(prefs: Any, camera: str, label: str, zones: list[str],
                   score: float, now_epoch: float) -> tuple[bool, str]:
     """Return (deliver, reason) for ONE device's synced prefs. Mirrors the iOS gate:
-    hard mutes (disarm / global snooze / per-camera snooze) always win; otherwise deliver if the
-    soft filters (camera & object & zone enabled, not quiet hours) pass OR any enabled trigger
-    matches. FAIL-OPEN: returns (True, ...) on any malformed/absent input or unexpected error."""
+    hard mutes (disarm / global snooze / Focus snooze / per-camera snooze) always win; otherwise
+    deliver if the soft filters (camera & object & zone enabled, not quiet hours) pass OR any
+    enabled trigger matches. FAIL-OPEN: returns (True, ...) on any malformed/absent input or
+    unexpected error."""
     try:
         if not isinstance(prefs, dict):
             return True, "fail-open: prefs not an object"
@@ -144,6 +145,14 @@ def would_deliver(prefs: Any, camera: str, label: str, zones: list[str],
         gsnooze = _f(prefs.get("snoozed_until"))
         if gsnooze and now_epoch < gsnooze:
             return False, "global snooze"
+        # Per-device Focus mute: an iOS Focus (Do Not Disturb, Sleep, Driving…) is PERSONAL to one
+        # phone, so it must never ride the household gate — one person's Do Not Disturb silencing
+        # everyone's cameras is the bug this key exists to prevent. Kept distinct from
+        # `snoozed_until` on purpose: that one is stripped in /v1/device-prefs (a stale per-device
+        # copy must not shadow a household re-arm), while this one is stored per device by design.
+        fsnooze = _f(prefs.get("focus_snoozed_until"))
+        if fsnooze and now_epoch < fsnooze:
+            return False, "focus snooze"
         cam_snoozes = prefs.get("camera_snoozes")
         if isinstance(cam_snoozes, dict):
             cs = _f(cam_snoozes.get(camera))

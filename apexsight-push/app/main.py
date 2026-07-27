@@ -352,7 +352,13 @@ class DevicePrefsIn(BaseModel):
     # Soft-only notification prefs for THIS device: cameras_disabled / objects_disabled /
     # zones_disabled / camera_snoozes / quiet_hours{enabled,start,end} / tz_offset / triggers.
     # NEVER disarmed or global snoozed_until — those stay real-time household state (see gate.py).
-    prefs: dict = {}
+    # None (absent) means "don't touch the stored blob" — the Focus filter posts only the field
+    # below, and must not wipe soft prefs it has no way to reconstruct.
+    prefs: dict | None = None
+    # Per-device iOS Focus mute (epoch; 0 = not muted). Personal to ONE phone by design — a Focus
+    # is a property of a person's device, so it must never ride the household gate. None (absent)
+    # means "don't touch", so a soft-prefs sync from an older build can't clear a live Focus mute.
+    focus_snoozed_until: float | None = None
 
 
 class ModeIn(BaseModel):
@@ -393,6 +399,10 @@ class GateIn(BaseModel):
     pairing_code: str
     disarmed: bool = False
     snoozed_until: float = 0.0   # epoch seconds; 0 = not snoozed
+    # Who silenced the household, for the app's banner. A household snooze can be set from any
+    # phone, a widget, Siri, the watch or CarPlay, and until this was recorded there was no way
+    # to tell which — "why did notifications stop?" took a forensic session to answer.
+    by: str = ""
 
 
 class RecapIn(BaseModel):
@@ -804,15 +814,36 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     ev_score = body.score or 0.0
     now = time.time()
 
+    def _focus_snooze(token: str) -> float:
+        """This device's iOS Focus mute, stored apart from the soft-prefs blob (see
+        /v1/device-prefs). FAIL-OPEN: any unreadable value reads as "not muted"."""
+        raw = db.get_config(f"focus:{token}")
+        if not raw:
+            return 0.0
+        try:
+            return float(json.loads(raw).get("until") or 0)
+        except Exception:  # noqa: BLE001 — fail-open
+            return 0.0
+
     def device_gate(token: str) -> tuple[bool, str]:
         prefs_raw = db.get_config(f"prefs:{token}")
+        focus_until = _focus_snooze(token)
         if prefs_raw:
             try:
+                prefs = json.loads(prefs_raw)
+                # Merge the separately-stored Focus mute in at evaluation time so gate.py stays the
+                # single place that decides delivery (and stays unit-testable on a plain dict).
+                if isinstance(prefs, dict) and focus_until:
+                    prefs["focus_snoozed_until"] = focus_until
                 return gate.would_deliver(
-                    json.loads(prefs_raw), body.camera, ev_label, ev_zones, ev_score, now
+                    prefs, body.camera, ev_label, ev_zones, ev_score, now
                 )
             except Exception as exc:  # noqa: BLE001 — FAIL-OPEN: never suppress on a parse error
                 return True, f"fail-open: prefs parse {exc!r}"
+        # No soft prefs synced yet, but a Focus mute still has to apply — it's set from the widget
+        # extension, which can reach the relay before the app ever syncs a full blob.
+        if focus_until and now < focus_until:
+            return False, "focus snooze"
         # Older app that hasn't synced per-device prefs yet → household per-camera mute fallback.
         if body.camera:
             raw = db.get_config(f"muted_cameras:{code}", "")
@@ -881,7 +912,19 @@ def device_prefs(body: DevicePrefsIn, _: None = Depends(rate_limit)) -> dict:
     # household re-arm from a widget/Siri. Those two stay real-time household state via /v1/gate.
     prefs.pop("disarmed", None)
     prefs.pop("snoozed_until", None)
-    db.set_config(f"prefs:{token}", json.dumps(prefs))
+    # The per-device Focus mute lives in its OWN key, never inside this blob — two different
+    # writers touch them (the main app POSTs the full prefs blob; the Focus filter, running in the
+    # widget extension, knows only the Focus deadline), and this endpoint REPLACES what it stores.
+    # Sharing one key would let a Focus-filter write wipe the phone's camera mutes and triggers.
+    prefs.pop("focus_snoozed_until", None)
+    if body.prefs is not None:
+        db.set_config(f"prefs:{token}", json.dumps(prefs))
+    if body.focus_snoozed_until is not None:
+        # Bound the horizon like /v1/gate does: the Focus filter writes a long backstop deadline in
+        # case iOS never delivers the "Focus ended" callback, and an unclamped value would mute
+        # this phone indefinitely.
+        fs = min(max(float(body.focus_snoozed_until), 0.0), time.time() + 24 * 3600)
+        db.set_config(f"focus:{token}", json.dumps({"until": fs}))
     # Keep the per-phone HA entity name fresh (and bump updated_at → "last seen") without needing a
     # full re-register. Name-only update — never touches environment/pairing (see db.set_device_name).
     name = (body.device_name or "").strip()[:64]
@@ -970,8 +1013,17 @@ def get_mode(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
             except json.JSONDecodeError:
                 g = {}
         snoozed = float(g.get("snoozed_until") or 0)
-        out["snoozed_until"] = snoozed if snoozed > time.time() else 0
+        active = snoozed > time.time()
+        out["snoozed_until"] = snoozed if active else 0
         out["disarmed"] = bool(g.get("disarmed"))
+        # Attribution rides along only while the gate is actually suppressing — an expired snooze
+        # reports 0 above, so naming who set it then would be noise in the banner.
+        if active or out["disarmed"]:
+            out["gate_by"] = str(g.get("by") or "")
+            try:
+                out["gate_at"] = float(g.get("at") or 0)
+            except (TypeError, ValueError):
+                out["gate_at"] = 0.0
     return out
 
 
@@ -1088,7 +1140,15 @@ def set_gate(body: GateIn, _: None = Depends(rate_limit)) -> dict:
         snooze = max_snooze
     db.set_config(
         f"gate:{code}",
-        json.dumps({"disarmed": bool(body.disarmed), "snoozed_until": snooze}),
+        json.dumps({
+            "disarmed": bool(body.disarmed),
+            "snoozed_until": snooze,
+            # Attribution, so the app's banner can say WHO silenced the house and WHEN instead of
+            # just that it's silent. Only stamped while the gate is actually suppressing something
+            # — a plain "resume" shouldn't leave a name behind implying someone muted anything.
+            "by": (body.by or "").strip()[:64] if (snooze or body.disarmed) else "",
+            "at": time.time() if (snooze or body.disarmed) else 0,
+        }),
     )
     return {"ok": True}
 
