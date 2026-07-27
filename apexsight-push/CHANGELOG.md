@@ -30,7 +30,7 @@
   path simply 404s and does nothing, so the app is safe to install before or after this update.
   `/v1/device-prefs` still accepts `focus_snoozed_until` for the main app's full sync, which
   is how a mute the extension failed to clear gets healed.
-- New `tests/test_focus_snooze.py` (28 checks) pins the per-device separation, the
+- New `tests/test_focus_snooze.py` (33 checks) pins the per-device separation, the
   no-clobber invariant in both directions, the clamp, the dedicated endpoint, and the
   attribution lifecycle.
 

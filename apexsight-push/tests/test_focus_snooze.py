@@ -157,6 +157,29 @@ with TestClient(m.app) as c:
     check("/v1/focus-mute with 0 resumes this device",
           json.loads(db.get_config(f"focus:{TOK}"))["until"] == 0)
 
+    # ---- 7. BACKWARD COMPATIBILITY with app build 212 -------------------------------------
+    # Both phones run 212 the moment this add-on updates, and 212 knows nothing about `by`,
+    # `focus_snoozed_until` or /v1/focus-mute. Its request shapes must keep working, and — the
+    # one that would actually hurt — a 212 soft-prefs sync must not disturb a live Focus mute.
+    OLD = "c" * 64
+    r = c.post("/v1/gate", json={"pairing_code": CODE, "disarmed": False,
+                                 "snoozed_until": time.time() + 300})
+    check("212-shaped /v1/gate (no `by`) -> 200", r.status_code == 200)
+    check("212-shaped /v1/gate still stores the snooze",
+          json.loads(db.get_config(f"gate:{CODE}"))["snoozed_until"] > time.time())
+
+    c.post("/v1/focus-mute", json={"device_token": OLD, "pairing_code": CODE,
+                                   "until": time.time() + 3600})
+    r = c.post("/v1/device-prefs", json={
+        "device_token": OLD, "pairing_code": CODE,
+        "device_name": "Brandons Iphone", "prefs": SOFT_PREFS,
+    })
+    check("212-shaped /v1/device-prefs (no focus field) -> 200", r.status_code == 200)
+    check("212-shaped /v1/device-prefs still stores soft prefs",
+          json.loads(db.get_config(f"prefs:{OLD}"))["cameras_disabled"] == ["Garage"])
+    check("212-shaped /v1/device-prefs does NOT disturb a live Focus mute",
+          json.loads(db.get_config(f"focus:{OLD}"))["until"] > time.time())
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 if not all(ok):
     raise SystemExit(1)
