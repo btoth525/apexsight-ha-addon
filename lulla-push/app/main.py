@@ -17,7 +17,8 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from . import apns, config, db, home, owlet_log, routing, security
@@ -232,6 +233,30 @@ async def register(body: RegisterBody, request: Request):
             app_version=body.app_version,
         )
     return {"token": token, "household": household}
+
+
+# Ryleigh's nursery camera, proxied from Frigate. The relay shares the LAN with Frigate, so it
+# can fetch the snapshot and hand it back over the (token-authed, TLS-tunnelled) relay — which is
+# how the phone sees the camera off-WiFi without exposing Frigate to the internet. Defaults are
+# overridable via db config (frigate_url / frigate_camera) with no redeploy.
+_FRIGATE_URL_DEFAULT = "http://192.168.1.204:5000"
+_FRIGATE_CAMERA_DEFAULT = "Ryleighs_Rm"
+
+
+@app.get("/v1/camera/snapshot")
+async def camera_snapshot(household: str = Depends(_household)):
+    base = (db.get_config("frigate_url") or _FRIGATE_URL_DEFAULT).rstrip("/")
+    cam = db.get_config("frigate_camera") or _FRIGATE_CAMERA_DEFAULT
+    url = f"{base}/api/{cam}/latest.jpg?h=720"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail="camera unavailable")
+        return Response(content=r.content, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="camera unreachable")
 
 
 @app.post("/v1/sync/push")
