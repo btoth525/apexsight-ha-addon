@@ -866,13 +866,33 @@ def _post_doorbell() -> None:
     if RING_DEBOUNCE_SECONDS > 0 and now - _last_ring_ts < RING_DEBOUNCE_SECONDS:
         log(f"doorbell ring debounced ({now - _last_ring_ts:.0f}s since last — window {RING_DEBOUNCE_SECONDS:.0f}s)")
         return
-    try:
-        r = requests.post(f"{RELAY_URL}/v1/doorbell-ring", json={"pairing_code": PAIRING_CODE, "camera": "doorbell"}, timeout=10)
-        log(f"doorbell ring → relay {r.status_code} {r.text[:100]}")
-        if 200 <= r.status_code < 300:
-            _last_ring_ts = now
-    except Exception as exc:
-        log("doorbell POST failed:", exc)
+    # Bounded retry. A ring is a ONE-SHOT, time-critical event: the visitor presses once and walks
+    # away, so a single failed POST (relay mid-restart, a momentary blip) used to lose the call
+    # entirely with nothing to recover it — "the doorbell rang and my phone never rang", and no
+    # trace once the log rolled. Three quick attempts stay well under a second of added latency in
+    # the normal case and cost nothing when the first succeeds.
+    delays = (0.4, 1.2)
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"{RELAY_URL}/v1/doorbell-ring",
+                json={"pairing_code": PAIRING_CODE, "camera": "doorbell"},
+                timeout=10,
+            )
+            log(f"doorbell ring → relay {r.status_code} {r.text[:100]}"
+                + (f" (attempt {attempt + 1})" if attempt else ""))
+            if 200 <= r.status_code < 300:
+                _last_ring_ts = now
+                return
+            # 4xx won't fix itself on a retry (bad pairing code, etc.) — don't hammer it.
+            if 400 <= r.status_code < 500:
+                log(f"doorbell ring rejected ({r.status_code}) — not retrying")
+                return
+        except Exception as exc:
+            log(f"doorbell POST failed (attempt {attempt + 1}):", exc)
+        if attempt < len(delays):
+            time.sleep(delays[attempt])
+    log("doorbell ring LOST — all 3 attempts failed; no CallKit call was sent")
 
 
 def _publish_last_talk(client, what: str) -> None:

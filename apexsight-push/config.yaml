@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.16.1"
+version: "1.17.0"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -26,6 +26,7 @@ options:
   admin_password: ""
   pairing_code: "APEX-PLEX-5250"
   frigate_base_url: ""
+  frigate_rtsp_host: ""
   alerts_only: true
   topic: "frigate/reviews"
   doorbell_ip: ""
@@ -46,6 +47,7 @@ schema:
   admin_password: password
   pairing_code: "match(^APEX-[A-Z0-9]{4}-[A-Z0-9]{4}$)"
   frigate_base_url: url?
+  frigate_rtsp_host: str?
   alerts_only: bool
   topic: str
   doorbell_ip: str?

@@ -647,7 +647,16 @@ async def doorbell_talk_live(body: DoorbellTalkLiveIn, _: None = Depends(rate_li
     frigate = (os.environ.get("FRIGATE_BASE_URL") or "").strip().rstrip("/")
     if not frigate:
         raise HTTPException(status_code=503, detail="frigate_base_url not set in add-on config")
-    host = frigate.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    # RTSP host for the mic pull. `frigate_base_url` is the PUBLIC hostname the phones use — go2rtc's
+    # RTSP port (8554) is NOT exposed there (only 443 via the tunnel, and 8555 for WebRTC), so
+    # deriving the RTSP host from it made this endpoint try to reach the mic stream over the
+    # internet on a port nothing answers. It hung until ffmpeg gave up, and the resulting failure
+    # wasn't a TalkbackError, so it escaped as an opaque 500 — while the soundboard (a local FILE,
+    # no RTSP) kept working, which is what made this look like "only live talk is broken".
+    # `frigate_rtsp_host` overrides it with the LAN address; empty keeps the old derivation.
+    host = (os.environ.get("FRIGATE_RTSP_HOST") or "").strip()
+    if not host:
+        host = frigate.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
     if not host:
         raise HTTPException(status_code=503, detail="frigate_base_url has no host")
 
@@ -680,6 +689,13 @@ async def doorbell_talk_live(body: DoorbellTalkLiveIn, _: None = Depends(rate_li
         )
     except aqara_talk.TalkbackError as exc:
         raise HTTPException(status_code=409 if "busy" in str(exc) else 502, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        # Anything the talkback path doesn't wrap (a socket timeout pulling the RTSP stream, an
+        # ffmpeg spawn failure, a parse error) previously escaped as a bare 500 with no body — the
+        # app showed a useless error and the log said nothing. Report it as a 502 with the actual
+        # reason and print it, so the next failure names itself instead of needing a bisect.
+        print(f"[doorbell] talk-live failed pulling {stream_url}: {exc!r}", flush=True)
+        raise HTTPException(status_code=502, detail=f"talk-live failed: {exc}") from exc
     return {"ok": True, "frames": frames}
 
 

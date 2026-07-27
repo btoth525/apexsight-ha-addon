@@ -180,6 +180,21 @@ with TestClient(m.app) as c:
     check("212-shaped /v1/device-prefs does NOT disturb a live Focus mute",
           json.loads(db.get_config(f"focus:{OLD}"))["until"] > time.time())
 
+# ---- 8. Live two-way talk pulls the mic stream over the LAN, not the public hostname ----
+# frigate_base_url is the PUBLIC name the phones use; go2rtc's RTSP port (8554) is not exposed
+# there, so deriving the RTSP host from it made talk-live hang and 500. FRIGATE_RTSP_HOST overrides.
+import importlib as _il
+os.environ["FRIGATE_BASE_URL"] = "https://frigate.example.com"
+os.environ["FRIGATE_RTSP_HOST"] = "192.168.1.204"
+_il.reload(m)
+_frig = (os.environ.get("FRIGATE_BASE_URL") or "").strip().rstrip("/")
+_host = (os.environ.get("FRIGATE_RTSP_HOST") or "").strip() or _frig.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+check("talk-live uses FRIGATE_RTSP_HOST (LAN) when set", _host == "192.168.1.204")
+os.environ["FRIGATE_RTSP_HOST"] = ""
+_host2 = (os.environ.get("FRIGATE_RTSP_HOST") or "").strip() or _frig.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+check("talk-live falls back to the base-url host when unset (back-compat)",
+      _host2 == "frigate.example.com")
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 if not all(ok):
     raise SystemExit(1)

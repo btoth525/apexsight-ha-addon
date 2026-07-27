@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.17.0
+
+**Live two-way talk was pulling the mic stream from the PUBLIC hostname, where the port isn't open.**
+
+- `/v1/doorbell/talk-live` derived the RTSP host from `frigate_base_url` — the public name the
+  phones use. go2rtc's RTSP port (8554) is only exposed on the LAN; the tunnel forwards 443, and
+  8555 is forwarded for WebRTC. Measured: `192.168.1.204:8554` connects instantly, while
+  `frigate.plexserver525.com:8554` times out. So the relay tried to pull the just-published mic
+  stream from an address nothing answers, hung until ffmpeg gave up, and the failure escaped as an
+  opaque **500**. The soundboard and TTS kept working because they play a local FILE and never
+  touch RTSP — which is exactly why only *live* talk appeared broken.
+  New **`frigate_rtsp_host`** option (set it to the Frigate host's LAN IP). Empty keeps the old
+  derivation, so existing installs are unchanged.
+- **talk-live no longer 500s silently.** It only caught `TalkbackError`, so a socket timeout, an
+  ffmpeg spawn failure or a parse error escaped as a bare 500 with no body and nothing in the log.
+  Now returns a 502 carrying the real reason and prints it.
+- **A doorbell ring is retried (3 bounded attempts).** `_post_doorbell` posted once; a single
+  failure — relay mid-restart, a momentary blip — lost the ring permanently, and a ring is a
+  ONE-SHOT event: the visitor presses once and walks away. That is "the doorbell rang and my phone
+  never rang", with nothing left in the log to explain it. 4xx is not retried (it won't fix
+  itself), and an exhausted retry now logs `doorbell ring LOST` explicitly.
+
 ## 1.16.1
 
 **The follow-up notification now shows THIS review's footage, not the whole event's.**

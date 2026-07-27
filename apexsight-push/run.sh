@@ -20,6 +20,9 @@ export TURN_API_TOKEN="$(bashio::config 'turn_api_token')"
 export RELAY_URL="http://127.0.0.1:3421"
 export PAIRING_CODE="$(bashio::config 'pairing_code')"
 export FRIGATE_BASE_URL="$(bashio::config 'frigate_base_url')"
+# LAN host for go2rtc's RTSP port (:8554). frigate_base_url is the PUBLIC hostname the
+# phones use; :8554 is not exposed there, so live two-way talk must pull over the LAN.
+export FRIGATE_RTSP_HOST="$(bashio::config 'frigate_rtsp_host')"
 export TOPIC="$(bashio::config 'topic')"
 export ALERTS_ONLY="$(bashio::config 'alerts_only')"
 
