@@ -23,8 +23,16 @@
   widget, Siri, the watch or CarPlay, and until now nothing recorded which — "why did my
   notifications stop?" could only be answered by reading the relay by hand. Attribution is
   stamped only while the gate is actually suppressing, and cleared on resume.
-- New `tests/test_focus_snooze.py` (21 checks) pins the per-device separation, the
-  no-clobber invariant in both directions, the clamp, and the attribution lifecycle.
+- **New `POST /v1/focus-mute`** — the endpoint the app's Focus filter (running in the widget
+  extension, where it knows only the deadline) actually posts to. Kept separate from
+  `/v1/device-prefs` so a partial body can never reach an OLDER relay, where `prefs` defaulted
+  to `{}` and would have been stored as "wipe this phone's soft prefs". Against ≤ 1.15.0 the
+  path simply 404s and does nothing, so the app is safe to install before or after this update.
+  `/v1/device-prefs` still accepts `focus_snoozed_until` for the main app's full sync, which
+  is how a mute the extension failed to clear gets healed.
+- New `tests/test_focus_snooze.py` (28 checks) pins the per-device separation, the
+  no-clobber invariant in both directions, the clamp, the dedicated endpoint, and the
+  attribution lifecycle.
 
 ## 1.15.0
 

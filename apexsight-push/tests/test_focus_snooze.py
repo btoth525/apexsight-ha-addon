@@ -130,6 +130,33 @@ with TestClient(m.app) as c:
                                            "focus_snoozed_until": time.time() + 60}
                  ).status_code == 403)
 
+    # ---- 6. The dedicated /v1/focus-mute endpoint (what the widget extension posts to) ----
+    # It exists so the extension never sends a partial body to /v1/device-prefs, where an older
+    # relay would read the absent `prefs` as {} and wipe this phone's soft prefs.
+    c.post("/v1/device-prefs", json={"device_token": TOK, "pairing_code": CODE, "prefs": SOFT_PREFS})
+    # Compare the gate before/after rather than asserting it's empty — earlier sections leave an
+    # active household snooze behind, and "unchanged" is the invariant that actually matters here.
+    gate_before = db.get_config(f"gate:{CODE}")
+    r = c.post("/v1/focus-mute", json={"device_token": TOK, "pairing_code": CODE,
+                                       "until": time.time() + 8 * 3600})
+    check("/v1/focus-mute accepted -> 200", r.status_code == 200)
+    check("/v1/focus-mute writes the same per-device key",
+          json.loads(db.get_config(f"focus:{TOK}"))["until"] > time.time())
+    check("/v1/focus-mute does NOT touch the soft-prefs blob",
+          json.loads(db.get_config(f"prefs:{TOK}")).get("cameras_disabled") == ["Garage"])
+    check("/v1/focus-mute leaves the household gate byte-for-byte unchanged",
+          db.get_config(f"gate:{CODE}") == gate_before)
+    check("/v1/focus-mute requires the household code",
+          c.post("/v1/focus-mute", json={"device_token": TOK, "pairing_code": "WRONG",
+                                         "until": time.time() + 60}).status_code == 403)
+    check("/v1/focus-mute clamps a far-future value",
+          json.loads(c.post("/v1/focus-mute", json={
+              "device_token": TOK, "pairing_code": CODE,
+              "until": time.time() + 400 * 24 * 3600}).text)["until"] <= time.time() + 24 * 3600 + 5)
+    c.post("/v1/focus-mute", json={"device_token": TOK, "pairing_code": CODE, "until": 0})
+    check("/v1/focus-mute with 0 resumes this device",
+          json.loads(db.get_config(f"focus:{TOK}"))["until"] == 0)
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 if not all(ok):
     raise SystemExit(1)

@@ -361,6 +361,12 @@ class DevicePrefsIn(BaseModel):
     focus_snoozed_until: float | None = None
 
 
+class FocusMuteIn(BaseModel):
+    device_token: str = Field(min_length=8)
+    pairing_code: str = ""
+    until: float = 0.0   # epoch seconds; 0 = Focus ended, alerts resume for this device
+
+
 class ModeIn(BaseModel):
     # The house mode (home / night / away) — synced from HA on Alarmo state change. Drives the
     # house-level camera filter in /v1/notify (see gate.MODE_MUTES).
@@ -931,6 +937,29 @@ def device_prefs(body: DevicePrefsIn, _: None = Depends(rate_limit)) -> dict:
     if name:
         db.set_device_name(token, name)
     return {"ok": True}
+
+
+@app.post("/v1/focus-mute")
+def focus_mute(body: FocusMuteIn, _: None = Depends(rate_limit)) -> dict:
+    """Set THIS device's iOS Focus mute (Do Not Disturb, Sleep, Driving…).
+
+    A separate endpoint from /v1/device-prefs on purpose. The Focus filter runs in the widget
+    extension and knows only the deadline — it can't reconstruct the soft-prefs blob. Posting a
+    partial body to /v1/device-prefs would be read by an OLDER relay (<= 1.15.0, where `prefs`
+    defaulted to `{}`) as "store an empty blob", wiping that phone's camera mutes, quiet hours and
+    triggers. Against an old relay this path simply 404s and does nothing, so the app can be
+    installed before or after the add-on update without that hazard.
+
+    Per DEVICE, never household: a Focus belongs to one person's phone and must not silence
+    everyone's cameras (see gate.would_deliver / FocusSnooze on the app side).
+    """
+    _require_pairing(body.pairing_code)
+    token = body.device_token.strip()
+    # Same clamp as /v1/gate and /v1/device-prefs: the filter writes a long backstop deadline in
+    # case iOS never reports the Focus ending, and an unclamped value would mute this phone forever.
+    until = min(max(float(body.until or 0), 0.0), time.time() + 24 * 3600)
+    db.set_config(f"focus:{token}", json.dumps({"until": until}))
+    return {"ok": True, "until": until}
 
 
 @app.post("/v1/mode")
