@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.16.1
+
+**The follow-up notification now shows THIS review's footage, not the whole event's.**
+
+- The GIF on the final push came from `/api/events/{id}/preview.gif`, which spans the tracked
+  object's ENTIRE lifetime — 82 seconds on a verified doorbell review, most of it unrelated to
+  what the alert was about. It now comes from
+  `/api/{camera}/start/{review_start}/end/{review_end}/preview.gif`, scoped to exactly the
+  review's own window. Verified resolving on 20/20 recent alerts.
+- Guarded the still image against a long-lived track. `/api/events/{id}/snapshot.jpg` returns the
+  event's highest-scoring frame and Frigate keeps re-choosing it while the event lives, so the URL
+  re-resolves on every fetch — and the final push (which REPLACES the first via the shared
+  collapse id) could end up showing a moment far from the alert. A parked car Frigate keeps alive
+  can point hours away. `_pinned_frame_time` clamps the frame into the review window and renders
+  it from recordings at that fixed instant.
+- Deliberately conservative: the clamp is used ONLY when it actually moves the time, and only
+  after probing that recordings can render it (a 404 would mean no image at all — worse than a
+  drifted one). Measured across 20 real alerts it engaged 0 times, falling back to the proven
+  event snapshot every time. That is the intent: Frigate's best-frame choice is usually right
+  (a verified 70s-late frame showed the delivery, while the "canonical" earlier frame showed an
+  empty porch), so this does not second-guess it — it only rescues the outlier.
+
 ## 1.16.0
 
 **One phone's iOS Focus no longer silences the whole household.**

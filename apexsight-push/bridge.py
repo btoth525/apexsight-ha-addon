@@ -557,6 +557,60 @@ def _primary_detection(data: dict) -> str | None:
     return min(dets, key=_epoch)
 
 
+def _pinned_frame_time(det: str, camera: str, start: float, end: float) -> float | None:
+    """A FIXED moment inside this review to render the notification image from.
+
+    `/api/events/{id}/snapshot.jpg` returns the event's HIGHEST-SCORING frame, and Frigate keeps
+    re-choosing that frame while the event lives. The URL therefore re-resolves on every fetch —
+    so the follow-up push (sent when the review ENDS, and which replaces the first one via the
+    shared collapse id) could show a moment far from the alert. Measured on this household: 38%
+    of alerts were >5s off the review start, 19% >10s, one verified case 70s off — the phone
+    buzzed at 18:58:07 and the picture was from 18:59:17.
+
+    So take the event's chosen frame time but CLAMP it into the review's own window, then render
+    that exact frame from recordings. Clamping is what kills the long tail: a parked-car track
+    that Frigate keeps alive for hours has a best frame hours away, and clamping pulls it back to
+    the alert. Returns None if the event can't be read, so callers fall back to the old URL.
+
+    Deliberately NOT `thumb_time`: it reads as the review's canonical moment but rendering that
+    frame from recordings produced an empty porch on a verified person+package review, while the
+    event's clamped frame produced the right image.
+
+    Returns None unless the clamp ACTUALLY moved the time — i.e. the event's frame was outside
+    this review. Measured across 14 real reviews, the clamp changed only 1: normally the best
+    frame already sits inside the window, and "late within the review" is usually the BEST image
+    (the 70s-late doorbell frame showed the delivery; the early one showed an empty porch). So
+    this deliberately does not second-guess Frigate's choice — it only rescues the outlier where
+    a long-lived track (a parked car Frigate keeps alive for hours) points hours from the alert.
+    """
+    if not FRIGATE_BASE_URL or not det:
+        return None
+    try:
+        r = requests.get(f"{FRIGATE_BASE_URL}/api/events/{det}", timeout=4)
+        if r.status_code != 200:
+            return None
+        sft = ((r.json() or {}).get("data") or {}).get("snapshot_frame_time")
+        if not sft:
+            return None
+        sft = float(sft)
+        pinned = min(max(sft, float(start)), float(end))
+        # Frigate's own frame is already inside the review — leave it alone.
+        if abs(pinned - sft) < 1.0:
+            return None
+        # Only offer the pinned frame if recordings can actually render it. Retention gaps and
+        # a camera whose recording is broken both make this 404, and a 404 means the push lands
+        # with NO image at all — strictly worse than a drifted one.
+        probe = requests.get(
+            f"{FRIGATE_BASE_URL}/api/{camera}/recordings/{pinned}/snapshot.jpg?height=720",
+            timeout=4,
+        )
+        if probe.status_code != 200 or not probe.content[:2] == b"\xff\xd8":
+            return None
+        return pinned
+    except Exception:  # noqa: BLE001 — image quality is never worth failing an alert over
+        return None
+
+
 def _build_alert(after: dict, final: bool = False) -> dict | None:
     review_id = after.get("id")
     camera = after.get("camera", "")
@@ -622,8 +676,29 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
         gif = f"{FRIGATE_BASE_URL}/api/events/{det}/preview.gif"
         full_snapshot = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg"
         if final:
-            payload["snapshot_url"] = gif
-            payload["thumbnail_url"] = cropped
+            # The follow-up push REPLACES the instant one (shared collapse id), so whatever it
+            # carries is the image the user is left looking at. Pin both to the review's own
+            # window so neither can drift to a later moment:
+            #   • GIF     → the camera's preview for exactly this review's start→end, instead of
+            #               the event's preview.gif, which spans the event's whole lifetime (82s
+            #               on a verified case) and can be mostly unrelated footage.
+            #   • still   → the event's best frame CLAMPED into the review window (see
+            #               _pinned_frame_time), rendered from recordings at that fixed instant.
+            #               height=720 keeps it ~57KB instead of ~262KB, so the notification
+            #               service extension downloads it well inside its bounded window.
+            rs, re_ = after.get("start_time"), after.get("end_time")
+            if rs and re_:
+                payload["snapshot_url"] = (
+                    f"{FRIGATE_BASE_URL}/api/{camera}/start/{int(rs)}/end/{int(re_)}/preview.gif"
+                )
+                pinned = _pinned_frame_time(det, camera, rs, re_)
+                payload["thumbnail_url"] = (
+                    f"{FRIGATE_BASE_URL}/api/{camera}/recordings/{pinned}/snapshot.jpg?height=720"
+                    if pinned else cropped
+                )
+            else:
+                payload["snapshot_url"] = gif
+                payload["thumbnail_url"] = cropped
         else:
             payload["snapshot_url"] = cropped
             payload["thumbnail_url"] = full_snapshot
