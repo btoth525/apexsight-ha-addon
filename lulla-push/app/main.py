@@ -11,6 +11,8 @@ Public API (called by the iOS app):
   GET  /v1/sync/state   — counts (also feeds the admin dashboard)
   GET  /healthz         — liveness
 """
+import asyncio
+import json
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -18,7 +20,7 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import apns, config, db, home, routing, security
+from . import apns, config, db, home, owlet_log, routing, security
 
 app = FastAPI(title="Lulla Push + Sync Relay", docs_url=None, redoc_url=None)
 
@@ -39,6 +41,44 @@ def _client_key(request: Request) -> str:
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
+    # Watch the Owlet sock and auto-log sleep sessions (single-writer → both phones get one
+    # shared entry). Only when we actually have HA access; wrapped so it can never crash the app.
+    if home.SUPERVISOR_TOKEN:
+        asyncio.create_task(_owlet_sleep_poller())
+
+
+_OWLET_POLL_SECONDS = 60
+
+
+async def _owlet_sleep_poller() -> None:
+    """Poll HA, run the pure sleep state machine, and write a synced sleep LogEvent when the
+    baby wakes. The relay is the sole writer, so no per-phone duplicates. Best-effort forever."""
+    tz = "UTC"
+    try:
+        cfg = await home._get("/config")
+        if cfg and cfg.get("time_zone"):
+            tz = cfg["time_zone"]        # render sleep times in the household's local zone
+    except Exception:
+        pass
+    household = config.PAIRING_CODE
+    while True:
+        try:
+            st = await home.state()
+            vitals = st.get("vitals") or {}
+            cur = owlet_log.sleep_class(vitals.get("sleep_state"))
+            open_start = db.get_config("owlet_open_start") or None
+            now = owlet_log.now_iso()
+            decision = owlet_log.decide(cur, open_start, now)
+            db.set_config("owlet_open_start", decision.new_open_start or "")
+            if decision.write:
+                payload = owlet_log.build_sleep_payload(
+                    start_iso=decision.write["start"], end_iso=decision.write["end"],
+                    tz=tz, now_iso=now)
+                db.upsert(household, "LogEvent", payload["id"], time.time(),
+                          "owlet", False, json.dumps(payload))
+        except Exception:
+            pass   # a bad poll must never take the relay down
+        await asyncio.sleep(_OWLET_POLL_SECONDS)
 
 
 class APNsConfigBody(BaseModel):
