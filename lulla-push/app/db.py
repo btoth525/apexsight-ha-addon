@@ -138,6 +138,13 @@ def register_device(household: str, device_id: str, name: Optional[str]) -> str:
     return token
 
 
+def prune_test_devices() -> int:
+    """Remove sync devices created by tooling/debug (device_id like 'debug-%'). Real phones use
+    UUID device_ids, so they are never matched. Returns how many rows were removed."""
+    with _conn() as c:
+        return c.execute("DELETE FROM devices WHERE device_id LIKE 'debug-%'").rowcount
+
+
 def resolve_token(token: str) -> Optional[sqlite3.Row]:
     with _conn() as c:
         row = c.execute("SELECT * FROM devices WHERE token=?", (token,)).fetchone()

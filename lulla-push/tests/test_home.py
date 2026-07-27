@@ -24,7 +24,31 @@ def test_owlet_vitals_assembled_from_separate_entities():
     out = classify(states)
     v = out["vitals"]
     assert v == {"bpm": 128, "spo2": 99, "skin_temp_f": 98.1, "battery_pct": 82,
-                 "sock_on": True, "charging": False}
+                 "sock_on": True, "charging": False, "sleep_state": None, "signal": None}
+
+
+def test_owlet_real_entity_names_including_o2_sleep_signal():
+    # The ACTUAL HA Owlet entity ids (from Brandon's home). "o2_saturation" (not "oxygen"/"spo2")
+    # used to fall through to the sock_on fallback, so O2 was never captured. Sleep state + signal
+    # were likewise mis-bucketed. This locks the real-world mapping.
+    states = [
+        s("sensor.ryleighs_sock_heart_rate", "120", friendly_name="Ryleighs Sock Heart rate"),
+        s("sensor.ryleighs_sock_o2_saturation", "98", friendly_name="Ryleighs Sock O2 saturation"),
+        s("sensor.ryleighs_sock_o2_saturation_10_minute_average", "97", friendly_name="Ryleighs Sock O2 10 min"),
+        s("sensor.ryleighs_sock_skin_temperature", "97.7", friendly_name="Ryleighs Sock Skin temperature"),
+        s("sensor.ryleighs_sock_battery_percentage", "100", friendly_name="Ryleighs Sock Battery percentage"),
+        s("sensor.ryleighs_sock_battery_remaining", "12", friendly_name="Ryleighs Sock Battery remaining"),
+        s("sensor.ryleighs_sock_signal_strength", "18", friendly_name="Ryleighs Sock Signal strength"),
+        s("sensor.ryleighs_sock_sleep_state", "light", friendly_name="Ryleighs Sock Sleep state"),
+    ]
+    v = classify(states)["vitals"]
+    assert v["spo2"] == 98, "O2 must be captured (the 10-min-average must NOT overwrite it)"
+    assert v["bpm"] == 120
+    assert v["skin_temp_f"] == 97.7
+    assert v["battery_pct"] == 100, "the percentage, not the 'remaining' estimate"
+    assert v["signal"] == 18
+    assert v["sleep_state"] == "light"
+    assert v["sock_on"] is False, "no entity should have been mis-bucketed into sock_on"
 
 
 def test_unavailable_owlet_entities_skipped_not_crashed():

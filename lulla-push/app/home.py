@@ -56,11 +56,21 @@ def _owlet_role(entity_id: str) -> Optional[str]:
         return None
     if "heart" in l:
         return "hr"
-    if "oxygen" in l or "spo2" in l:
+    if "sleep" in l:            # sensor.<baby>_sock_sleep_state — drives auto sleep logging
+        return "sleep_state"
+    if "signal" in l:          # Wi-Fi signal strength — a monitor-health signal, not a vital
+        return "signal"
+    # O2 saturation. The HA entity is "..._o2_saturation" (NOT "oxygen"/"spo2"), which the old
+    # check missed entirely — so O2 fell through to the sock_on fallback and was never captured.
+    if "o2" in l or "oxygen" in l or "spo2" in l:
+        if "average" in l:     # ignore the 10-minute-average entity; the live reading wins
+            return None
         return "o2"
     if "skin" in l or "temp" in l:
         return "temp"
     if "battery" in l:
+        if "remaining" in l:   # a duration estimate, not the percentage — ignore
+            return None
         return "battery"
     if "charg" in l:
         return "charging"
@@ -101,6 +111,10 @@ def _apply_owlet(vitals: dict, role: str, state: str) -> None:
             vitals["charging"] = state == "on"
         elif role == "sock_on":
             vitals["sock_on"] = state == "on"
+        elif role == "sleep_state":
+            vitals["sleep_state"] = state          # raw HA value, e.g. "awake"/"light"/"deep"
+        elif role == "signal":
+            vitals["signal"] = int(float(state))
     except (ValueError, TypeError):
         pass   # unavailable/unknown states — leave the field unset rather than crash
 
@@ -110,7 +124,7 @@ def classify(states: list[dict]) -> dict:
     fully unit-testable. `connected` is added by the async wrapper (it reflects the API
     call, not the classification)."""
     vitals = {"bpm": None, "spo2": None, "skin_temp_f": None, "battery_pct": None,
-              "sock_on": False, "charging": False}
+              "sock_on": False, "charging": False, "sleep_state": None, "signal": None}
     saw_owlet_data = False   # at least one owlet reading is actually available
     baby_name: Optional[str] = None
     nursery: list[dict] = []

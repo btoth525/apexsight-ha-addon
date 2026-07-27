@@ -66,6 +66,21 @@ async def set_apns_config(body: APNsConfigBody, request: Request):
     return {"ok": True, "apns_configured": True}
 
 
+class PruneBody(BaseModel):
+    pairing_code: str
+
+
+@app.post("/v1/admin/prune_devices")
+async def prune_devices(body: PruneBody, request: Request):
+    """Remove leftover debug/test sync devices (device_id like 'debug-%'). Pairing-protected.
+    Real phones use UUID device_ids, so they can never be pruned by this."""
+    if not _admin_limiter.allow(_client_key(request)):
+        raise HTTPException(status_code=429, detail="too many attempts, try again later")
+    if not security.safe_equals(body.pairing_code.upper().strip(), config.PAIRING_CODE):
+        raise HTTPException(status_code=403, detail="pairing code mismatch")
+    return {"ok": True, "pruned": db.prune_test_devices()}
+
+
 # ---- models -----------------------------------------------------------------
 
 class RegisterBody(BaseModel):
