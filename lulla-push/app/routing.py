@@ -50,16 +50,16 @@ def route_event(
     handled by the caller (device iteration / header); this decides deliver vs silent.
 
     Rules:
-      - Quiet hours suppress everything EXCEPT time-sensitive/critical → not delivered.
+      - Quiet hours NO LONGER suppress delivery. For a newborn tracker both parents want to
+        know when the other logs a feed/diaper — including overnight, which is the whole point.
+        (`in_quiet_hours` / `is_quiet_hours` are kept for the app's own indicators, but they no
+        longer gate whether a push is sent.)
       - If nap_aware and the child is asleep, downgrade NON-urgent events to silent
-        (a background push, no banner/sound).
+        (a background push, no banner/sound). This is opt-in and orthogonal to quiet hours.
       - Urgent (time-sensitive/critical) always delivers as a normal alert.
     """
     level = interruption_level or "active"
     urgent = level in _URGENT
-
-    if in_quiet_hours and not urgent:
-        return RouteDecision(False, False, "alert", "quiet-hours suppressed")
 
     if nap_aware and child_asleep and not urgent:
         return RouteDecision(True, True, "background", "nap-aware downgrade to silent")

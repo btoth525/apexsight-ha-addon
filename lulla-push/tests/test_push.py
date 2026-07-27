@@ -244,20 +244,16 @@ def test_is_quiet_hours_wrapping_window(env):
     assert r.is_quiet_hours(12 * 60, 22 * 60, 7 * 60) is False    # noon awake
 
 
-def test_quiet_hours_suppresses_non_urgent(env, monkeypatch):
+def test_quiet_hours_no_longer_suppresses(env, monkeypatch):
+    # For a baby tracker, "Mom fed her at 3am" is exactly what the other parent wants to see —
+    # so quiet hours must NOT hold back a routine log notification overnight anymore.
     _register_push(env, "phoneA", "mom", "tok-mom")
-    monkeypatch.setattr(env.main, "_now_local_minutes", lambda: 3 * 60)  # 03:00
+    monkeypatch.setattr(env.main, "_now_local_minutes", lambda: 3 * 60)  # 03:00, deep in old quiet window
     monkeypatch.setattr(env.config, "QUIET_HOURS_START", "22:00")
     monkeypatch.setattr(env.config, "QUIET_HOURS_END", "07:00")
-    # non-urgent → suppressed
+    # non-urgent at 3am → still delivered.
     r = env.http.post("/v1/push", json={"event": "event.logged", "title": "t", "body": "b"})
-    assert r.json()["suppressed"] is True
-    assert len(env.fake.calls) == 0
-    # time-sensitive pierces quiet hours
-    r2 = env.http.post("/v1/push", json={
-        "event": "feed.overdue", "title": "t", "body": "b",
-        "interruption_level": "time-sensitive"})
-    assert r2.json()["suppressed"] is False
+    assert r.json()["suppressed"] is False
     assert len(env.fake.calls) == 1
 
 
