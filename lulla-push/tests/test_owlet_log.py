@@ -56,6 +56,28 @@ def test_event_id_is_deterministic_per_session():
     assert a == b and a != c
 
 
+def test_alert_transitions_are_edge_triggered():
+    # nothing on -> low_o2 turns on: fires once
+    assert o.alert_transitions({}, {"low_o2": True}) == ["low_o2"]
+    # still on next poll: does NOT re-fire (edge-triggered, not level)
+    assert o.alert_transitions({"low_o2": True}, {"low_o2": True}) == []
+    # turning off doesn't fire
+    assert o.alert_transitions({"low_o2": True}, {"low_o2": False}) == []
+    # 'awake' is a sleep signal, never an alert
+    assert o.alert_transitions({}, {"awake": True}) == []
+    # an unknown key with no ALERT_META is ignored
+    assert o.alert_transitions({}, {"mystery": True}) == []
+
+
+def test_sleep_class_prefers_the_awake_flag():
+    assert o.sleep_class_from_alerts({"awake": False}, None) == "asleep"
+    assert o.sleep_class_from_alerts({"awake": True}, "deep") == "awake", "awake flag wins over text"
+    assert o.sleep_class_from_alerts({"sock_off": True, "awake": False}, "deep") == "nosignal"
+    # no awake flag -> fall back to the text state
+    assert o.sleep_class_from_alerts({}, "light") == "asleep"
+    assert o.sleep_class_from_alerts({}, None) == "nosignal"
+
+
 def test_payload_has_the_fields_the_app_decoder_requires():
     p = o.build_sleep_payload(start_iso="2026-07-27T01:00:00Z", end_iso="2026-07-27T02:00:00Z",
                               tz="America/Chicago", now_iso="2026-07-27T02:00:00Z")

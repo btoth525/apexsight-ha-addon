@@ -65,7 +65,20 @@ async def _owlet_sleep_poller() -> None:
         try:
             st = await home.state()
             vitals = st.get("vitals") or {}
-            cur = owlet_log.sleep_class(vitals.get("sleep_state"))
+            alerts = st.get("alerts") or {}
+            baby = st.get("baby_name") or "Ryleigh"
+
+            # 1) Relay Owlet's OWN alert flags — push once per OFF→ON episode. On the FIRST poll
+            #    ever (no stored baseline) we seed silently, so a flag that's already on at deploy
+            #    time (e.g. sock_off while it's charging) doesn't fire a spurious alert.
+            raw_prev = db.get_config("owlet_alerts")
+            if raw_prev is not None:
+                for key in owlet_log.alert_transitions(json.loads(raw_prev), alerts):
+                    await _push_owlet_alert(key, baby)
+            db.set_config("owlet_alerts", json.dumps(alerts))
+
+            # 2) Auto-log sleep — prefer Owlet's `awake` flag, fall back to sleep_state text.
+            cur = owlet_log.sleep_class_from_alerts(alerts, vitals.get("sleep_state"))
             open_start = db.get_config("owlet_open_start") or None
             now = owlet_log.now_iso()
             decision = owlet_log.decide(cur, open_start, now)
@@ -79,6 +92,24 @@ async def _owlet_sleep_poller() -> None:
         except Exception:
             pass   # a bad poll must never take the relay down
         await asyncio.sleep(_OWLET_POLL_SECONDS)
+
+
+async def _push_owlet_alert(key: str, baby: str) -> None:
+    """Fan an Owlet alert flag out to both phones (relaying the sock's own flag, not a threshold
+    we invented). Safety-critical flags are time-sensitive so they pierce Sleep Focus."""
+    meta = owlet_log.ALERT_META.get(key)
+    if not meta:
+        return
+    phrase, critical = meta
+    try:
+        await push(PushEventBody(
+            event=f"owlet.{key}", household=config.PAIRING_CODE,
+            title=f"⚠️ {baby}", body=f"Owlet alert — {phrase}. Check the base station.",
+            interruption_level="time-sensitive" if critical else "active",
+            collapse_id=f"owlet-{key}",
+        ))
+    except Exception:
+        pass   # APNs not configured / transient — never crash the poller
 
 
 class APNsConfigBody(BaseModel):

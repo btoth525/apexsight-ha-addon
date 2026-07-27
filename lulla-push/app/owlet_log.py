@@ -45,6 +45,45 @@ def sleep_class(state: Optional[str]) -> str:
     return "asleep"   # light / deep / asleep / rem / …
 
 
+def sleep_class_from_alerts(alerts: dict, sleep_state: Optional[str]) -> str:
+    """Prefer Owlet's own `awake` binary flag (cleaner than the text state); fall back to the
+    sleep_state string. A raised `sock_off` flag means she isn't being monitored → 'nosignal'."""
+    if alerts.get("sock_off") is True:
+        return "nosignal"
+    awake = alerts.get("awake")
+    if awake is True:
+        return "awake"
+    if awake is False:
+        return "asleep"
+    return sleep_class(sleep_state)
+
+
+# Owlet's own alert flags → (human phrase, safety-critical?). We RELAY these; the sock/base
+# station raises them. Safety-critical ones push time-sensitive (pierce Sleep Focus).
+ALERT_META = {
+    "low_o2": ("low oxygen", True),
+    "high_o2": ("high oxygen", True),
+    "low_hr": ("low heart rate", True),
+    "high_hr": ("high heart rate", True),
+    "sock_off": ("the sock came off", True),
+    "sock_disconnected": ("the sock disconnected", True),
+    "lost_power": ("the base station lost power", False),
+    "low_battery": ("the sock battery is low", False),
+}
+
+
+def alert_transitions(prev: dict, cur: dict) -> list[str]:
+    """Alert keys that just went OFF→ON (edge-triggered, so we notify once per episode, not
+    every poll). 'awake' is a sleep signal, never an alert."""
+    fired = []
+    for key, is_on in cur.items():
+        if key == "awake" or not is_on:
+            continue
+        if not prev.get(key, False) and key in ALERT_META:
+            fired.append(key)
+    return fired
+
+
 @dataclass
 class SleepDecision:
     new_open_start: Optional[str]        # the open-session start to persist for the next tick

@@ -50,6 +50,31 @@ def _is_owlet(entity_id: str) -> bool:
     return "owlet" in l or "dream_sock" in l or "sock" in l
 
 
+# Owlet's OWN alert flags (binary_sensors). We RELAY these — Lulla never invents medical
+# thresholds; the sock/base station decides, we just forward. `awake` is Owlet's clean sleep
+# signal (better than parsing the sleep_state string).
+_ALERT_NEEDLES = {
+    "high_heart_rate": "high_hr", "low_heart_rate": "low_hr",
+    "high_oxygen": "high_o2", "low_oxygen": "low_o2",
+    "low_battery": "low_battery", "lost_power": "lost_power",
+    "sock_disconnected": "sock_disconnected", "sock_off": "sock_off",
+}
+
+
+def _owlet_alert(entity_id: str) -> Optional[str]:
+    """Alert-flag key for an Owlet binary_sensor, or 'awake', or None. Checked BEFORE _owlet_role
+    so e.g. 'high_heart_rate_alert' is an alert, not misread as the heart-rate vital."""
+    l = entity_id.lower()
+    if not _is_owlet(l):
+        return None
+    for needle, key in _ALERT_NEEDLES.items():
+        if needle in l:
+            return key
+    if "awake" in l:
+        return "awake"
+    return None
+
+
 def _owlet_role(entity_id: str) -> Optional[str]:
     l = entity_id.lower()
     if not _is_owlet(l):
@@ -125,6 +150,7 @@ def classify(states: list[dict]) -> dict:
     call, not the classification)."""
     vitals = {"bpm": None, "spo2": None, "skin_temp_f": None, "battery_pct": None,
               "sock_on": False, "charging": False, "sleep_state": None, "signal": None}
+    alerts: dict = {}                      # Owlet's own flags: {key: bool} (only when available)
     saw_owlet_data = False   # at least one owlet reading is actually available
     baby_name: Optional[str] = None
     nursery: list[dict] = []
@@ -134,6 +160,14 @@ def classify(states: list[dict]) -> dict:
         state = s.get("state", "")
         attrs = s.get("attributes") or {}
         friendly_name = attrs.get("friendly_name") or entity_id
+
+        alert_key = _owlet_alert(entity_id)
+        if alert_key:
+            if baby_name is None:
+                baby_name = _guess_baby_name(entity_id, friendly_name)
+            if state in ("on", "off"):     # only when the flag is actually reporting
+                alerts[alert_key] = (state == "on")
+            continue
 
         role = _owlet_role(entity_id)
         if role:
@@ -161,7 +195,8 @@ def classify(states: list[dict]) -> dict:
             "is_on": state == "on",
         })
 
-    return {"vitals": vitals if saw_owlet_data else None, "nursery": nursery, "baby_name": baby_name}
+    return {"vitals": vitals if saw_owlet_data else None, "alerts": alerts,
+            "nursery": nursery, "baby_name": baby_name}
 
 
 # ---- async wrappers (network) -----------------------------------------------
@@ -169,7 +204,7 @@ def classify(states: list[dict]) -> dict:
 async def state() -> dict:
     states = await _get("/states")
     if states is None:
-        return {"connected": False, "vitals": None, "nursery": [], "baby_name": None}
+        return {"connected": False, "vitals": None, "alerts": {}, "nursery": [], "baby_name": None}
     result = classify(states)
     result["connected"] = True
     return result

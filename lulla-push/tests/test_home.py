@@ -51,6 +51,25 @@ def test_owlet_real_entity_names_including_o2_sleep_signal():
     assert v["sock_on"] is False, "no entity should have been mis-bucketed into sock_on"
 
 
+def test_owlet_alert_flags_extracted_without_polluting_vitals():
+    states = [
+        s("sensor.ryleighs_sock_heart_rate", "150", friendly_name="Ryleighs Sock Heart rate"),
+        s("binary_sensor.ryleighs_sock_high_heart_rate_alert", "on", friendly_name="High heart rate alert"),
+        s("binary_sensor.ryleighs_sock_low_oxygen_alert", "off", friendly_name="Low oxygen alert"),
+        s("binary_sensor.ryleighs_sock_sock_off", "off", friendly_name="Sock off"),
+        s("binary_sensor.ryleighs_sock_awake", "on", friendly_name="Awake"),
+        s("binary_sensor.ryleighs_sock_low_battery_alert", "unavailable", friendly_name="Low battery alert"),
+    ]
+    out = classify(states)
+    assert out["vitals"]["bpm"] == 150, "the real heart-rate sensor is still a vital"
+    a = out["alerts"]
+    assert a["high_hr"] is True
+    assert a["low_o2"] is False
+    assert a["sock_off"] is False
+    assert a["awake"] is True
+    assert "low_battery" not in a, "unavailable flags are not recorded"
+
+
 def test_unavailable_owlet_entities_skipped_not_crashed():
     # All-unavailable means no Owlet data reachable at all — vitals stays None (not a
     # dict of nulls), so the app's card correctly hides rather than showing empty fields.
