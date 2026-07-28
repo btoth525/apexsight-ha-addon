@@ -48,7 +48,23 @@ def test_owlet_real_entity_names_including_o2_sleep_signal():
     assert v["battery_pct"] == 100, "the percentage, not the 'remaining' estimate"
     assert v["signal"] == 18
     assert v["sleep_state"] == "light"
-    assert v["sock_on"] is False, "no entity should have been mis-bucketed into sock_on"
+    # Live HR/O2 readings ARE the evidence she's wearing it — there is no dedicated HA entity for
+    # "worn", and assuming False left the app showing "Awake · Off" mid-nap.
+    assert v["sock_on"] is True, "live vitals mean the sock is on her"
+
+
+def test_sock_on_is_false_without_readings_or_when_sock_off_flag_is_raised():
+    charging_only = [
+        s("sensor.ryleighs_sock_battery_percentage", "100", friendly_name="Battery percentage"),
+        s("sensor.ryleighs_sock_heart_rate", "unavailable", friendly_name="Heart rate"),
+    ]
+    assert classify(charging_only)["vitals"]["sock_on"] is False, "no vitals → not worn"
+
+    came_off = [
+        s("sensor.ryleighs_sock_heart_rate", "120", friendly_name="Heart rate"),
+        s("binary_sensor.ryleighs_sock_sock_off", "on", friendly_name="Sock off"),
+    ]
+    assert classify(came_off)["vitals"]["sock_on"] is False, "Owlet's sock_off flag wins"
 
 
 def test_owlet_alert_flags_extracted_without_polluting_vitals():

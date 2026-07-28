@@ -195,6 +195,14 @@ def classify(states: list[dict]) -> dict:
             "is_on": state == "on",
         })
 
+    # `sock_on` = is she actually wearing it. There is no single HA entity for this (the sock's
+    # binary_sensors are all alert flags), and the old fallback silently left it False forever —
+    # which made the app show "Awake · Off" while live vitals proved otherwise. Derive it from
+    # EVIDENCE instead: a live heart-rate/O2 reading means it's on her, unless Owlet's own
+    # `sock_off` flag says it came off.
+    has_reading = vitals["bpm"] is not None or vitals["spo2"] is not None
+    vitals["sock_on"] = bool(has_reading) and alerts.get("sock_off") is not True
+
     return {"vitals": vitals if saw_owlet_data else None, "alerts": alerts,
             "nursery": nursery, "baby_name": baby_name}
 

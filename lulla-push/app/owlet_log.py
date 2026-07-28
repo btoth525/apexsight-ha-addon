@@ -124,7 +124,12 @@ def decide(cur_class: str, open_start: Optional[str], now_iso: str,
 
 
 def session_event_id(start_iso: str) -> str:
-    return str(uuid.uuid5(_NS, f"owlet-sleep-{start_iso}"))
+    """Deterministic per session — and **UPPERCASE**, because Swift's `UUID.uuidString` is
+    uppercase. The server's dedupe key is a case-sensitive string, so emitting Python's default
+    lowercase made the app's round-tripped copy land as a SECOND record for the same sleep
+    (harmless in-app, since Swift UUID equality ignores case, but it doubled storage and caused
+    endless push/pull churn). Matching Swift's casing keeps one row per session."""
+    return str(uuid.uuid5(_NS, f"owlet-sleep-{start_iso}")).upper()
 
 
 def build_sleep_payload(*, start_iso: str, end_iso: str, tz: str, now_iso: str) -> dict:
