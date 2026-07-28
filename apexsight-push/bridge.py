@@ -499,6 +499,15 @@ def _frigate_switch_watcher(client=None) -> None:
     Keeping both is deliberate: profiles are new, and a security app should not have a single
     untested path to "which cameras are allowed to alert".
     """
+    # Give MQTT a moment to connect before the first sync. Without this the very first tick after
+    # every restart runs pre-connection, the publish is impossible, and it falls back to switches —
+    # then marks the sync done, so the profile path wouldn't be retried until the next mode change.
+    # Bounded, and the loop proceeds regardless: switches are a valid outcome, just not the fast one.
+    for _ in range(30):
+        if client is not None and client.is_connected():
+            break
+        time.sleep(1)
+
     last = None
     last_forced = 0.0
     while True:

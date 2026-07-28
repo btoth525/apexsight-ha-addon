@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.19.1
+
+**Fix: the first sync after a restart always fell back to switches.**
+
+The alert-sync watcher started before MQTT finished connecting, so its very first tick could not
+publish `frigate/profile/set`, correctly fell back to the switch path — and then marked the sync
+done, meaning the profile path wasn't retried until the next mode change. Observed live: after the
+1.19.0 update the log showed `frigate alert switches synced` and no profile publish. The watcher now
+waits (bounded, 30s) for the MQTT connection before its first sync.
+
 ## 1.19.0
 
 **House-mode changes are one MQTT publish instead of 18 Home Assistant switch calls.**
