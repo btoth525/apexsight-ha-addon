@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.20.0
+
+**Notifications now say what happened — and the AI decides whether to interrupt you.**
+
+- The follow-up push already REPLACED the instant one in place (shared collapse id) to swap in the
+  complete GIF, so whatever it carries is what you are left looking at. It now also carries
+  Frigate's **review summary**: the notification becomes "Package Delivery at Residence — A person
+  delivers multiple packages to the porch before departing" instead of "🧍 Person — Doorbell".
+- **The threat rating drives the interruption level**, which is the actual point:
+  * routine (0) — stays **passive**. A delivery upgrades quietly; it must not buzz you twice.
+  * notable (1) — **time-sensitive**, breaks through Focus, still no sound.
+  * concerning (2) — time-sensitive **and audible**, prefixed ⚠️.
+  Both failure directions are bad: buzzing on every delivery trains you to ignore the app, and
+  staying silent on something worth seeing defeats the point. So the rating OVERRIDES `silent`.
+- `_review_ai_story()` waits up to 25s for the summary, because it is only generated once the
+  review ends and the local model takes ~10-20s. It runs on the existing forwarding worker thread,
+  never the MQTT loop, and returning None on timeout sends exactly the alert it would have sent
+  before — a slow or disabled model degrades to the old behaviour rather than delaying alerts.
+- `threat_level`, `ai_summary` and `ai_concerns` ride through to the app so the Review tab can show
+  the same rating the push used. `ai_summary` is length-bounded so a runaway model can't bloat the
+  payload.
+- FAIL-QUIET throughout: a missing, negative, non-numeric or absent rating all read as routine. A
+  language model produced that number and it decides whether a phone wakes someone up.
+- `tests/test_smart_alerts.py` (22 checks) pins every interruption-level rule, the passthrough,
+  the bound, and all the clamping. 191 relay checks across 7 suites.
+
 ## 1.19.1
 
 **Fix: the first sync after a restart always fell back to switches.**

@@ -733,6 +733,47 @@ def _pinned_frame_time(det: str, camera: str, start: float, end: float) -> float
         return None
 
 
+def _review_ai_story(review_id: str, wait_s: float = 25.0) -> dict | None:
+    """Frigate's GenAI review summary (`review.data.metadata`) for `review_id`, waiting briefly.
+
+    The summary is only generated once the review ENDS, and the local model takes ~10-20s, so the
+    follow-up push would otherwise always race it and find nothing. This runs on `_forward_stages`'
+    worker thread, never the bridge's MQTT loop, so waiting here can't stall anything else.
+
+    Returns None on timeout — the caller then sends exactly the alert it would have sent before, so
+    a slow or disabled model degrades to the old behaviour rather than delaying or dropping alerts.
+    """
+    if not FRIGATE_BASE_URL or not review_id:
+        return None
+    deadline = time.time() + wait_s
+    delay = 1.5
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{FRIGATE_BASE_URL}/api/review/{review_id}", timeout=6)
+            if r.status_code == 200:
+                meta = ((r.json() or {}).get("data") or {}).get("metadata")
+                # Require real prose — Frigate writes the key before the model has filled it in.
+                if isinstance(meta, dict) and (meta.get("title") or meta.get("shortSummary")):
+                    return meta
+        except Exception:  # noqa: BLE001 — never let this path fail an alert
+            pass
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5.0)
+    return None
+
+
+def _threat_level(meta: dict | None) -> int:
+    """Frigate's `potential_threat_level`, clamped. FAIL-QUIET: anything unparseable reads as 0.
+
+    A language model produced this number and it decides whether a phone interrupts someone, so the
+    only safe direction to fail is "routine".
+    """
+    try:
+        return max(0, min(2, int((meta or {}).get("potential_threat_level") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _build_alert(after: dict, final: bool = False) -> dict | None:
     review_id = after.get("id")
     camera = after.get("camera", "")
@@ -808,6 +849,32 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
             #               _pinned_frame_time), rendered from recordings at that fixed instant.
             #               height=720 keeps it ~57KB instead of ~262KB, so the notification
             #               service extension downloads it well inside its bounded window.
+            # ---- AI story: turn "🧍 Person — Doorbell" into what actually happened ----
+            # The follow-up push already REPLACES the instant one (shared collapse id), so whatever
+            # it carries is what the user is left looking at. Frigate's review summary is ready by
+            # now (the review has ended), so use its words.
+            story = _review_ai_story(review_id)
+            if story:
+                level = _threat_level(story)
+                headline = (story.get("title") or "").strip()
+                summary = (story.get("shortSummary") or story.get("scene") or "").strip()
+                if headline:
+                    payload["title"] = ("⚠️ " if level >= 2 else "") + headline
+                if summary:
+                    payload["body"] = summary
+                payload["ai_title"] = headline
+                payload["ai_summary"] = summary
+                payload["threat_level"] = level
+                if story.get("other_concerns"):
+                    payload["ai_concerns"] = str(story["other_concerns"])[:300]
+                # THE POINT OF THE FEATURE. A routine delivery upgrades quietly — one buzz, then
+                # better words. Anything the model rated above routine stops being silent and
+                # interrupts, because that is the case you actually want pulled out of your pocket.
+                if level >= 1:
+                    payload["silent"] = False
+                    payload["announce"] = True
+                log(f"review {review_id} AI story: level={level} title={headline[:60]!r}")
+
             rs, re_ = after.get("start_time"), after.get("end_time")
             if rs and re_:
                 # ONE event fetch feeds both the GIF window and the still, so this costs the same

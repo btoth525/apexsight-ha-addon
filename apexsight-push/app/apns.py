@@ -188,6 +188,9 @@ def build_payload(
     labels: list | None = None,
     zones: list | None = None,
     score: float = 0.0,
+    threat_level: int = 0,
+    ai_summary: str = "",
+    ai_concerns: str = "",
 ) -> dict:
     """Build the APNs payload the ApexSight NotificationService extension expects.
 
@@ -204,7 +207,15 @@ def build_payload(
         "mutable-content": 1,
         "category": "APEX_FRIGATE_ALERT",
     }
-    if silent:
+    # An AI rating above routine OVERRIDES `silent`. The follow-up push is normally a quiet
+    # in-place upgrade (better GIF, better words) that must not buzz a second time — but when the
+    # model flagged the activity as worth a look, that quiet upgrade is exactly the notification
+    # the user needs pulled out of their pocket. Time-sensitive breaks through Focus.
+    if threat_level >= 1:
+        aps["interruption-level"] = "time-sensitive"
+        if threat_level >= 2:
+            aps["sound"] = "default"
+    elif silent:
         aps["interruption-level"] = "passive"
     elif announce:
         # Announce-able (read aloud by iOS "Announce Notifications" in CarPlay/AirPods) but no
@@ -244,6 +255,14 @@ def build_payload(
     # SAME per-object/zone mutes the server-side per-device gate already used to decide delivery —
     # without this, foreground presentation could only honor camera-level mutes (a muted object/zone
     # would still show a banner while foregrounded). Mirrors the app's own objects.first convention.
+    # Surfaced to the app so the Review tab / banners can show the same rating the push used,
+    # and so the foreground re-check can reason about it.
+    if threat_level:
+        payload["threat_level"] = threat_level
+    if ai_summary:
+        payload["ai_summary"] = ai_summary[:400]
+    if ai_concerns:
+        payload["ai_concerns"] = ai_concerns[:300]
     if labels:
         payload["label"] = labels[0]
     if zones:

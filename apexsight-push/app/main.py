@@ -319,6 +319,12 @@ class NotifyIn(BaseModel):
     frigate_base_url: str = ""
     recognized_license_plate: str = ""
     stage: str = ""
+    # Frigate 0.18 review-summary fields, carried on the follow-up push so the notification
+    # the user is LEFT with describes what actually happened rather than "Person — Doorbell".
+    ai_title: str = ""
+    ai_summary: str = ""
+    ai_concerns: str = ""
+    threat_level: int = 0
 
 
 class DoorbellPlayIn(BaseModel):
@@ -826,6 +832,9 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         labels=body.labels,
         zones=body.zones,
         score=body.score,
+        threat_level=body.threat_level,
+        ai_summary=body.ai_summary,
+        ai_concerns=body.ai_concerns,
     )
     # Per-device SOFT gate: camera / object / zone / quiet-hours / per-camera-snooze / triggers,
     # each synced per device via /v1/device-prefs and evaluated FAIL-OPEN (see gate.py). The app
