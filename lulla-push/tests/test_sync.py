@@ -112,3 +112,25 @@ def test_tie_break_deterministic(client):
     # and it does NOT flip back for a lower created_by at the same time
     r = client.post("/v1/sync/push", json={"records": [_rec("id1", 100.0, "phoneA", "c")]}, headers=_auth(ta))
     assert r.json()["applied"] == 0
+
+
+def test_household_settings_lww(client):
+    t = _register(client, "A")
+    # nothing stored yet
+    assert client.get("/v1/settings", headers=_auth(t)).json()["settings"] is None
+    # phone A sets the schedule
+    client.post("/v1/settings", headers=_auth(t), json={
+        "feed_day_hours": 2, "feed_night_hours": 3, "night_start": 23, "night_end": 7,
+        "updated_at": 100.0})
+    got = client.get("/v1/settings", headers=_auth(t)).json()["settings"]
+    assert got["feed_day_hours"] == 2 and got["night_start"] == 23
+    # a NEWER change wins
+    client.post("/v1/settings", headers=_auth(t), json={
+        "feed_day_hours": 2.5, "feed_night_hours": 3.5, "night_start": 22, "night_end": 6,
+        "updated_at": 200.0})
+    assert client.get("/v1/settings", headers=_auth(t)).json()["settings"]["feed_day_hours"] == 2.5
+    # a STALE change is ignored (keeps the newer one)
+    client.post("/v1/settings", headers=_auth(t), json={
+        "feed_day_hours": 9, "feed_night_hours": 9, "night_start": 1, "night_end": 2,
+        "updated_at": 150.0})
+    assert client.get("/v1/settings", headers=_auth(t)).json()["settings"]["feed_day_hours"] == 2.5

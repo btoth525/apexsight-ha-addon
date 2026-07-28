@@ -285,6 +285,33 @@ async def camera_snapshot(household: str = Depends(_household)):
         raise HTTPException(status_code=502, detail="camera unreachable")
 
 
+class SettingsBody(BaseModel):
+    feed_day_hours: float
+    feed_night_hours: float
+    night_start: int
+    night_end: int
+    updated_at: float          # client stamp; the newest write wins (LWW), like every record
+
+
+@app.get("/v1/settings")
+async def get_settings(household: str = Depends(_household)):
+    """Household-shared settings (the feed schedule). Both phones read this so a change on one
+    follows to the other."""
+    raw = db.get_config("household_settings")
+    return {"settings": json.loads(raw) if raw else None}
+
+
+@app.post("/v1/settings")
+async def set_settings(body: SettingsBody, household: str = Depends(_household)):
+    raw = db.get_config("household_settings")
+    if raw:
+        cur = json.loads(raw)
+        if float(cur.get("updated_at", 0)) > body.updated_at:
+            return {"ok": True, "settings": cur}     # a newer change already won
+    db.set_config("household_settings", json.dumps(body.model_dump()))
+    return {"ok": True, "settings": body.model_dump()}
+
+
 @app.post("/v1/sync/push")
 async def sync_push(body: PushBody, household: str = Depends(_household)):
     applied = 0
