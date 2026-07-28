@@ -762,6 +762,11 @@ def _review_ai_story(review_id: str, wait_s: float = 25.0) -> dict | None:
     return None
 
 
+# Traffic-light dot prefixed to the notification title. iOS has no API to colour a notification,
+# so the colour is a character. Index == Frigate's clamped potential_threat_level.
+_LEVEL_DOT = {0: "\U0001F7E2", 1: "\U0001F7E1", 2: "\U0001F534"}   # green, yellow, red
+
+
 def _threat_level(meta: dict | None) -> int:
     """Frigate's `potential_threat_level`, clamped. FAIL-QUIET: anything unparseable reads as 0.
 
@@ -859,7 +864,14 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
                 headline = (story.get("title") or "").strip()
                 summary = (story.get("shortSummary") or story.get("scene") or "").strip()
                 if headline:
-                    payload["title"] = ("⚠️ " if level >= 2 else "") + headline
+                    # iOS gives no API to colour a notification banner, so the colour has to BE a
+                    # character. A traffic-light dot at the head of the title reads instantly on a
+                    # lock screen without opening anything:
+                    #   🟢 routine   🟡 worth a glance   🔴 worth acting on
+                    # Green is deliberately shown rather than left blank — it says "the model
+                    # looked at this and it's normal", which is different from an unrated alert
+                    # (those carry no dot at all).
+                    payload["title"] = f"{_LEVEL_DOT[level]} {headline}"
                 if summary:
                     payload["body"] = summary
                 payload["ai_title"] = headline

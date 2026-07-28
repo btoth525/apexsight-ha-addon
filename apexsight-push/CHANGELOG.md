@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.20.1
+
+**Traffic-light dot on the notification title.**
+
+iOS gives no API to colour a notification banner, so the colour has to BE a character. The AI-rated
+follow-up now leads with a dot matching the rating — green for routine, yellow for worth-a-glance,
+red for worth-acting-on — readable on a lock screen without opening anything.
+
+Green is shown deliberately rather than left blank: it says "the model looked at this and it's
+normal", which is different information from an alert that was never rated at all. Those still
+carry no dot, so an unrated alert never masquerades as a cleared one.
+
 ## 1.20.0
 
 **Notifications now say what happened — and the AI decides whether to interrupt you.**

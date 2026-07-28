@@ -84,6 +84,14 @@ check("non-numeric fails quiet to routine",
 check("None value fails quiet to routine",
       bridge._threat_level({"potential_threat_level": None}) == 0)
 
+# ---- traffic-light dot in the title (iOS can't colour a banner, so the colour is a character) ----
+check("routine gets a GREEN dot", bridge._LEVEL_DOT[0] == "\U0001F7E2")
+check("notable gets a YELLOW dot", bridge._LEVEL_DOT[1] == "\U0001F7E1")
+check("concerning gets a RED dot", bridge._LEVEL_DOT[2] == "\U0001F534")
+check("all three dots are distinct", len(set(bridge._LEVEL_DOT.values())) == 3)
+check("a dot exists for every level the clamp can produce",
+      all(l in bridge._LEVEL_DOT for l in (0, 1, 2)))
+
 # ---- the story fetch must never block or break an alert ----
 check("no review id -> None immediately", bridge._review_ai_story("") is None)
 
