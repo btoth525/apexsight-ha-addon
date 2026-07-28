@@ -1,0 +1,26 @@
+# Python build artifacts. This repo had NO .gitignore, which is how __pycache__ ended up staged
+# during a routine `git add` — the test runs generate it on every invocation.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local databases the relay writes at runtime (never the committed schema).
+*.sqlite
+*.sqlite3
+*.db
+
+# Secrets — the APNs signing key and any certs live in the add-on's /data volume at runtime and
+# must never be committed. Mirrors the app repo's rule.
+*.p8
+*.p12
+*.key
+*.pem
+.env
+
+# macOS
+.DS_Store
+
+# A stray nested clone of this same repo has appeared here before; never commit one.
+apexsight-ha-addon/
