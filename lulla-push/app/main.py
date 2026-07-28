@@ -320,6 +320,12 @@ async def camera_snapshot(household: str = Depends(_household)):
         raise HTTPException(status_code=502, detail="camera unreachable")
 
 
+@app.get("/v1/home/history")
+async def home_history(hours: int = 12, household: str = Depends(_household)):
+    """Owlet vitals history for the app's trend charts (HR / O2 / skin temp)."""
+    return await home.vitals_history(hours=max(1, min(hours, 72)))
+
+
 class SettingsBody(BaseModel):
     feed_day_hours: float
     feed_night_hours: float

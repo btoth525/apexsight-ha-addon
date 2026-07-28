@@ -9,6 +9,7 @@ Entities are auto-discovered by name (no entity picker, on either side):
 As soon as those exist in HA (Owlet signed in, entities named/aliased), they appear.
 """
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -216,6 +217,61 @@ async def state() -> dict:
     result = classify(states)
     result["connected"] = True
     return result
+
+
+def _downsample(points: list[dict], cap: int = 150) -> list[dict]:
+    """Keep the payload small for the phone: evenly thin a series to at most `cap` points.
+    Always keeps the newest sample so the chart's right edge is current."""
+    if len(points) <= cap:
+        return points
+    step = len(points) / cap
+    thinned = [points[int(i * step)] for i in range(cap)]
+    if thinned[-1] is not points[-1]:
+        thinned[-1] = points[-1]
+    return thinned
+
+
+async def vitals_history(hours: int = 12) -> dict:
+    """Heart-rate / O2 / skin-temp series from HA's recorder, for the app's trend charts.
+    Returns {"hr": [{t, v}], "spo2": [...], "temp": [...]}, oldest→newest, thinned for transport.
+    Empty lists (not an error) when the sock hasn't been worn in the window."""
+    states = await _get("/states")
+    if states is None:
+        return {"connected": False, "hours": hours, "hr": [], "spo2": [], "temp": []}
+
+    wanted: dict[str, str] = {}          # entity_id -> series key
+    for s in states:
+        eid = s.get("entity_id", "")
+        if _owlet_alert(eid):            # alert flags are not vitals
+            continue
+        role = _owlet_role(eid)
+        if role in ("hr", "o2", "temp") and role not in wanted.values():
+            wanted[eid] = {"hr": "hr", "o2": "spo2", "temp": "temp"}[role]
+    if not wanted:
+        return {"connected": True, "hours": hours, "hr": [], "spo2": [], "temp": []}
+
+    start = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    raw = await _get(f"/history/period/{start}"
+                     f"?filter_entity_id={','.join(wanted)}&minimal_response&no_attributes")
+    out: dict[str, list] = {"hr": [], "spo2": [], "temp": []}
+    for series in (raw or []):
+        if not series:
+            continue
+        key = wanted.get(series[0].get("entity_id", ""))
+        if not key:
+            continue
+        pts = []
+        for row in series:
+            state = row.get("state")
+            when = row.get("last_changed") or row.get("last_updated")
+            if not state or not when or state in ("unavailable", "unknown"):
+                continue          # sock off the foot — a gap, not a zero
+            try:
+                pts.append({"t": when, "v": float(state)})
+            except (TypeError, ValueError):
+                continue
+        out[key] = _downsample(pts)
+    return {"connected": True, "hours": hours, **out}
 
 
 async def toggle(entity_id: str) -> bool:
