@@ -78,7 +78,20 @@ async def _owlet_sleep_poller() -> None:
                     await _push_owlet_alert(key, baby)
             db.set_config("owlet_alerts", json.dumps(alerts))
 
-            # 2) Auto-log sleep — prefer Owlet's `awake` flag, fall back to sleep_state text.
+            # 2) Sleep-stage notifications — a quiet, rate-limited ping as she moves through
+            #    light/deep sleep and toward waking. Passive (no buzz) since stages cycle often;
+            #    collapse so the shade holds one, not a pile. First reading seeds silently.
+            cur_stage = vitals.get("sleep_state")
+            prev_stage = db.get_config("owlet_stage")
+            if owlet_log.stage_changed(prev_stage, cur_stage):
+                last_ts = float(db.get_config("owlet_stage_ts") or 0)
+                if time.time() - last_ts >= 600:      # ≥10 min between stage pings
+                    await _push_sleep_stage(cur_stage, baby)
+                    db.set_config("owlet_stage_ts", str(time.time()))
+            if cur_stage is not None:
+                db.set_config("owlet_stage", cur_stage)
+
+            # 3) Auto-log sleep — prefer Owlet's `awake` flag, fall back to sleep_state text.
             cur = owlet_log.sleep_class_from_alerts(alerts, vitals.get("sleep_state"))
             open_start = db.get_config("owlet_open_start") or None
             now = owlet_log.now_iso()
@@ -93,6 +106,19 @@ async def _owlet_sleep_poller() -> None:
         except Exception:
             pass   # a bad poll must never take the relay down
         await asyncio.sleep(_OWLET_POLL_SECONDS)
+
+
+async def _push_sleep_stage(state: str, baby: str) -> None:
+    """A quiet, collapsing note that the baby moved to a new sleep stage. Passive so it never
+    buzzes overnight; it just appears for a glance."""
+    try:
+        await push(PushEventBody(
+            event="owlet.sleep_stage", household=config.PAIRING_CODE,
+            title=f"😴 {baby}", body=f"Now: {owlet_log.stage_label(state)}",
+            interruption_level="passive", collapse_id="owlet-stage",
+        ))
+    except Exception:
+        pass
 
 
 async def _push_owlet_alert(key: str, baby: str) -> None:

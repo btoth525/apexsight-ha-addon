@@ -69,6 +69,15 @@ def test_alert_transitions_are_edge_triggered():
     assert o.alert_transitions({}, {"mystery": True}) == []
 
 
+def test_stage_change_detection():
+    assert o.stage_changed("light", "deep") is True
+    assert o.stage_changed("deep", "deep") is False, "same stage doesn't re-notify"
+    assert o.stage_changed(None, "light") is False, "first reading seeds, no ping"
+    assert o.stage_changed("light", "unavailable") is False, "going no-signal isn't a stage change"
+    assert o.stage_changed("deep", "awake") is True, "waking is a stage change worth a ping"
+    assert o.stage_label("deep_sleep") == "Deep Sleep"
+
+
 def test_sleep_class_prefers_the_awake_flag():
     assert o.sleep_class_from_alerts({"awake": False}, None) == "asleep"
     assert o.sleep_class_from_alerts({"awake": True}, "deep") == "awake", "awake flag wins over text"

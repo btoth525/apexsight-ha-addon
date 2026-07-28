@@ -72,6 +72,20 @@ ALERT_META = {
 }
 
 
+def stage_changed(prev: Optional[str], cur: Optional[str]) -> bool:
+    """True when `cur` is a real, available sleep stage that differs from the last-seen one — the
+    trigger for a (passive, rate-limited) 'she's now in deep sleep' notification. A missing/no-
+    signal reading is never a stage change (charging/sock-off shouldn't ping)."""
+    if not cur or sleep_class(cur) == "nosignal":
+        return False
+    return prev is not None and prev != cur
+
+
+def stage_label(state: str) -> str:
+    """Human label for a sleep-stage push, vocab-agnostic (whatever HA reports)."""
+    return state.strip().replace("_", " ").title()
+
+
 def alert_transitions(prev: dict, cur: dict) -> list[str]:
     """Alert keys that just went OFF→ON (edge-triggered, so we notify once per episode, not
     every poll). 'awake' is a sleep signal, never an alert."""
