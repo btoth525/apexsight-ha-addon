@@ -48,7 +48,9 @@ async def _startup() -> None:
         asyncio.create_task(_owlet_sleep_poller())
 
 
-_OWLET_POLL_SECONDS = 60
+# Poll fast enough that "she just woke up" reaches a parent in seconds, not a minute. The HA
+# Core API call is local and cheap, so 15s is comfortable for a household relay.
+_OWLET_POLL_SECONDS = 15
 
 
 async def _owlet_sleep_poller() -> None:
@@ -83,7 +85,12 @@ async def _owlet_sleep_poller() -> None:
             #    collapse so the shade holds one, not a pile. First reading seeds silently.
             cur_stage = vitals.get("sleep_state")
             prev_stage = db.get_config("owlet_stage")
-            if owlet_log.stage_changed(prev_stage, cur_stage):
+            # Skip stage pings that cross the awake/asleep boundary — the wake/asleep alert in
+            # (3a) owns those, and firing both would double-notify for one event.
+            crosses_wake_boundary = (
+                owlet_log.sleep_class(prev_stage) != owlet_log.sleep_class(cur_stage)
+                if prev_stage and cur_stage else False)
+            if owlet_log.stage_changed(prev_stage, cur_stage) and not crosses_wake_boundary:
                 last_ts = float(db.get_config("owlet_stage_ts") or 0)
                 if time.time() - last_ts >= 600:      # ≥10 min between stage pings
                     await _push_sleep_stage(cur_stage, baby)
@@ -93,6 +100,18 @@ async def _owlet_sleep_poller() -> None:
 
             # 3) Auto-log sleep — prefer Owlet's `awake` flag, fall back to sleep_state text.
             cur = owlet_log.sleep_class_from_alerts(alerts, vitals.get("sleep_state"))
+
+            # 3a) AWAKE <-> ASLEEP transition: the notification parents actually want ("she's
+            #     waking up" / "she's down"). Time-sensitive on WAKE so it reaches you through
+            #     Focus; the falling-asleep note is passive. Seeded silently on first read.
+            prev_cls = db.get_config("owlet_sleep_cls")
+            if prev_cls is not None and cur != prev_cls and cur in ("awake", "asleep"):
+                if cur == "awake" and prev_cls == "asleep":
+                    await _push_wake_state(True, baby)
+                elif cur == "asleep" and prev_cls == "awake":
+                    await _push_wake_state(False, baby)
+            if cur in ("awake", "asleep") or prev_cls is None:
+                db.set_config("owlet_sleep_cls", cur)
             open_start = db.get_config("owlet_open_start") or None
             now = owlet_log.now_iso()
             decision = owlet_log.decide(cur, open_start, now)
@@ -106,6 +125,22 @@ async def _owlet_sleep_poller() -> None:
         except Exception:
             pass   # a bad poll must never take the relay down
         await asyncio.sleep(_OWLET_POLL_SECONDS)
+
+
+async def _push_wake_state(awake: bool, baby: str) -> None:
+    """She just woke up / just fell asleep. Waking is time-sensitive (that's the one you want to
+    catch through Focus — a feed usually follows); falling asleep is a quiet note."""
+    try:
+        await push(PushEventBody(
+            event="owlet.awake" if awake else "owlet.asleep",
+            household=config.PAIRING_CODE,
+            title=f"{'👀' if awake else '😴'} {baby}",
+            body="She's waking up." if awake else "She's fallen asleep.",
+            interruption_level="time-sensitive" if awake else "passive",
+            collapse_id="owlet-wake",
+        ))
+    except Exception:
+        pass
 
 
 async def _push_sleep_stage(state: str, baby: str) -> None:
