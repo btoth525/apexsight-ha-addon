@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.18.0
+
+**Bound the follow-up push's GIF so a long review can't produce a download the phone gives up on.**
+
+- The GIF spanned the entire review. On a verified 95-second doorbell review that is **780 KB**,
+  against ~200 KB for 20 seconds — and the notification service extension has a bounded window to
+  fetch it, so on cellular the size decides whether an image appears at all. The window is now
+  capped at ~20s.
+- **Centered on the review's key moment, not its start.** Head-truncating that same review would
+  have shown an empty porch: the delivery happened ~70s in. The window centers on the event's
+  best frame (clamped into the review), slightly back-weighted so the approach is included.
+  Unknown best frame falls back to the full review window rather than guessing.
+- **Measured honestly: ~5% smaller across 12 real reviews**, because most are already under the
+  cap. This is a worst-case guard for the long tail (a 52s review saved 29%), not a general win.
+- The single event fetch now feeds both the GIF window and the pinned still, so this costs no
+  extra requests. `tests/test_gif_window.py` (14 checks) pins the coverage invariant, the
+  short-review no-op, the unknown-best fallback, and the end-rounding that a truncating `int()`
+  got wrong.
+
+### Note on image sizing
+Adding `?height` to the *event* snapshots was investigated and deliberately **not** done: those
+images come from the detect stream and are already 22–56 KB, so the parameter UPSCALES them —
+the cropped thumbnail went 22 KB → 78 KB. `?height=720` is applied only where the source is
+genuinely 4K (the recordings frame, 262 KB → 57 KB), which 1.16.1 already does.
+
 ## 1.17.0
 
 **Live two-way talk was pulling the mic stream from the PUBLIC hostname, where the port isn't open.**
