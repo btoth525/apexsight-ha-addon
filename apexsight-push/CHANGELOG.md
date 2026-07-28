@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.19.0
+
+**House-mode changes are one MQTT publish instead of 18 Home Assistant switch calls.**
+
+- Frigate 0.18 Profiles now drive per-camera alerting. A mode change publishes the mode name to
+  `frigate/profile/set` and Frigate applies that profile's `review.alerts.enabled` overrides
+  **atomically** — the switch path always had a window where half the cameras had flipped and half
+  hadn't. Requires profiles in the Frigate config (one per mode); see the repo README.
+- **The switch path is kept, not replaced.** It is still used whenever the household has CUSTOMISED
+  a mode's camera matrix in the app, because the profiles baked into Frigate's config encode the
+  DEFAULT matrix and cannot represent a list the user edits at runtime. Getting that wrong would be
+  a security bug in the dangerous direction — muted cameras alerting, or expected cameras going
+  quiet — so `_effective_mutes()` reports whether the live matrix still matches the defaults and
+  only then is a profile used. The switch path is also the fallback if the publish fails.
+- Published at **qos=1** (the broker retries the handoff) and **not retained** — a retained mode
+  would be re-applied to Frigate on every reconnect, overriding a mode set since.
+- New `use_frigate_profiles` option (default on) to force the switch path if ever needed.
+- `tests/test_profiles.py` (26 checks) pins the default-vs-custom detection — including a custom
+  map that merely reorders the default list, a one-mode edit not contaminating other modes, and
+  malformed JSON failing safe — plus the publish contract and all three fallback paths.
+
 ## 1.18.0
 
 **Bound the follow-up push's GIF so a long review can't produce a download the phone gives up on.**

@@ -33,6 +33,10 @@ PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 FRIGATE_BASE_URL = os.environ.get("FRIGATE_BASE_URL", "").rstrip("/")
 TOPIC = os.environ.get("TOPIC", "frigate/reviews")
 ALERTS_ONLY = os.environ.get("ALERTS_ONLY", "true").lower() in ("true", "1", "yes")
+# Frigate 0.18 Profiles: activating one applies every camera's alert override atomically, replacing
+# 18 Home Assistant switch calls with a single MQTT publish. Off => always use the switch path.
+USE_FRIGATE_PROFILES = os.environ.get("USE_FRIGATE_PROFILES", "true").lower() in ("true", "1", "yes")
+FRIGATE_PROFILE_TOPIC = os.environ.get("FRIGATE_PROFILE_TOPIC", "frigate/profile/set")
 
 # Frigate's per-object events topic (same prefix as the reviews topic) — accumulated
 # into the shared relay DB so the relay can build the daily recap without querying
@@ -407,6 +411,51 @@ def _ha_switch(entities, on: bool) -> bool:
         return False
 
 
+def _effective_mutes(mode: str) -> tuple[list, list, bool]:
+    """(muted, roster, is_default) for `mode`. `is_default` is True only when the household has NOT
+    customised this mode's list in the app — which is what decides whether a Frigate PROFILE can
+    represent it (profiles are static config; the app's matrix is live household state)."""
+    custom = {}
+    raw = _get_cfg("mode_map", "")
+    if raw:
+        try:
+            custom = json.loads(raw) or {}
+        except json.JSONDecodeError:
+            custom = {}
+    default = _MODE_MUTES_DEFAULT.get(mode, [])
+    if isinstance(custom.get(mode), list):
+        muted = custom[mode]
+        is_default = sorted(str(c) for c in muted) == sorted(default)
+    else:
+        muted, is_default = default, True
+    roster = custom.get("_cameras") if isinstance(custom.get("_cameras"), list) else []
+    return list(muted), (roster or _ALL_CAMERAS_FALLBACK), is_default
+
+
+def _set_frigate_profile(client, mode: str) -> bool:
+    """Activate the matching Frigate profile with ONE MQTT publish.
+
+    Replaces 18 Home Assistant switch calls (2 per camera x 9) with a single message. Frigate
+    applies the profile's per-camera `review.alerts.enabled` overrides atomically, so there is no
+    window where half the cameras have flipped — which the switch path always had.
+
+    Returns False if the publish can't be made, so the caller falls back to the switch path.
+    """
+    if not client or not client.is_connected():
+        return False
+    try:
+        info = client.publish(FRIGATE_PROFILE_TOPIC, mode, qos=1, retain=False)
+        # rc 0 == queued for delivery; qos1 means the broker will retry the handoff itself.
+        if getattr(info, "rc", 1) != 0:
+            log(f"frigate profile publish rejected (rc={getattr(info, 'rc', '?')})")
+            return False
+        log(f"frigate profile set → '{mode}' (1 MQTT publish, replaces 18 switch calls)")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log("frigate profile publish failed:", exc)
+        return False
+
+
 def _sync_frigate_alert_switches() -> bool:
     """Make Frigate's per-camera review_alerts/review_detections switches match the current house
     mode + the household's custom mode map (edited in the app). This is what keeps 'relay and Home
@@ -416,17 +465,7 @@ def _sync_frigate_alert_switches() -> bool:
     mode = (_get_cfg("house_mode", "") or "").strip().lower()
     if mode not in _MODE_MUTES_DEFAULT:
         return True                 # unknown mode → leave switches alone (fail-open, nothing to do)
-    custom = {}
-    raw = _get_cfg("mode_map", "")
-    if raw:
-        try:
-            custom = json.loads(raw) or {}
-        except json.JSONDecodeError:
-            custom = {}
-    muted = custom.get(mode) if isinstance(custom.get(mode), list) else _MODE_MUTES_DEFAULT[mode]
-    roster = custom.get("_cameras") if isinstance(custom.get("_cameras"), list) else []
-    if not roster:
-        roster = _ALL_CAMERAS_FALLBACK
+    muted, roster, _ = _effective_mutes(mode)
     on_entities, off_entities = [], []
     for cam in roster:
         slug = str(cam).strip().lower()
@@ -442,25 +481,48 @@ def _sync_frigate_alert_switches() -> bool:
     return ok
 
 
-def _frigate_switch_watcher() -> None:
-    """Re-sync Frigate's alert switches whenever the house mode or the household mode map changes
+def _frigate_switch_watcher(client=None) -> None:
+    """Keep Frigate's per-camera alerting in step with the house mode + the household's mode map
     (checked every 3s), plus a 10-minute heartbeat so a manual flip or an HA restart self-heals.
-    A FAILED sync (HA restarting, API error) does NOT advance the change marker, so it retries
-    every tick until it lands — never leaves the switches wrong for the whole heartbeat window."""
+    A FAILED sync does NOT advance the change marker, so it retries every tick until it lands.
+
+    Two mechanisms, preferred in order:
+
+      1. **Frigate profile** — ONE `frigate/profile/set` publish. Frigate applies that profile's
+         per-camera `review.alerts.enabled` overrides atomically, so there is no window where half
+         the cameras have flipped. Only usable when the mode's mute list matches the built-in
+         defaults, because the profiles in Frigate's config encode exactly those defaults.
+      2. **HA switches** — the original 18 calls (2 per camera x 9). Still the path whenever the
+         household has CUSTOMISED that mode's matrix in the app, since a static profile can't
+         represent a list the user edits at runtime, and it's the fallback if the publish fails.
+
+    Keeping both is deliberate: profiles are new, and a security app should not have a single
+    untested path to "which cameras are allowed to alert".
+    """
     last = None
     last_forced = 0.0
     while True:
         try:
-            mode = _get_cfg("house_mode", "") or ""
+            mode = (_get_cfg("house_mode", "") or "").strip().lower()
             seq = _get_cfg("mode_map_seq", "") or ""
             key = f"{mode}|{seq}"
             now = time.time()
             if key != last or now - last_forced > 600:
-                if _sync_frigate_alert_switches():
+                ok = False
+                if mode in _MODE_MUTES_DEFAULT:
+                    _, _, is_default = _effective_mutes(mode)
+                    if is_default and USE_FRIGATE_PROFILES:
+                        ok = _set_frigate_profile(client, mode)
+                    elif not is_default:
+                        log(f"mode '{mode}' has a CUSTOM camera matrix — using HA switches "
+                            f"(a static profile can't represent an app-edited list)")
+                if not ok:
+                    ok = _sync_frigate_alert_switches()
+                if ok:
                     last = key
                     last_forced = now
         except Exception as exc:
-            log("frigate switch sync failed:", exc)
+            log("frigate alert sync failed:", exc)
         time.sleep(3)
 
 
@@ -1228,7 +1290,7 @@ def main():
     threading.Thread(target=_device_publisher, args=(client,), daemon=True).start()
     # Watch for app arm/disarm requests and forward them to HA (consume-once, restart-safe).
     threading.Thread(target=_mode_request_watcher, args=(client,), daemon=True).start()
-    threading.Thread(target=_frigate_switch_watcher, daemon=True).start()
+    threading.Thread(target=_frigate_switch_watcher, args=(client,), daemon=True).start()
 
     while True:
         try:
