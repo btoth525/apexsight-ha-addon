@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.23.0
+
+**The app can now tell you what went wrong on the phone.**
+
+New `/v1/diag`: the iOS app ships its own error log here, so a problem seen while testing can be
+read back afterwards instead of dying with the app. Until now the app only logged to stderr under
+a debug build — which means the TestFlight builds actually in use recorded nothing at all.
+
+- `POST /v1/diag` — pairing-gated and rate-limited like every other write. Caps 200 entries per
+  request, 2000 characters per line, and prunes to the newest 20,000 rows, so a runaway error loop
+  on a phone can't fill the server's disk.
+- `GET /v1/diag?pairing_code=…&limit=…&since_ts=…&level=error` — read it back. Same pairing gate as
+  the write: this is app-internal detail about a household's cameras and is not world-readable, and
+  one household can never see another's lines.
+- `DELETE /v1/diag` — clear the log for a household.
+
+A malformed entry is skipped rather than raising: the one thing worse than a missing log is the
+endpoint 500ing while the app is trying to report that something else broke. The app strips tokens,
+pairing codes and passwords before anything is sent, and the relay clamps sizes independently
+rather than trusting it to have done so.
+
+_Tests: 267 checks across 9 suites (new `test_diag.py`, 21 checks — cross-household isolation,
+bounds, rotation keeping the NEWEST lines, and malformed input not raising)._
+
 ## 1.22.0
 
 **Notification text that finishes its sentence, and a rating you can trust.**

@@ -51,6 +51,20 @@ def init() -> None:
                 updated_at   INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_voip_pairing ON voip_tokens(pairing_code);
+            -- App-side diagnostics: the phone's own error log, shipped here so a problem seen
+            -- while testing can be read back afterwards instead of being lost with the app.
+            -- Deliberately dumb and append-only; `prune_diag` keeps it from growing without bound.
+            CREATE TABLE IF NOT EXISTS diag (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                pairing_code TEXT NOT NULL,
+                device       TEXT,
+                build        TEXT,
+                ts           REAL NOT NULL,
+                level        TEXT NOT NULL,
+                category     TEXT,
+                message      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_diag_ts ON diag(pairing_code, ts);
             """
         )
         # Migration for DBs created before device_name existed (v1.7.0). ADD COLUMN is a
@@ -235,3 +249,70 @@ def recap_events_between(pairing_code: str, start_ts: float, end_ts: float) -> l
 def prune_recap_events(before_ts: float) -> None:
     with _conn() as c:
         c.execute("DELETE FROM recap_events WHERE ts < ?", (before_ts,))
+
+# ---- app diagnostics -------------------------------------------------------
+# The phone's own log, so "it did something weird while I was testing" survives long enough to be
+# read. Capped hard: this is a debugging aid on a home server, never a reason to fill the disk.
+DIAG_MAX_ROWS = 20_000
+
+
+def insert_diag(pairing_code: str, device: str, build: str, entries: list[dict]) -> int:
+    """Append log lines. Returns how many landed. Never raises on a bad row — a malformed
+    diagnostic must not 500 the endpoint the app is trying to report a problem through."""
+    rows = []
+    for e in entries:
+        try:
+            rows.append((
+                pairing_code,
+                (device or "")[:64],
+                (build or "")[:32],
+                float(e.get("ts") or time.time()),
+                str(e.get("level") or "info")[:12],
+                str(e.get("category") or "")[:40],
+                str(e.get("message") or "")[:2000],
+            ))
+        except (TypeError, ValueError):
+            continue
+    if not rows:
+        return 0
+    with _conn() as c:
+        c.executemany(
+            "INSERT INTO diag (pairing_code, device, build, ts, level, category, message) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    return len(rows)
+
+
+def recent_diag(pairing_code: str, limit: int = 500, since_ts: float = 0.0,
+                level: Optional[str] = None) -> list[sqlite3.Row]:
+    q = ("SELECT id, device, build, ts, level, category, message FROM diag "
+         "WHERE pairing_code = ? AND ts >= ?")
+    args: list = [pairing_code, since_ts]
+    if level:
+        q += " AND level = ?"
+        args.append(level)
+    q += " ORDER BY ts DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 5000)))
+    with _conn() as c:
+        return c.execute(q, tuple(args)).fetchall()
+
+
+def prune_diag(max_rows: int = DIAG_MAX_ROWS) -> int:
+    """Keep only the newest `max_rows`. Returns how many were dropped."""
+    with _conn() as c:
+        total = c.execute("SELECT COUNT(*) FROM diag").fetchone()[0]
+        if total <= max_rows:
+            return 0
+        c.execute(
+            "DELETE FROM diag WHERE id NOT IN "
+            "(SELECT id FROM diag ORDER BY id DESC LIMIT ?)",
+            (max_rows,),
+        )
+        return total - max_rows
+
+
+def clear_diag(pairing_code: str) -> int:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM diag WHERE pairing_code = ?", (pairing_code,))
+        return cur.rowcount or 0

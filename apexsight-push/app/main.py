@@ -483,6 +483,65 @@ async def turn_credentials(body: TurnCredentialsIn, _: None = Depends(rate_limit
     return servers
 
 
+class DiagEntryIn(BaseModel):
+    ts: float = 0.0
+    level: str = "info"
+    category: str = ""
+    message: str = ""
+
+
+class DiagIn(BaseModel):
+    """A batch of log lines from one phone.
+
+    The app redacts before sending, but this is a security app and a diagnostic channel is exactly
+    the sort of thing that quietly grows into a data leak — so the relay clamps sizes independently
+    rather than trusting the client to have behaved.
+    """
+    pairing_code: str = ""
+    device: str = ""
+    build: str = ""
+    entries: list[DiagEntryIn] = []
+
+
+# One phone, testing hard, still shouldn't be able to spam the DB. 200 lines per POST is far more
+# than a session produces; anything beyond it is a bug or an abuse and gets dropped, not stored.
+DIAG_MAX_ENTRIES_PER_POST = 200
+
+
+@app.post("/v1/diag")
+def post_diag(body: DiagIn, _: None = Depends(rate_limit)) -> dict:
+    """The app's own error log, so a problem seen on the phone can be read back here afterwards.
+
+    Pairing-gated like every other write. Deliberately cheap and forgiving: it stores what it can
+    and never raises on a malformed line, because the one thing worse than a missing log is an
+    endpoint that errors while the app is trying to report that something errored.
+    """
+    code = _require_pairing(body.pairing_code)
+    entries = [e.model_dump() for e in body.entries[:DIAG_MAX_ENTRIES_PER_POST]]
+    stored = db.insert_diag(code, body.device, body.build, entries)
+    dropped = db.prune_diag()
+    if stored:
+        print(f"[diag] +{stored} from {body.device or '?'} build {body.build or '?'}"
+              + (f" (pruned {dropped})" if dropped else ""), flush=True)
+    return {"ok": True, "stored": stored, "dropped_over_limit": len(body.entries) - stored}
+
+
+@app.get("/v1/diag")
+def get_diag(pairing_code: str = "", limit: int = 300, since_ts: float = 0.0,
+             level: str = "", _: None = Depends(rate_limit)) -> dict:
+    """Read the log back. Same pairing gate as the write — this is app-internal detail about a
+    household's cameras and must not be world-readable."""
+    code = _require_pairing(pairing_code)
+    rows = db.recent_diag(code, limit=limit, since_ts=since_ts, level=(level or None))
+    return {"ok": True, "count": len(rows), "entries": [dict(r) for r in rows]}
+
+
+@app.delete("/v1/diag")
+def delete_diag(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
+    code = _require_pairing(pairing_code)
+    return {"ok": True, "deleted": db.clear_diag(code)}
+
+
 @app.post("/v1/doorbell-ring")
 async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> dict:
     """The HA bridge calls this when the doorbell button is pressed. Sends a VoIP push to every
