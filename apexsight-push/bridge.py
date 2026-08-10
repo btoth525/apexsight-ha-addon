@@ -50,6 +50,10 @@ MODE_TOPIC = os.environ.get("MODE_TOPIC", "apexsight/mode")
 # the bridge publishes it here for an HA automation to arm Alarmo. Non-retained (a request is a
 # one-shot command, never a state to replay).
 MODE_SET_TOPIC = os.environ.get("MODE_SET_TOPIC", "apexsight/mode/set")
+# How long an unpublished arm/disarm request may still be retried. Long enough to ride out a broker
+# or HA restart, short enough that a command can never surface as a surprise later — an arm/disarm
+# firing minutes after the tap is its own safety bug.
+MODE_REQUEST_MAX_AGE_S = float(os.environ.get("MODE_REQUEST_MAX_AGE_S", "120"))
 # Doorbell ring — an HA automation publishes here on the doorbell button press; we forward it to the
 # relay's /v1/doorbell-ring, which sends a VoIP push so the phones ring via CallKit.
 DOORBELL_TOPIC = os.environ.get("DOORBELL_TOPIC", "apexsight/doorbell")
@@ -563,9 +567,32 @@ def _consume_mode_request(client) -> bool:
     consumed = int(_get_cfg("mode_request_consumed_seq", "0") or "0")
     if seq <= consumed:
         return False
-    client.publish(MODE_SET_TOPIC, json.dumps({
+    # An old request is dropped rather than fired. This is what makes the rc gate below safe: a
+    # command that never published can be retried for a couple of minutes, but must never sit in
+    # the DB and then arm/disarm the house long afterwards (the stale-disarm hazard in the docstring
+    # above). Requests predating this field have no `ts` and are treated as current, exactly as before.
+    ts = req.get("ts")
+    if ts:
+        age = time.time() - float(ts)
+        if age > MODE_REQUEST_MAX_AGE_S:
+            _set_cfg("mode_request_consumed_seq", str(seq))
+            log(f"mode request seq {seq} expired after {age:.0f}s — dropped rather than replayed")
+            return False
+
+    # qos=1: paho only QUEUES QoS>=1 while the socket is down. `is_connected()` can still be True
+    # for a socket that has just dropped (broker restart, HA restart), and a qos=0 publish in that
+    # window is discarded with rc=MQTT_ERR_NO_CONN. Marking it consumed anyway lost the command
+    # outright: the app had already been told {"ok": true}, so the house stayed unarmed with no
+    # error anywhere. Same pattern `_set_frigate_profile` already uses.
+    info = client.publish(MODE_SET_TOPIC, json.dumps({
         "mode": req.get("mode", ""), "by": req.get("by", ""), "code": req.get("code", ""),
-    }), retain=False)
+    }), qos=1, retain=False)
+    rc = getattr(info, "rc", 1)
+    if rc != 0:
+        # Leave it unconsumed (and the code intact) — the watcher retries in a second, and the age
+        # bound above stops it retrying forever.
+        log(f"mode request seq {seq} publish failed (rc={rc}) — leaving unconsumed for retry")
+        return False
     _set_cfg("mode_request_consumed_seq", str(seq))
     if req.get("code"):
         req["code"] = ""
@@ -920,6 +947,13 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
                 "apex_url": payload["apex_url"],
                 "snapshot_url": gif,
                 "thumbnail_url": cropped,
+                # Carried so the follow-up description inherits THIS alert's gate decision. Without
+                # them the relay fell back to label "object" and zones [], which pass every
+                # per-object and per-zone mute — so a phone that had muted "person" still got a
+                # time-sensitive banner titled "Person" moments after the instant alert was
+                # correctly suppressed for it.
+                "labels": objects,
+                "zones": zones,
                 "_t": time.time(),
             }
             for _d in detections:
@@ -1290,6 +1324,11 @@ def _handle_description(event: dict) -> None:
         "collapse_id": rec["review_id"],   # replace the original alert in place
         "is_description": True,            # relay honors the per-camera opt-out
         "announce": True,                  # read aloud in CarPlay (no second buzz)
+        # The gate needs the same facts the instant alert was judged on, or a muted object/zone
+        # slips through as a time-sensitive push. Empty lists are the pre-existing behaviour for
+        # any record written before this field existed.
+        "labels": rec.get("labels", []) or [],
+        "zones": rec.get("zones", []) or [],
     }
     if rec.get("snapshot_url"):
         payload["snapshot_url"] = rec["snapshot_url"]

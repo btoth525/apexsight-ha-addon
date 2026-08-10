@@ -494,7 +494,7 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
     code = _require_pairing(body.pairing_code)
     rows = db.voip_tokens_for(code)
     payload = {"aps": {"content-available": 1}, "doorbell": True, "camera": body.camera or "doorbell"}
-    sent, failed = 0, 0
+    sent, failed, pruned = 0, 0, 0
     for row in rows:
         ok, detail = await apns.send_voip(row["voip_token"], row["environment"], payload)
         if ok:
@@ -503,8 +503,22 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
             failed += 1
             if any(k in detail for k in ("410", "BadDeviceToken", "Unregistered", "BadEnvironmentKeyInToken")):
                 db.delete_voip(row["voip_token"])
-    print(f"[doorbell] ring → {sent} phones (failed {failed})", flush=True)
-    return {"ok": True, "sent": sent, "failed": failed, "phones": len(rows)}
+                pruned += 1
+    print(f"[doorbell] ring → {sent} phones (failed {failed}, pruned {pruned})", flush=True)
+    # A 2xx tells the bridge the ring was DELIVERED: it stops retrying and charges its ring-debounce
+    # window. Returning 200 when nothing rang meant a visitor pressing the button three times over
+    # the debounce window rang nobody, with only "doorbell ring debounced" in the log. A ring is a
+    # one-shot event — the visitor is already walking away — so a total transient failure has to be
+    # a 5xx the bridge will retry.
+    #
+    # Threshold is `sent == 0`, deliberately NOT /v1/notify's "any transient failure": re-ringing a
+    # phone that already rang restarts its CallKit call, which is worse than one phone missing it.
+    # Pruned dead tokens don't count, so a single stale registration can't 502 the doorbell forever,
+    # and no registered phones at all stays a 200 (nothing to retry).
+    if rows and sent == 0 and (failed - pruned) > 0:
+        raise HTTPException(status_code=502,
+                            detail=f"{failed - pruned} VoIP pushes failed transiently — retry")
+    return {"ok": True, "sent": sent, "failed": failed, "pruned": pruned, "phones": len(rows)}
 
 
 # ---- doorbell talkback (play audio to the Aqara speaker) ---------------------
@@ -781,7 +795,11 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
 
     # Raw event present → render here using the household's saved style (or defaults),
     # so the app's GUI controls the content even when the app is closed.
-    if body.detection_id or body.labels or body.sub_labels:
+    # NOT for a description follow-up. Its whole payload IS the GenAI sentence, and the renderer
+    # emits at least an entity list + timestamp for stage "alert" — so once the bridge started
+    # sending `labels` (needed so per-object/zone mutes apply to descriptions too), rendering here
+    # would overwrite "A person delivers multiple packages to the porch" with "Person · 3:42 PM".
+    if (body.detection_id or body.labels or body.sub_labels) and not body.is_description:
         raw = db.get_config(f"style:{code}")
         style = {}
         if raw:

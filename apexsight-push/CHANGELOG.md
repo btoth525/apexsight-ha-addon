@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.21.0
+
+**Three ways a command or an alert could be lost silently — all of them reported success.**
+
+**A doorbell ring that reached nobody now retries.** `/v1/doorbell-ring` returned 200 even when
+every VoIP push failed transiently. The bridge reads a 2xx as "delivered", so it stopped retrying
+*and* charged its 30-second ring-debounce window — a visitor pressing the button three times rang
+nobody, leaving only "doorbell ring debounced" in the log. A ring is one-shot (the visitor is
+already walking away), so a total transient failure is now a 502 the bridge retries. Deliberately
+only when *nothing* got through: re-ringing a phone that already rang restarts its CallKit call,
+which is worse than one phone missing it. Dead tokens that get pruned don't count, so a single
+stale registration can't 502 the doorbell forever.
+
+**Arm/disarm is no longer discarded when the broker socket has just dropped.** The request was
+published at qos=0 and marked consumed regardless of the result. paho only queues QoS>=1 while
+disconnected, and `is_connected()` still reports True for a socket that has died (broker restart,
+HA restart) — so the publish was thrown away, never retried, and the app had already told the user
+"ok" while the house stayed unarmed. Now qos=1, and a failed publish leaves the request for the
+next tick. A 120-second age bound keeps that safe: an old command is dropped rather than fired
+late, because an arm/disarm surfacing minutes after the tap is its own safety bug.
+
+**AI descriptions no longer bypass your per-object and per-zone mutes.** The follow-up push carried
+no labels or zones, so the relay fell back to label "object" and zones `[]` — which pass every
+object and zone filter. Mute "person" on your phone and the instant alert was correctly suppressed,
+then the description arrived seconds later as a *time-sensitive* banner titled "Person", breaking
+through Focus for exactly the thing you muted. The follow-up now carries the same facts the alert
+was judged on, so it inherits that alert's decision. Camera mutes and quiet hours were never
+affected.
+
+_Tests: 229 checks across 8 suites (new `test_delivery_integrity.py`, 33 checks, pins all three
+plus the trap that sending labels would otherwise let the renderer overwrite the AI sentence with
+"Person · 3:42 PM")._
+
 ## 1.20.1
 
 **Traffic-light dot on the notification title.**
