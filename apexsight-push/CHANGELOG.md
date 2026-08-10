@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.22.0
+
+**Notification text that finishes its sentence, and a rating you can trust.**
+
+**The push body stopped mid-word on about a third of alerts.** Frigate hard-clamps its
+`shortSummary` to 140 characters and cuts blind — measured over 61 rated reviews, 22 ended
+mid-sentence ("…instead moving ", "…entering through the"). In every one of those, the `scene`
+field held the same narrative, finished. The follow-up push now picks whichever field is actually a
+complete sentence, and only falls back to a clamped one — trimmed, with an ellipsis — when there is
+nothing whole to use.
+
+**A hallucinated break-in alert can no longer wake the house.** One review was rated Level 2,
+"Forced Entry Attempt", with an imagined crowbar — against two face-recognised residents carrying a
+package, at the model's own confidence of **0.02**. That would have arrived as a red, audible,
+Focus-breaking push. An escalation is now ignored when the model's confidence is under 0.35, or
+when the subject is a recognised person (the rubric already said a verified person is Level 0
+"regardless of time or activity"; the model overrode it, so it is enforced in code). The threshold
+is measured: every legitimate Level 1 in the same sample sat at 0.5–1.0.
+
+An untrusted rating reads as *unrated* — no traffic-light dot, no escalation — never as a green
+all-clear, because "we don't believe this" and "this is normal" are different statements. Level 0
+is exempt from the confidence floor, and neither guard can suppress a notification: they only
+decide how loudly one lands.
+
+_Tests: 246 checks across 8 suites (+17), pinning both directions of each guard — a confident
+escalation on an unrecognised person still fires._
+
 ## 1.21.0
 
 **Three ways a command or an alert could be lost silently — all of them reported success.**

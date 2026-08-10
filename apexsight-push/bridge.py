@@ -760,6 +760,35 @@ def _pinned_frame_time(det: str, camera: str, start: float, end: float) -> float
         return None
 
 
+def _story_summary(story: dict) -> str:
+    """The best COMPLETE sentence from a review's GenAI metadata.
+
+    Frigate hard-clamps `shortSummary` to 140 characters, slicing mid-word. Measured across 61
+    rated reviews on the live server, 22 of them (36%) ended mid-sentence — "…instead moving ",
+    "…entering through the". This function is why the push body no longer does: in all 22 cases the
+    `scene` field held the same narrative, finished.
+
+    Preferring the LONGER complete field rather than a fixed order, because either one can be the
+    finished one. Falls back to the longest available text with the dangling part-word trimmed and
+    an ellipsis, so a summary that must be cut at least reads as abbreviated.
+    """
+    candidates = [(story.get("scene") or "").strip(), (story.get("shortSummary") or "").strip()]
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return ""
+    complete = [c for c in candidates if c.endswith((".", "!", "?"))]
+    if complete:
+        return max(complete, key=len)
+    text = max(candidates, key=len)
+    # Only tidy when it actually looks CLAMPED — a short summary that merely lacks a full stop is
+    # not truncated, and chopping its last word would be vandalism. Frigate's clamp is 140.
+    if len(text) < 139:
+        return text
+    trimmed = text if text.endswith(" ") else text.rsplit(" ", 1)[0]
+    trimmed = trimmed.strip().rstrip(",;:")
+    return (trimmed + "…") if trimmed else text
+
+
 def _review_ai_story(review_id: str, wait_s: float = 25.0) -> dict | None:
     """Frigate's GenAI review summary (`review.data.metadata`) for `review_id`, waiting briefly.
 
@@ -804,6 +833,41 @@ def _threat_level(meta: dict | None) -> int:
         return max(0, min(2, int((meta or {}).get("potential_threat_level") or 0)))
     except (TypeError, ValueError):
         return 0
+
+
+# Below this, the model's own stated confidence is too low for an ESCALATION to be believed.
+# Measured over 61 rated reviews: every legitimate Level 1 sat at 0.5-1.0, while the one Level 2 —
+# a fabricated "Forced Entry Attempt" complete with an imagined crowbar, raised against two
+# RECOGNISED RESIDENTS carrying a package — sat at 0.02. 0.35 is the empty gap between them.
+CONFIDENCE_FLOOR = float(os.environ.get("AI_CONFIDENCE_FLOOR", "0.35"))
+
+
+def _trusted_threat_level(meta: dict | None, objects: list | None = None) -> int | None:
+    """The rating to act on, or None when it shouldn't be believed.
+
+    None means UNRATED — no dot, no escalation — which is deliberately different from 0. Level 0 is
+    a positive statement ("the model looked and this is normal", shown as a green dot); an untrusted
+    rating is an absence of information and must not be dressed up as an all-clear.
+
+    Mirrors `ThreatLevel.trusted` in the iOS app — if you change one, change both.
+
+    This only ever REDUCES an escalation. The notification is already going out by this point; this
+    decides how loudly it lands, never whether it lands.
+    """
+    level = _threat_level(meta)
+    if level == 0:
+        return 0
+    # A recognised face is a household member. The rubric already says a verified person is Level 0
+    # "regardless of time or activity" and the model overrode it anyway, so it's enforced here where
+    # a prompt can't argue back.
+    for obj in (objects or []):
+        if "verified" in str(obj).lower():
+            return None
+    try:
+        confidence = float((meta or {}).get("confidence"))
+    except (TypeError, ValueError):
+        return None
+    return level if confidence >= CONFIDENCE_FLOOR else None
 
 
 def _build_alert(after: dict, final: bool = False) -> dict | None:
@@ -887,9 +951,9 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
             # now (the review has ended), so use its words.
             story = _review_ai_story(review_id)
             if story:
-                level = _threat_level(story)
+                level = _trusted_threat_level(story, objects)
                 headline = (story.get("title") or "").strip()
-                summary = (story.get("shortSummary") or story.get("scene") or "").strip()
+                summary = _story_summary(story)
                 if headline:
                     # iOS gives no API to colour a notification banner, so the colour has to BE a
                     # character. A traffic-light dot at the head of the title reads instantly on a
@@ -898,21 +962,26 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
                     # Green is deliberately shown rather than left blank — it says "the model
                     # looked at this and it's normal", which is different from an unrated alert
                     # (those carry no dot at all).
-                    payload["title"] = f"{_LEVEL_DOT[level]} {headline}"
+                    # No dot when the rating isn't believed — an unrated alert must never
+                    # masquerade as one the model cleared.
+                    payload["title"] = (
+                        f"{_LEVEL_DOT[level]} {headline}" if level is not None else headline
+                    )
                 if summary:
                     payload["body"] = summary
                 payload["ai_title"] = headline
                 payload["ai_summary"] = summary
-                payload["threat_level"] = level
+                payload["threat_level"] = level if level is not None else 0
                 if story.get("other_concerns"):
                     payload["ai_concerns"] = str(story["other_concerns"])[:300]
                 # THE POINT OF THE FEATURE. A routine delivery upgrades quietly — one buzz, then
                 # better words. Anything the model rated above routine stops being silent and
                 # interrupts, because that is the case you actually want pulled out of your pocket.
-                if level >= 1:
+                if level is not None and level >= 1:
                     payload["silent"] = False
                     payload["announce"] = True
-                log(f"review {review_id} AI story: level={level} title={headline[:60]!r}")
+                log(f"review {review_id} AI story: level={level if level is not None else 'untrusted'} "
+                    f"conf={story.get('confidence')} title={headline[:60]!r}")
 
             rs, re_ = after.get("start_time"), after.get("end_time")
             if rs and re_:
