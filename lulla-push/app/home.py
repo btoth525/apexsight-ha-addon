@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
+from urllib.parse import quote
 
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 CORE_API = "http://supervisor/core/api"
@@ -252,9 +253,9 @@ async def vitals_history(hours: int = 12) -> dict:
 
     now_utc = datetime.now(timezone.utc)
     start = (now_utc - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    # Explicit end_time — see sleep_state_history: the default is start + one day, which would
-    # silently truncate any window longer than 24h.
-    end = now_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    # Explicit AND percent-encoded — see sleep_state_history for both traps: the default window
+    # is start + one day, and an unencoded "+00:00" in the query is read as a space → 400.
+    end = quote(now_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
     raw = await _get(f"/history/period/{start}?end_time={end}"
                      f"&filter_entity_id={','.join(wanted)}&minimal_response&no_attributes")
     out: dict[str, list] = {"hr": [], "spo2": [], "temp": []}
@@ -295,7 +296,11 @@ async def sleep_state_history(days: int = 10) -> list[tuple[float, str]]:
     # `end_time` is NOT optional. HA's /history/period defaults it to start + ONE DAY, so asking
     # for 10 days silently returns the single day that began 10 days ago — the backfill wrote 17
     # bands instead of 289 and looked like it had worked.
-    end = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    #
+    # And it MUST be percent-encoded. `start` sits in the PATH, where a "+" is literal, but
+    # `end_time` is a QUERY parameter, where "+" decodes as a SPACE — HA answers 400 and `_get`
+    # turns that into None, i.e. a backfill that silently does nothing at all.
+    end = quote(now.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
     raw = await _get(f"/history/period/{start}?end_time={end}"
                      f"&filter_entity_id={entity}&minimal_response&no_attributes")
     out: list[tuple[float, str]] = []

@@ -187,3 +187,50 @@ def test_classify_derives_name_even_when_all_owlet_entities_unavailable():
 def test_classify_no_owlet_entities_baby_name_is_none():
     out = classify([s("light.kitchen", "on")])
     assert out["baby_name"] is None
+
+
+# ---- history URL construction ------------------------------------------------------------
+# Two traps, both SILENT: HA's /history/period defaults end_time to start + one day (so a 10-day
+# backfill returns one day), and an unencoded "+00:00" in the query decodes as a space (400 →
+# `_get` returns None → the backfill does nothing and looks like it worked). Both happened.
+
+import asyncio
+from urllib.parse import parse_qs, urlparse
+
+from app import home
+
+
+def _capture_history_url(monkeypatch, coro_factory):
+    seen = {}
+
+    async def fake_get(path):
+        seen.setdefault("paths", []).append(path)
+        if path == "/states":
+            return [
+                {"entity_id": "sensor.ryleighs_sock_sleep_state", "state": "light_sleep",
+                 "attributes": {"friendly_name": "Ryleighs Sock Sleep State"}},
+                {"entity_id": "sensor.ryleighs_sock_heart_rate", "state": "129",
+                 "attributes": {"friendly_name": "Ryleighs Sock Heart Rate"}},
+            ]
+        return []
+
+    monkeypatch.setattr(home, "_get", fake_get)
+    asyncio.run(coro_factory())
+    return [p for p in seen["paths"] if p.startswith("/history/period/")]
+
+
+def test_sleep_history_url_sets_an_explicit_encoded_end_time(monkeypatch):
+    urls = _capture_history_url(monkeypatch, lambda: home.sleep_state_history(days=10))
+    assert urls, "no history request was made"
+    query = parse_qs(urlparse(urls[0]).query)
+    assert "end_time" in query, "without end_time HA returns only the first DAY of the window"
+    # parse_qs decodes; a literal '+' would have arrived as a space and HA would have 400'd.
+    assert "+00:00" in query["end_time"][0], f"end_time not encoded: {query['end_time'][0]}"
+
+
+def test_vitals_history_url_sets_an_explicit_encoded_end_time(monkeypatch):
+    urls = _capture_history_url(monkeypatch, lambda: home.vitals_history(hours=48))
+    assert urls, "no history request was made"
+    query = parse_qs(urlparse(urls[0]).query)
+    assert "end_time" in query
+    assert "+00:00" in query["end_time"][0]
