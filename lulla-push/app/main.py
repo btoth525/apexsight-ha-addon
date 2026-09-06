@@ -80,40 +80,64 @@ async def _owlet_sleep_poller() -> None:
                     await _push_owlet_alert(key, baby)
             db.set_config("owlet_alerts", json.dumps(alerts))
 
-            # 2) Sleep-stage notifications — a quiet, rate-limited ping as she moves through
-            #    light/deep sleep and toward waking. Passive (no buzz) since stages cycle often;
-            #    collapse so the shade holds one, not a pile. First reading seeds silently.
-            cur_stage = vitals.get("sleep_state")
-            prev_stage = db.get_config("owlet_stage")
-            # Skip stage pings that cross the awake/asleep boundary — the wake/asleep alert in
-            # (3a) owns those, and firing both would double-notify for one event.
-            crosses_wake_boundary = (
-                owlet_log.sleep_class(prev_stage) != owlet_log.sleep_class(cur_stage)
-                if prev_stage and cur_stage else False)
-            if owlet_log.stage_changed(prev_stage, cur_stage) and not crosses_wake_boundary:
-                last_ts = float(db.get_config("owlet_stage_ts") or 0)
-                if time.time() - last_ts >= 600:      # ≥10 min between stage pings
-                    await _push_sleep_stage(cur_stage, baby)
-                    db.set_config("owlet_stage_ts", str(time.time()))
-            if cur_stage is not None:
-                db.set_config("owlet_stage", cur_stage)
+            now_ts = time.time()
 
-            # 3) Auto-log sleep — prefer Owlet's `awake` flag, fall back to sleep_state text.
-            cur = owlet_log.sleep_class_from_alerts(alerts, vitals.get("sleep_state"))
+            # 2) Sleep STAGE, debounced. The sock's raw stage flaps (deep-sleep runs have a
+            #    median length of ~2 minutes), so acting on the raw edge produced notes that
+            #    were already wrong by the time a phone lit up. Only a stage that HOLDS is
+            #    announced. Nothing is announced while she's awake — (3) owns that.
+            raw_stage = vitals.get("sleep_state")
+            stage_reading = (raw_stage if raw_stage
+                             and owlet_log.sleep_class(raw_stage) != "nosignal" else None)
+            stage_state, new_stage = owlet_log.debounce(
+                owlet_log.Debounced.from_json(db.get_config("owlet_stage")),
+                stage_reading, now_ts, owlet_log.STAGE_HOLD_SECONDS)
+            db.set_config("owlet_stage", stage_state.to_json())
 
-            # 3a) AWAKE <-> ASLEEP transition: the notification parents actually want ("she's
-            #     waking up" / "she's down"). Time-sensitive on WAKE so it reaches you through
-            #     Focus; the falling-asleep note is passive. Seeded silently on first read.
-            prev_cls = db.get_config("owlet_sleep_cls")
-            if prev_cls is not None and cur != prev_cls and cur in ("awake", "asleep"):
-                if cur == "awake" and prev_cls == "asleep":
-                    await _push_wake_state(True, baby)
-                elif cur == "asleep" and prev_cls == "awake":
-                    await _push_wake_state(False, baby)
-            if cur in ("awake", "asleep") or prev_cls is None:
-                db.set_config("owlet_sleep_cls", cur)
+            # 3) Sleep CLASS, debounced. One filter now drives BOTH the wake/asleep alert and
+            #    the auto sleep log, so the two can never disagree — and the ~60-120s "awake"
+            #    twitches that produced 140 pushes a day (and chopped one night into eleven
+            #    "sleeps") are swallowed before either can act on them.
+            raw_cls = owlet_log.sleep_class_from_alerts(alerts, raw_stage)
+            cls_state, new_cls = owlet_log.debounce(
+                owlet_log.Debounced.from_json(db.get_config("owlet_sleep_cls")),
+                raw_cls, now_ts, owlet_log.WAKE_HOLD_SECONDS)
+            db.set_config("owlet_sleep_cls", cls_state.to_json())
+            cur = cls_state.confirmed or raw_cls
+
+            # 3a) AWAKE <-> ASLEEP, on the CONFIRMED edge only. Time-sensitive on wake (that's
+            #     the one worth piercing Focus for, now that it's trustworthy); falling asleep
+            #     stays a quiet note.
+            if new_cls in ("awake", "asleep"):
+                gap = (owlet_log.WAKE_ALERT_MIN_GAP if new_cls == "awake"
+                       else owlet_log.ASLEEP_ALERT_MIN_GAP)
+                key = f"owlet_{new_cls}_alert_ts"
+                if now_ts - float(db.get_config(key) or 0) >= gap:
+                    await _push_wake_state(new_cls == "awake", baby)
+                    db.set_config(key, str(now_ts))
+
+            # 3b) A confirmed stage note, rate-limited PER STAGE (1.3.0 shared one 10-minute
+            #     budget across every stage, so a light-sleep ping silently swallowed the
+            #     deep-sleep one). Only while she is confirmed asleep.
+            if new_stage in owlet_log.ALERTING_STAGES and cur == "asleep":
+                last_alerts = json.loads(db.get_config("owlet_stage_ts_by_stage") or "{}")
+                if owlet_log.stage_alert_due(last_alerts, new_stage, now_ts):
+                    await _push_sleep_stage(new_stage, baby)
+                    last_alerts[new_stage] = now_ts
+                    db.set_config("owlet_stage_ts_by_stage", json.dumps(last_alerts))
+
+            # 3c) Silent nudge on any confirmed change so the phones' widgets / Lock Screen
+            #     redraw without waiting on WidgetKit's refresh budget. Carries the reading
+            #     itself, so the app can stamp its App Group snapshot with no round trip.
+            if new_stage or new_cls:
+                await _push_owlet_refresh(vitals, stage=stage_state.confirmed, sleep_class=cur)
+
+            # 3d) Auto-log sleep off the CONFIRMED class. The edge is back-stamped to when the
+            #     change actually started (now - hold) rather than when we believed it, so a
+            #     debounced log still records the true times.
             open_start = db.get_config("owlet_open_start") or None
-            now = owlet_log.now_iso()
+            now = (owlet_log.iso_at(now_ts - owlet_log.WAKE_HOLD_SECONDS) if new_cls
+                   else owlet_log.now_iso())
             decision = owlet_log.decide(cur, open_start, now)
             db.set_config("owlet_open_start", decision.new_open_start or "")
             if decision.write:
@@ -141,6 +165,34 @@ async def _push_wake_state(awake: bool, baby: str) -> None:
         ))
     except Exception:
         pass
+
+
+async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
+                              sleep_class: str) -> None:
+    """A silent (content-available) nudge carrying the current reading, so both phones can stamp
+    their App Group snapshot and redraw the widget / Lock Screen immediately.
+
+    Sent only on a CONFIRMED change (a handful of times a day), because iOS budgets background
+    pushes and a per-poll nudge would simply be dropped. No alert, no sound, no badge — this is
+    the data path behind the glance, not a notification."""
+    client = apns.get_client()
+    if not client.is_configured():
+        return
+    payload = apns.build_background_payload(data={
+        "event": "owlet.refresh",
+        "owlet": {
+            "bpm": vitals.get("bpm"), "spo2": vitals.get("spo2"),
+            "battery_pct": vitals.get("battery_pct"), "sock_on": vitals.get("sock_on"),
+            "sleep_state": stage, "sleep_class": sleep_class,
+            "read_at": owlet_log.now_iso(),
+        },
+    })
+    for dev in db.push_devices(config.PAIRING_CODE):
+        try:
+            await _send_and_log(client, "owlet.refresh", dev["device_token"], dev["env"],
+                                payload, push_type="background", collapse_id="owlet-refresh")
+        except Exception:
+            pass   # a silent nudge is best-effort by definition
 
 
 async def _push_sleep_stage(state: str, baby: str) -> None:

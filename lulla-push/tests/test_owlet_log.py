@@ -97,3 +97,111 @@ def test_payload_has_the_fields_the_app_decoder_requires():
     assert p["sourceRaw"] == "owlet"
     assert p["childID"] is None
     assert p["isTombstoned"] is False
+
+
+# ---- debounce / hysteresis --------------------------------------------------------------
+# Modelled on the real flap measured on Brandon's sock: light_sleep punctuated by ~60-120s
+# "awake" blips, with genuine wakes running 8+ minutes.
+
+from app.owlet_log import (Debounced, debounce, stage_alert_due, ALERTING_STAGES,
+                           STAGE_ALERT_MIN_GAP, WAKE_HOLD_SECONDS)
+
+
+def _run(readings, hold=WAKE_HOLD_SECONDS, start=None):
+    """Feed (time, reading) pairs through the filter; return the list of confirmed edges."""
+    state = Debounced() if start is None else start
+    fired = []
+    for now, reading in readings:
+        state, confirmed = debounce(state, reading, now, hold)
+        if confirmed:
+            fired.append((now, confirmed))
+    return state, fired
+
+
+def test_first_reading_seeds_silently():
+    """A cold start (or a fresh deploy) adopts the current state without announcing it."""
+    state, fired = _run([(0, "asleep")])
+    assert state.confirmed == "asleep"
+    assert fired == []
+
+
+def test_short_blip_is_swallowed():
+    """The 60-second 'awake' twitch mid-nap — 43% of the sock's awake runs — never fires."""
+    _, fired = _run([(0, "asleep"), (60, "awake"), (120, "asleep"), (180, "asleep")])
+    # (60s is the single most common false-wake length in 14 days of real data.)
+    assert fired == []
+
+
+def test_two_minute_blip_is_also_swallowed():
+    """43% of the sock's 'awake' runs are under 3 minutes; the hold must clear all of them."""
+    _, fired = _run([(0, "asleep"), (10, "awake"), (100, "awake"), (134, "asleep")])
+    assert fired == []
+
+
+def test_sustained_change_confirms_once():
+    """A real wake fires exactly one edge, `hold` seconds after it started."""
+    start = 100
+    ticks = [(0, "asleep")] + [(start + i * 15, "awake") for i in range(60)]
+    state, fired = _run(ticks)
+    assert [f[1] for f in fired] == ["awake"]
+    assert fired[0][0] == start + WAKE_HOLD_SECONDS
+    assert state.confirmed == "awake"
+
+
+def test_flapping_restarts_the_clock():
+    """Hysteresis needs the new state CONTINUOUSLY, so an interrupted run never confirms."""
+    readings = []
+    t = 0
+    for _ in range(10):                  # 10 rounds of asleep/awake every 60s = 10 minutes
+        readings += [(t, "asleep"), (t + 60, "awake")]
+        t += 120
+    _, fired = _run(readings)
+    assert fired == []
+
+
+def test_real_night_collapses_to_the_genuine_wakes():
+    """The 04:01-04:34 window from HA's recorder: two false wakes (60s, 124s) then a real one."""
+    readings = [(0, "asleep"),
+                (700, "awake"), (760, "asleep"),            # 60s blip
+                (1120, "awake"), (1244, "asleep"),          # 124s blip
+                (2530, "awake")]
+    readings += [(2530 + i * 15, "awake") for i in range(1, 140)]   # the real 34-minute wake
+    _, fired = _run(readings)
+    assert [f[1] for f in fired] == ["awake"]
+    assert fired[0][0] == 2530 + WAKE_HOLD_SECONDS
+
+
+def test_none_reading_holds_the_timer():
+    """A dropped poll (sock unavailable) must not reset a candidate that's mid-count."""
+    state = Debounced(confirmed="asleep", candidate="awake", since=0.0)
+    state, fired = debounce(state, None, 100, WAKE_HOLD_SECONDS)
+    assert fired is None
+    assert state.candidate == "awake" and state.since == 0.0
+
+
+def test_state_survives_a_restart():
+    state = Debounced(confirmed="deep_sleep", candidate="light_sleep", since=42.0)
+    assert Debounced.from_json(state.to_json()) == state
+
+
+def test_legacy_bare_string_upgrades_without_reannouncing():
+    """1.3.0 stored `owlet_stage` as a bare value; reading it as `confirmed` keeps deploy quiet."""
+    assert Debounced.from_json("light_sleep").confirmed == "light_sleep"
+    assert Debounced.from_json(None) == Debounced()
+    assert Debounced.from_json("{not json").confirmed == "{not json"
+
+
+def test_stage_alerts_are_rate_limited_per_stage():
+    """1.3.0's single shared 10-minute budget let a light-sleep ping DROP the deep-sleep one."""
+    last = {"light_sleep": 1000.0}
+    assert stage_alert_due(last, "deep_sleep", 1001.0) is True     # different stage, unaffected
+    assert stage_alert_due(last, "light_sleep", 1001.0) is False   # same stage, too soon
+    assert stage_alert_due(last, "light_sleep", 1000.0 + STAGE_ALERT_MIN_GAP) is True
+    assert stage_alert_due({}, "deep_sleep", 0.0) is True          # never fired before
+
+
+def test_only_deep_sleep_is_worth_announcing():
+    """Light sleep is where a newborn spends most of the night — announcing it added ~16
+    pushes a day in the replay and told Taylor nothing she couldn't see on the widget."""
+    assert "deep_sleep" in ALERTING_STAGES
+    assert "light_sleep" not in ALERTING_STAGES

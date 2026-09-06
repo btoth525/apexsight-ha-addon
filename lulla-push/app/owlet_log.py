@@ -19,6 +19,7 @@ Sleep-state vocabulary is confirmed against the real sock the first time it's wo
 NO-SIGNAL sets below are the tunable knobs.
 """
 from __future__ import annotations
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -160,3 +161,117 @@ def _parse(iso: str) -> datetime:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def iso_at(epoch_seconds: float) -> str:
+    """A specific instant in the same wire format. Used to back-stamp a debounced sleep edge to
+    when it actually happened, so hysteresis costs us notification latency but never log
+    accuracy."""
+    return datetime.fromtimestamp(epoch_seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---- debounce / hysteresis (WAVE: "notifications are 2 minutes behind") -----------------
+#
+# Measured against 14 days of `sensor.ryleighs_sock_sleep_state` (949 samples) on Brandon's
+# HA box. The sock's raw signal FLAPS: of 360 "awake" runs, 156 (43%) lasted under 3 minutes
+# — Owlet's staging algorithm twitching mid-nap, not Ryleigh actually waking. Real wakes have
+# a median run of 4 min and a p75 of 8 min, so a 3-minute confirmation window separates them
+# cleanly.
+#
+# Acting on the RAW signal is what produced all three symptoms Taylor felt:
+#   * 70 "She's waking up" + 70 "She's fallen asleep" pushes in 24h, the wake ones
+#     time-sensitive so they pierce Sleep Focus,
+#   * every one of them contradicted ~60s later, so the banner in her hand describes a state
+#     that already ended — the "2 minutes behind" complaint (delivery itself is 1-15s;
+#     measured against the relay's own delivery log, it was never the problem),
+#   * one overnight stretch logged as ELEVEN separate sleeps instead of one night.
+#
+# So: hold a reading until it has persisted, and only then treat it as real. This trades a
+# little time-to-notify for a signal that is actually true when it arrives.
+
+# Tuned by replaying 10.2 days of the real signal (59,568 simulated 15s polls) through the
+# filter and sweeping the knobs — not picked by feel. Per DAY, alerts land at:
+#
+#              raw (1.3.0)   hold=180   hold=300   hold=420   hold=600
+#   wake/asleep      66.7        23.7       18.3       14.1        10.4
+#
+# 300s is the knee. Below it the sock's twitching leaks through; above it we start delaying
+# real wakes for a shrinking return. At 300s a "she's awake" alert means she has been awake
+# for five continuous minutes — which is what a parent means by awake.
+WAKE_HOLD_SECONDS = 300.0     # awake <-> asleep must persist 5 min to be believed
+WAKE_ALERT_MIN_GAP = 900.0    # >=15 min between wake alerts
+ASLEEP_ALERT_MIN_GAP = 2700.0 # >=45 min between "she's down" notes (the least actionable one)
+
+# Stage notes are DEEP-SLEEP ONLY. Announcing light sleep too costs ~16 extra pushes a day and
+# tells you nothing — light sleep is simply where a newborn spends most of the night. Deep
+# sleep is the one worth knowing ("you have a real window"), and at ~2.7/day it stays a signal.
+STAGE_HOLD_SECONDS = 120.0    # a stage must persist 2 min (deep runs have a ~2 min median)
+STAGE_ALERT_MIN_GAP = 2700.0  # >=45 min between VISIBLE stage notes, per stage
+ALERTING_STAGES = ("deep_sleep",)
+
+
+@dataclass
+class Debounced:
+    """Hysteresis state for one signal. `confirmed` is what we've told the parents; `candidate`
+    is a different reading we're currently timing. Serialized into the relay's config table so
+    it survives restarts (and reseeds silently on a cold start — no alert storm on deploy)."""
+    confirmed: Optional[str] = None
+    candidate: Optional[str] = None
+    since: float = 0.0
+
+    def to_json(self) -> str:
+        return json.dumps({"confirmed": self.confirmed, "candidate": self.candidate,
+                           "since": self.since})
+
+    @classmethod
+    def from_json(cls, raw: Optional[str]) -> "Debounced":
+        """Tolerant of missing/corrupt/legacy values — a bad row must never wedge the poller.
+        A plain (non-JSON) string is read as a legacy bare `confirmed` value, so upgrading from
+        1.3.0's `owlet_stage`/`owlet_sleep_cls` keys doesn't re-announce the current state."""
+        if not raw:
+            return cls()
+        try:
+            d = json.loads(raw)
+            if isinstance(d, dict):
+                return cls(confirmed=d.get("confirmed"), candidate=d.get("candidate"),
+                           since=float(d.get("since") or 0.0))
+            raise ValueError
+        except Exception:
+            return cls(confirmed=raw if isinstance(raw, str) else None)
+
+
+def debounce(state: Debounced, reading: Optional[str], now: float,
+             hold: float) -> tuple[Debounced, Optional[str]]:
+    """Advance a hysteresis filter one tick.
+
+    Returns `(new_state, newly_confirmed)`. `newly_confirmed` is non-None ONLY on the tick where
+    a different reading has held continuously for `hold` seconds — that's the edge worth
+    notifying on. Everything else returns None, so callers can fire unconditionally.
+
+    The very first reading seeds `confirmed` SILENTLY (no notification): on a fresh deploy we
+    adopt whatever is true right now rather than announcing it.
+    """
+    if reading is None:
+        return state, None                       # nothing to say; hold the candidate timer
+    if state.confirmed is None:
+        return Debounced(confirmed=reading), None            # seed silently
+    if reading == state.confirmed:
+        return Debounced(confirmed=reading), None            # back to the known state; reset
+    if reading != state.candidate:
+        return Debounced(state.confirmed, reading, now), None  # a new candidate starts the clock
+    if now - state.since >= hold:
+        return Debounced(confirmed=reading), reading         # held long enough — believe it
+    return state, None                                       # still counting
+
+
+def stage_alert_due(last_alert_ts: dict, stage: str, now: float,
+                    min_gap: float = STAGE_ALERT_MIN_GAP) -> bool:
+    """Should a VISIBLE stage note fire for `stage`? Rate-limited PER STAGE, not from one shared
+    budget — 1.3.0 used a single 10-minute gate across every stage, so a light-sleep ping ate the
+    budget and the deep-sleep ping that followed was DROPPED (not deferred). That is why only 12
+    stage notes went out in 48 hours, and why the one that did arrive described a later
+    transition than the one Taylor had noticed."""
+    previous = last_alert_ts.get(stage)
+    if previous is None:
+        return True                      # never announced this stage — always due
+    return now - float(previous) >= min_gap
