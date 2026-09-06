@@ -574,7 +574,8 @@ class RegisterBody(BaseModel):
     # recorded in the push registry so it can receive APNs. env is tracked PER token.
     parent_id: Optional[str] = None
     device_token: Optional[str] = None
-    push_env: Optional[str] = None            # "prod" | "sandbox"
+    push_env: Optional[str] = Field(default=None, alias="env")   # "prod" | "sandbox"
+    # accept BOTH the field name the app sends ("env") and the canonical "push_env".
     push_to_start_token: Optional[str] = None
     app_version: Optional[str] = None
 

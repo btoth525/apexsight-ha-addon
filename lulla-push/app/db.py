@@ -308,8 +308,11 @@ def upsert_push_device(
                 household=excluded.household,
                 parent_id=excluded.parent_id,
                 env=excluded.env,
-                push_to_start_token=excluded.push_to_start_token,
-                app_version=excluded.app_version,
+                -- COALESCE so a re-registration that arrives WITHOUT a push-to-start token
+                -- (the device-token callback often fires before pushToStartTokenUpdates yields)
+                -- can never wipe a good token to NULL — which silently killed push-to-start.
+                push_to_start_token=COALESCE(excluded.push_to_start_token, push_devices.push_to_start_token),
+                app_version=COALESCE(excluded.app_version, push_devices.app_version),
                 last_seen=excluded.last_seen
             """,
             (device_token, household, parent_id, env, push_to_start_token, app_version, now),
