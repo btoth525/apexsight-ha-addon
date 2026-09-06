@@ -231,3 +231,191 @@ def sessions_from_segments(segments: list[Segment],
         run.append(seg)
     close()
     return sessions
+
+
+# ---- Owlet-matched sessions (the numbers Taylor compares against) ------------------------
+#
+# The debounced segments above are right for the notification-free chart bands, but Owlet's
+# Sleep Summary (Time asleep / Wakings / Awake·Light·Deep) is computed at 1-MINUTE resolution
+# over a whole SOCK SESSION, and that's what the family sees. Reverse-engineered against a real
+# Owlet screenshot (night of 8:26 PM→7:18 AM): matching Owlet needs three things the debounce
+# path got wrong —
+#   1. 1-minute binning (Owlet "updates every minute"), not a 5-minute hold,
+#   2. one session across the whole sock-on period (brief sock-off bridged), not fragmented naps,
+#   3. a waking = a SUSTAINED wake, not every stir.
+# With those, the durations matched to within a minute (deep was exact) and the waking rule below
+# reproduced Owlet's count of 8.
+
+# Sock-off (nosignal) shorter than this is bridged INSIDE a session — a feed/change/adjust, not
+# the end of the night. Longer ends the session. (Owlet bridged the brief gaps in the sample.)
+SESSION_BRIDGE_MINUTES = 15
+# Waking smoothing, calibrated to Owlet's count: a wake registers only after this many continuous
+# awake minutes, and can't register again until this many continuous asleep minutes have passed.
+WAKE_REGISTER_MINUTES = 5
+WAKE_REARM_MINUTES = 10
+# A session is worth showing once it holds at least this much actual sleep.
+MIN_SESSION_ASLEEP_MINUTES = 10
+
+_ASLEEP_STATES = {"light_sleep", "deep_sleep"}
+_NOSIGNAL_STATES = {"", "nosignal", "unavailable", "unknown", "not placed", "none", "off"}
+
+
+def _minute_state(raw: Optional[str]) -> str:
+    """Normalize a stored/HA sleep_state to one of light_sleep|deep_sleep|awake|nosignal."""
+    if raw is None:
+        return "nosignal"
+    s = raw.strip().lower()
+    if s in _ASLEEP_STATES:
+        return s
+    if s in _NOSIGNAL_STATES:
+        return "nosignal"
+    if s == "awake":
+        return "awake"
+    return "awake" if "wake" in s else ("light_sleep" if "sleep" in s else "nosignal")
+
+
+def _fill_minutes(minutes: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Expand a sparse (minute_ts, state) list to a dense per-minute grid, carrying the last state
+    across gaps up to the bridge (feed/change) and marking longer gaps as nosignal."""
+    if not minutes:
+        return []
+    bridge = SESSION_BRIDGE_MINUTES
+    out: list[tuple[int, str]] = []
+    for i, (ts, raw) in enumerate(minutes):
+        state = _minute_state(raw)
+        out.append((ts, state))
+        nxt = minutes[i + 1][0] if i + 1 < len(minutes) else ts + 60
+        missing = int((nxt - ts) // 60) - 1
+        if missing <= 0:
+            continue
+        # A short hole while the sock stays reporting the same non-nosignal state = carry it
+        # (Owlet bridges brief gaps); a long hole = nosignal (sock genuinely off).
+        fill = state if (state != "nosignal" and missing <= bridge) else "nosignal"
+        for k in range(1, missing + 1):
+            out.append((ts + k * 60, fill))
+    return out
+
+
+@dataclass
+class OwletSession:
+    start: float
+    end: float
+    asleep_minutes: int
+    light_minutes: int
+    deep_minutes: int
+    awake_minutes: int
+    wakings: int
+    longest_stretch_minutes: int
+    segments: list[Segment]
+
+    def as_dict(self) -> dict:
+        return {
+            "start": owlet_log.iso_at(self.start),
+            "end": owlet_log.iso_at(self.end),
+            "asleep_seconds": self.asleep_minutes * 60,
+            "light_seconds": self.light_minutes * 60,
+            "deep_seconds": self.deep_minutes * 60,
+            "awake_seconds": self.awake_minutes * 60,
+            "wakings": self.wakings,
+            "longest_stretch_seconds": self.longest_stretch_minutes * 60,
+            "segments": [s.as_dict() for s in self.segments],
+        }
+
+
+def _count_wakings(states: list[str]) -> int:
+    """Owlet-style waking count over one session's per-minute states. A waking is a SUSTAINED
+    awakening between sleep bouts: it registers after WAKE_REGISTER_MINUTES continuous awake, and
+    won't register another until WAKE_REARM_MINUTES continuous asleep have re-armed it. Leading
+    (settling) and trailing (final wake) awake are excluded by only scanning between the first and
+    last asleep minute."""
+    idx = [i for i, s in enumerate(states) if s in _ASLEEP_STATES]
+    if not idx:
+        return 0
+    core = states[idx[0]: idx[-1] + 1]
+    wakings = 0
+    armed = True
+    awake_run = 0
+    asleep_run = 0
+    for s in core:
+        if s == "awake":
+            awake_run += 1
+            asleep_run = 0
+            if armed and awake_run >= WAKE_REGISTER_MINUTES:
+                wakings += 1
+                armed = False
+        elif s in _ASLEEP_STATES:
+            asleep_run += 1
+            awake_run = 0
+            if asleep_run >= WAKE_REARM_MINUTES:
+                armed = True
+        else:  # a bridged nosignal minute — neither confirms nor breaks a wake
+            awake_run = 0
+    return wakings
+
+
+def owlet_sessions(minutes: list[tuple[int, str]]) -> list[OwletSession]:
+    """Build Owlet-matched sessions from a per-minute timeline. One session per sock-on period
+    (brief sock-off bridged); stats at 1-minute resolution to match Owlet's Sleep Summary."""
+    dense = _fill_minutes(minutes)
+    if not dense:
+        return []
+    # Split into sock-on runs separated by a real (unbridged) nosignal stretch.
+    groups: list[list[tuple[int, str]]] = []
+    cur: list[tuple[int, str]] = []
+    nosig_run = 0
+    for ts, s in dense:
+        if s == "nosignal":
+            nosig_run += 1
+            if nosig_run > SESSION_BRIDGE_MINUTES:
+                if cur:
+                    groups.append(cur)
+                    cur = []
+                continue
+        else:
+            nosig_run = 0
+        cur.append((ts, s))
+    if cur:
+        groups.append(cur)
+
+    sessions: list[OwletSession] = []
+    for g in groups:
+        # Trim leading/trailing nosignal but KEEP leading/trailing awake (Owlet's span includes
+        # settling and the final wake).
+        while g and g[0][1] == "nosignal":
+            g.pop(0)
+        while g and g[-1][1] == "nosignal":
+            g.pop()
+        if not g:
+            continue
+        states = [s for _, s in g]
+        if not any(s in _ASLEEP_STATES for s in states):
+            continue
+        light = states.count("light_sleep")
+        deep = states.count("deep_sleep")
+        asleep = light + deep
+        if asleep < MIN_SESSION_ASLEEP_MINUTES:
+            continue
+        awake = states.count("awake")
+        # longest unbroken asleep run (minutes)
+        longest = best = 0
+        for s in states:
+            if s in _ASLEEP_STATES:
+                best += 1
+                longest = max(longest, best)
+            else:
+                best = 0
+        # hypnogram bands = runs of the per-minute state (so the chart shows Owlet's fine detail)
+        segments: list[Segment] = []
+        run_state = states[0]
+        run_start = g[0][0]
+        for (ts, s) in g[1:] + [(g[-1][0] + 60, None)]:
+            if s != run_state:
+                if run_state != "nosignal":
+                    segments.append(Segment(run_state, float(run_start), float(ts)))
+                run_state = s
+                run_start = ts
+        sessions.append(OwletSession(
+            start=float(g[0][0]), end=float(g[-1][0] + 60),
+            asleep_minutes=asleep, light_minutes=light, deep_minutes=deep, awake_minutes=awake,
+            wakings=_count_wakings(states), longest_stretch_minutes=longest, segments=segments))
+    return sessions

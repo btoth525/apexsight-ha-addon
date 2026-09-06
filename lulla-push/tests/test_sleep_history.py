@@ -140,3 +140,79 @@ def test_backfill_extends_the_final_state_to_now():
     segs = sh.segments_from_readings(readings, until=now)
     assert segs, "the final held state must produce a band"
     assert segs[-1].end >= now - 60          # reaches (about) now, not just +15s after the change
+
+
+# ---- Owlet-matched per-minute sessions --------------------------------------------------
+from app.sleep_history import (owlet_sessions, _count_wakings, _minute_state,
+                               WAKE_REGISTER_MINUTES, WAKE_REARM_MINUTES)
+
+
+def _minutes(spec, start=1_788_000_000):
+    """spec: list of (state, count_minutes) -> a per-minute (ts, state) list."""
+    out = []
+    t = start
+    for state, n in spec:
+        for _ in range(n):
+            out.append((t, state)); t += 60
+    return out
+
+
+def test_minute_state_normalizes_vocabulary():
+    assert _minute_state("deep_sleep") == "deep_sleep"
+    assert _minute_state("awake") == "awake"
+    assert _minute_state("unavailable") == "nosignal"
+    assert _minute_state(None) == "nosignal"
+
+
+def test_waking_needs_sustained_awake_not_a_stir():
+    # 30 asleep, 1 awake (a stir), 30 asleep -> NOT a waking (< 5 min awake)
+    states = ["light_sleep"] * 30 + ["awake"] + ["light_sleep"] * 30
+    assert _count_wakings(states) == 0
+    # 30 asleep, 6 awake, 30 asleep -> ONE waking
+    states = ["light_sleep"] * 30 + ["awake"] * 6 + ["light_sleep"] * 30
+    assert _count_wakings(states) == 1
+
+
+def test_waking_does_not_recount_until_rearmed():
+    # sustained wake, brief sleep (< re-arm), sustained wake -> still ONE waking
+    states = (["light_sleep"] * 20 + ["awake"] * 6 + ["light_sleep"] * 3
+              + ["awake"] * 6 + ["light_sleep"] * 20)
+    assert _count_wakings(states) == 1
+    # ...but a full re-arm of sleep between them -> TWO
+    states = (["light_sleep"] * 20 + ["awake"] * 6 + ["light_sleep"] * (WAKE_REARM_MINUTES + 1)
+              + ["awake"] * 6 + ["light_sleep"] * 20)
+    assert _count_wakings(states) == 2
+
+
+def test_leading_and_trailing_awake_are_not_wakings():
+    # settling before sleep + final wake after -> zero wakings
+    states = ["awake"] * 40 + ["light_sleep"] * 60 + ["awake"] * 40
+    assert _count_wakings(states) == 0
+
+
+def test_one_sock_session_spans_brief_sock_off():
+    # asleep, 5-min sock-off (bridged), asleep -> ONE session, not two
+    m = _minutes([("light_sleep", 60), ("nosignal", 5), ("light_sleep", 60)])
+    sess = owlet_sessions(m)
+    assert len(sess) == 1
+    assert sess[0].asleep_minutes == 120
+
+
+def test_long_sock_off_splits_sessions():
+    m = _minutes([("light_sleep", 60), ("nosignal", 30), ("light_sleep", 60)])
+    sess = owlet_sessions(m)
+    assert len(sess) == 2
+
+
+def test_session_stats_are_owlet_shaped():
+    # 20 deep + 60 light + 6 awake(one waking) + 40 light
+    m = _minutes([("deep_sleep", 20), ("light_sleep", 60), ("awake", 6), ("light_sleep", 40)])
+    s = owlet_sessions(m)[0]
+    assert s.deep_minutes == 20
+    assert s.light_minutes == 100
+    assert s.asleep_minutes == 120           # light + deep, excludes awake
+    assert s.awake_minutes == 6
+    assert s.wakings == 1
+    assert s.longest_stretch_minutes == 80   # the 20 deep + 60 light run, before the wake
+    d = s.as_dict()
+    assert d["asleep_seconds"] == 120 * 60 and d["deep_seconds"] == 20 * 60

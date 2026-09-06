@@ -101,6 +101,17 @@ def init() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_sleep_segments_end ON sleep_segments(end_ts);
 
+            -- Per-MINUTE sleep-state timeline. Owlet samples the sock "every minute" and computes
+            -- its Sleep Summary (time asleep, wakings, light/deep/awake) off that cadence, so to
+            -- MATCH the numbers Taylor sees we store and reduce at the same 1-minute resolution —
+            -- not the notification debounce (which deliberately swallows brief wakings and made
+            -- our counts disagree with hers). One row per minute; kept indefinitely (HA's recorder
+            -- is ~10 days, Owlet keeps history forever).
+            CREATE TABLE IF NOT EXISTS sleep_minute (
+                minute_ts INTEGER NOT NULL PRIMARY KEY,   -- epoch floored to the minute
+                state     TEXT NOT NULL                   -- light_sleep|deep_sleep|awake|nosignal
+            );
+
             -- Delivery log for the admin dashboard + the watchdog's undeliverable signal.
             CREATE TABLE IF NOT EXISTS deliveries (
                 ts          REAL NOT NULL,
@@ -354,6 +365,31 @@ def prune_sleep_segments(before_ts: float) -> None:
     unbounded table on a household relay is still a leak."""
     with _conn() as c:
         c.execute("DELETE FROM sleep_segments WHERE end_ts < ?", (before_ts,))
+
+
+def set_sleep_minute(minute_ts: int, state: str) -> None:
+    """Record (or overwrite) the sock's sleep state for one minute. `minute_ts` is epoch floored
+    to the minute so re-polling within a minute just overwrites the same row."""
+    with _conn() as c:
+        c.execute("INSERT INTO sleep_minute(minute_ts, state) VALUES(?,?) "
+                  "ON CONFLICT(minute_ts) DO UPDATE SET state=excluded.state",
+                  (int(minute_ts), state))
+
+
+def sleep_minutes(since_ts: float) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT minute_ts, state FROM sleep_minute WHERE minute_ts >= ? "
+                         "ORDER BY minute_ts", (int(since_ts),)).fetchall()
+
+
+def sleep_minute_count() -> int:
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM sleep_minute").fetchone()[0]
+
+
+def prune_sleep_minutes(before_ts: float) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM sleep_minute WHERE minute_ts < ?", (int(before_ts),))
 
 
 # ---- Live Activity registry -------------------------------------------------

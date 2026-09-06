@@ -65,6 +65,14 @@ async def _backfill_sleep_segments() -> None:
             return          # sock never worn / recorder empty — try again next boot
         for seg in sleep_history.segments_from_readings(readings, until=time.time()):
             db.add_sleep_segment(seg.band, seg.start, seg.end)
+        # Seed the per-minute timeline too (Owlet-matched stats): one row per minute, carrying the
+        # last change forward (HA history is change-only).
+        for i, (ts, state) in enumerate(readings):
+            end = readings[i + 1][0] if i + 1 < len(readings) else time.time()
+            m = int(ts // 60) * 60
+            while m < end:
+                db.set_sleep_minute(m, sleep_history._minute_state(state))
+                m += 60
         db.set_config("owlet_backfill_done", owlet_log.now_iso())
     except Exception:
         pass                # never let a backfill take the relay down
@@ -274,6 +282,11 @@ async def _owlet_sleep_poller() -> None:
             #         alerts and the auto-log, so the chart can never contradict them — an app
             #         that re-derived bands from the raw state would strobe and count ~70
             #         wakings for a night the log correctly calls eight.
+            # Per-MINUTE raw timeline for the Owlet-matched Sleep Summary (separate from the
+            # debounced band below). Store the RAW sock state so 1-minute stats match Owlet.
+            db.set_sleep_minute(int(now_ts // 60) * 60,
+                                sleep_history._minute_state(raw_stage))
+
             band = sleep_history.band_for(cur, stage_state.confirmed)
             # Back-stamp a band boundary caused by a CONFIRMED edge to when the change actually
             # started (now - hold), exactly as the auto sleep-log does — otherwise the chart would
@@ -708,14 +721,13 @@ async def home_sleep_sessions(days: int = 7, household: str = Depends(_household
     """
     days = max(1, min(int(days), 120))
     since = time.time() - days * 86400
-    segments = [sleep_history.Segment(r["band"], r["start_ts"], r["end_ts"])
-                for r in db.sleep_segments(since)]
-    sessions = sleep_history.sessions_from_segments(segments)
+    minutes = [(r["minute_ts"], r["state"]) for r in db.sleep_minutes(since)]
+    sessions = sleep_history.owlet_sessions(minutes)
     sessions.sort(key=lambda s: s.start, reverse=True)
     return {
         "days": days,
         "backfilled": bool(db.get_config("owlet_backfill_done")),
-        "segment_count": len(segments),
+        "minute_count": len(minutes),
         "sessions": [s.as_dict() for s in sessions],
     }
 
