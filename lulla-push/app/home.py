@@ -250,9 +250,13 @@ async def vitals_history(hours: int = 12) -> dict:
     if not wanted:
         return {"connected": True, "hours": hours, "hr": [], "spo2": [], "temp": []}
 
-    start = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    raw = await _get(f"/history/period/{start}"
-                     f"?filter_entity_id={','.join(wanted)}&minimal_response&no_attributes")
+    now_utc = datetime.now(timezone.utc)
+    start = (now_utc - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    # Explicit end_time — see sleep_state_history: the default is start + one day, which would
+    # silently truncate any window longer than 24h.
+    end = now_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    raw = await _get(f"/history/period/{start}?end_time={end}"
+                     f"&filter_entity_id={','.join(wanted)}&minimal_response&no_attributes")
     out: dict[str, list] = {"hr": [], "spo2": [], "temp": []}
     for series in (raw or []):
         if not series:
@@ -286,9 +290,14 @@ async def sleep_state_history(days: int = 10) -> list[tuple[float, str]]:
                    and not _owlet_alert(s.get("entity_id", ""))), None)
     if not entity:
         return []
-    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    raw = await _get(f"/history/period/{start}"
-                     f"?filter_entity_id={entity}&minimal_response&no_attributes")
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    # `end_time` is NOT optional. HA's /history/period defaults it to start + ONE DAY, so asking
+    # for 10 days silently returns the single day that began 10 days ago — the backfill wrote 17
+    # bands instead of 289 and looked like it had worked.
+    end = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    raw = await _get(f"/history/period/{start}?end_time={end}"
+                     f"&filter_entity_id={entity}&minimal_response&no_attributes")
     out: list[tuple[float, str]] = []
     for series in (raw or []):
         for row in series:
