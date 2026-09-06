@@ -205,3 +205,40 @@ def test_only_deep_sleep_is_worth_announcing():
     pushes a day in the replay and told Taylor nothing she couldn't see on the widget."""
     assert "deep_sleep" in ALERTING_STAGES
     assert "light_sleep" not in ALERTING_STAGES
+
+
+# ---- deep-sleep arm helper (transfer window) --------------------------------------------
+# The arm/fire/expire decision is inlined in the poller, but the raw-stage EDGE detection it
+# depends on is `stage_changed`-like: fire only on a FRESH entry into deep sleep, never while
+# already deep. These pin that contract so a refactor of the poller can't silently break it.
+
+from app.owlet_log import deep_arm_decision
+
+
+def test_arm_fires_on_a_fresh_deep_entry():
+    assert deep_arm_decision(armed_until=1000.0, now=500.0, prev_stage="light_sleep",
+                             cur_stage="deep_sleep", sleep_class_confirmed="asleep") == "fire"
+
+
+def test_arm_does_not_refire_while_already_deep():
+    """One shot: being deep for a while must not keep alerting."""
+    assert deep_arm_decision(armed_until=1000.0, now=500.0, prev_stage="deep_sleep",
+                             cur_stage="deep_sleep", sleep_class_confirmed="asleep") == "hold"
+
+
+def test_arm_ignores_a_raw_deep_flicker_around_a_wake():
+    """The raw stage can flick to deep for one poll while she's actually waking; the confirmed
+    class gates it out so a flicker never fires the 'safe to put down' alert."""
+    assert deep_arm_decision(armed_until=1000.0, now=500.0, prev_stage="light_sleep",
+                             cur_stage="deep_sleep", sleep_class_confirmed="awake") == "hold"
+
+
+def test_arm_expires_on_its_own():
+    """A forgotten arm must never ping hours later."""
+    assert deep_arm_decision(armed_until=1000.0, now=1001.0, prev_stage="light_sleep",
+                             cur_stage="deep_sleep", sleep_class_confirmed="asleep") == "expire"
+
+
+def test_unarmed_is_always_a_hold():
+    assert deep_arm_decision(armed_until=0.0, now=500.0, prev_stage="light_sleep",
+                             cur_stage="deep_sleep", sleep_class_confirmed="asleep") == "hold"

@@ -421,7 +421,8 @@ def test_sleep_content_state_matches_the_swift_shape():
     state = _sleep_content_state(sleep_started="2026-09-06T01:55:26Z",
                                  stage_since="2026-09-06T02:10:00Z",
                                  stage="deep_sleep", vitals={"bpm": 129, "spo2": 99})
-    assert set(state) == {"sleepStartedAt", "stageSince", "stageLabel", "bpm", "spo2"}
+    assert set(state) == {"sleepStartedAt", "stageSince", "stageLabel",
+                          "liveStage", "liveStageSince", "bpm", "spo2"}
     assert state["stageLabel"] == "Deep Sleep"        # raw sock vocabulary made readable
     assert state["sleepStartedAt"].endswith("Z")      # Swift decodes with .iso8601
 
@@ -432,5 +433,20 @@ def test_sleep_content_state_end_payload_is_all_nulls_not_missing_keys():
     from app.main import _sleep_content_state
     state = _sleep_content_state(sleep_started="2026-09-06T01:55:26Z",
                                  stage_since="2026-09-06T02:10:00Z", stage=None, vitals={})
-    assert set(state) == {"sleepStartedAt", "stageSince", "stageLabel", "bpm", "spo2"}
+    assert set(state) == {"sleepStartedAt", "stageSince", "stageLabel",
+                          "liveStage", "liveStageSince", "bpm", "spo2"}
     assert state["stageLabel"] is None and state["bpm"] is None and state["spo2"] is None
+    assert state["liveStage"] is None and state["liveStageSince"] is None
+
+
+def test_live_stage_carries_the_raw_transfer_window_fields():
+    """The raw fast-path (transfer window): liveStage flips the instant the sock says deep,
+    while the confirmed stageLabel/stageSince stay put. They must be independent fields."""
+    from app.main import _sleep_content_state
+    state = _sleep_content_state(
+        sleep_started="2026-09-06T01:55:26Z", stage_since="2026-09-06T02:00:00Z",
+        stage="light_sleep", vitals={"bpm": 120}, live_stage="deep_sleep",
+        live_stage_since="2026-09-06T02:12:00Z")
+    assert state["stageLabel"] == "Light Sleep"       # confirmed, stable
+    assert state["liveStage"] == "Deep Sleep"         # raw, instant
+    assert state["liveStageSince"] == "2026-09-06T02:12:00Z"

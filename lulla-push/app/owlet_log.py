@@ -163,6 +163,25 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def deep_arm_decision(*, armed_until: float, now: float, prev_stage: Optional[str],
+                      cur_stage: Optional[str], sleep_class_confirmed: str) -> str:
+    """Pure decision for the one-shot "tell me at deep sleep" alert. Returns:
+      * "fire"   — a fresh deep-sleep entry while armed and confirmed-asleep → alert + disarm,
+      * "expire" — the arm window has passed → clear it,
+      * "hold"   — nothing to do.
+
+    Fires on the EDGE (prev != deep, cur == deep), so being deep for a while can't re-fire, and
+    only while the debounced class says asleep, so a raw flicker around a wake can't trip it.
+    """
+    if armed_until and now > armed_until:
+        return "expire"
+    if (armed_until and now <= armed_until
+            and cur_stage == "deep_sleep" and prev_stage != "deep_sleep"
+            and sleep_class_confirmed == "asleep"):
+        return "fire"
+    return "hold"
+
+
 def iso_at(epoch_seconds: float) -> str:
     """A specific instant in the same wire format. Used to back-stamp a debounced sleep edge to
     when it actually happened, so hysteresis costs us notification latency but never log

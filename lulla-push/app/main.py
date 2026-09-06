@@ -155,31 +155,44 @@ async def _owlet_sleep_poller() -> None:
                 await _push_owlet_refresh(vitals, stage=stage_state.confirmed, sleep_class=cur)
 
             # 3c-ii) The sleep Live Activity — the surface that actually answers "is she in deep
-            #        sleep RIGHT NOW". Pushed, so it costs no WidgetKit refresh budget and can't
-            #        go stale between updates the way a banner or a widget can.
-            #        Started when she's confirmed asleep, updated on every confirmed stage, ended
-            #        when she wakes. The stage clock is stored separately so a vitals-only update
-            #        can't reset "deep sleep for 12 minutes" back to zero.
+            #        sleep RIGHT NOW", which is the whole ask: a mom holding the baby after a feed,
+            #        waiting to know it's safe to put her down. Pushed, so it costs no WidgetKit
+            #        refresh budget and can't go stale between updates.
+            #
+            #        TWO stage signals feed it, on purpose:
+            #          * the CONFIRMED stage (debounced) drives the stable "asleep for 2h" clock
+            #            and the lifecycle (start on asleep, end on wake), and
+            #          * the RAW stage drives the live headline, updated the instant the sock
+            #            changes (~15-30s) rather than after a 2-minute confirm. The raw path only
+            #            runs while she is CONFIRMED asleep, so it can never re-introduce the
+            #            awake<->light flap storm the debounce exists to kill.
+            live_stage = stage_reading                        # raw sleep stage, or None
+            prev_live = db.get_config("owlet_live_stage") or ""
+            if (live_stage or "") != prev_live:
+                db.set_config("owlet_live_stage", live_stage or "")
+                if live_stage:
+                    db.set_config("owlet_live_stage_since", owlet_log.now_iso())
+            live_since = db.get_config("owlet_live_stage_since") or owlet_log.now_iso()
+
+            def _content(stage_confirmed):
+                return _sleep_content_state(
+                    sleep_started=db.get_config("owlet_activity_start") or owlet_log.now_iso(),
+                    stage_since=db.get_config("owlet_activity_stage_since") or owlet_log.now_iso(),
+                    stage=stage_confirmed, vitals=vitals,
+                    live_stage=live_stage,
+                    live_stage_since=live_since if live_stage else None)
+
             if new_cls == "asleep":
                 db.set_config("owlet_activity_start", owlet_log.iso_at(
                     now_ts - owlet_log.WAKE_HOLD_SECONDS))
                 db.set_config("owlet_activity_stage_since", owlet_log.now_iso())
-                await _sleep_activity_start(baby=baby, state=_sleep_content_state(
-                    sleep_started=db.get_config("owlet_activity_start"),
-                    stage_since=db.get_config("owlet_activity_stage_since"),
-                    stage=stage_state.confirmed, vitals=vitals))
+                await _sleep_activity_start(baby=baby, state=_content(stage_state.confirmed))
             elif new_cls == "awake":
-                await _sleep_activity_push("end", _sleep_content_state(
-                    sleep_started=db.get_config("owlet_activity_start") or owlet_log.now_iso(),
-                    stage_since=db.get_config("owlet_activity_stage_since") or owlet_log.now_iso(),
-                    stage=None, vitals=vitals))
+                await _sleep_activity_push("end", _content(None))
             elif new_stage and cur == "asleep":
                 db.set_config("owlet_activity_stage_since", owlet_log.iso_at(
                     now_ts - owlet_log.STAGE_HOLD_SECONDS))
-                await _sleep_activity_push("update", _sleep_content_state(
-                    sleep_started=db.get_config("owlet_activity_start") or owlet_log.now_iso(),
-                    stage_since=db.get_config("owlet_activity_stage_since"),
-                    stage=new_stage, vitals=vitals))
+                await _sleep_activity_push("update", _content(new_stage))
             elif cur == "asleep" and not db.activities_by_kind(OWLET_ACTIVITY_KIND):
                 # SELF-HEAL. The lifecycle above only fires on the falling-asleep EDGE, so a
                 # phone that installs (or reinstalls, or is rebooted) mid-nap would sit with no
@@ -195,10 +208,30 @@ async def _owlet_sleep_poller() -> None:
                                   db.get_config("owlet_activity_start") or owlet_log.now_iso())
                     db.set_config("owlet_activity_stage_since",
                                   db.get_config("owlet_activity_stage_since") or owlet_log.now_iso())
-                    await _sleep_activity_start(baby=baby, state=_sleep_content_state(
-                        sleep_started=db.get_config("owlet_activity_start"),
-                        stage_since=db.get_config("owlet_activity_stage_since"),
-                        stage=stage_state.confirmed, vitals=vitals))
+                    await _sleep_activity_start(baby=baby, state=_content(stage_state.confirmed))
+            elif ((live_stage or "") != prev_live and cur == "asleep"
+                  and db.activities_by_kind(OWLET_ACTIVITY_KIND)):
+                # RAW fast path. The confirmed-stage branch above didn't fire (no confirmed
+                # change this tick), but the raw stage moved — push it so the Live Activity
+                # headline flips to "Deep sleep" within a poll, not after a 2-minute confirm.
+                # No extra rate limit: the 15s poll IS the floor, and a running activity is a
+                # liveactivity push (not an iOS-budgeted background push), so per-poll is fine.
+                await _sleep_activity_push("update", _content(stage_state.confirmed))
+
+            # 3c-ii-arm) One-shot "tell me the moment she's in deep sleep" — the transfer-window
+            #            alert Owlet has no equivalent of. Fires on the RAW deep entry (waiting for
+            #            a confirm would defeat the point), pierces Focus (time-sensitive: this is
+            #            the one alert where that's unambiguously right), disarms after one shot,
+            #            and self-expires so a forgotten arm can't ping at 4am.
+            arm_until = float(db.get_config("owlet_deep_arm_until") or 0)
+            decision = owlet_log.deep_arm_decision(
+                armed_until=arm_until, now=now_ts, prev_stage=(prev_live or None),
+                cur_stage=live_stage, sleep_class_confirmed=cur)
+            if decision == "fire":
+                db.set_config("owlet_deep_arm_until", "")     # one shot
+                await _push_deep_sleep_reached(baby)
+            elif decision == "expire":
+                db.set_config("owlet_deep_arm_until", "")
 
             # 3c-iii) Record the hypnogram band. Written off the SAME confirmed signals as the
             #         alerts and the auto-log, so the chart can never contradict them — an app
@@ -254,16 +287,32 @@ async def _push_wake_state(awake: bool, baby: str) -> None:
 
 OWLET_ACTIVITY_KIND = "owletSleep"
 
+# How long a one-shot "tell me at deep sleep" arm stays live before it self-expires. Long
+# enough to cover settling after a feed, short enough that a forgotten arm never pings overnight.
+DEEP_ARM_WINDOW_SECONDS = 3600.0
+
 
 def _sleep_content_state(*, sleep_started: str, stage_since: str, stage: Optional[str],
-                         vitals: dict) -> dict:
+                         vitals: dict, live_stage: Optional[str] = None,
+                         live_stage_since: Optional[str] = None) -> dict:
     """The Live Activity's `content-state`. Must round-trip EXACTLY with Swift's
     `OwletSleepContentState` — same keys, same types, ISO-8601 dates (the app's decoder uses
-    `.iso8601`). Getting this wrong doesn't error; the activity just silently stops updating."""
+    `.iso8601`). Getting this wrong doesn't error; the activity just silently stops updating.
+
+    Two stage pairs, on purpose (this is the transfer-window feature):
+      * `stageLabel`/`stageSince` — the CONFIRMED stage (debounced). Stable; never resets on a
+        flicker. Kept for anything that wants a trustworthy stage.
+      * `liveStage`/`liveStageSince` — the RAW stage, straight off the sock. This is what a mom
+        holding the baby after a feed is staring at: it flips to "Deep sleep" the instant the sock
+        says so, ~15-30s, not after a 2-minute confirm. The app shows this as the live headline
+        and the confirmed pair for the trustworthy duration. Defaults to the confirmed values so
+        an older relay payload still renders."""
     return {
         "sleepStartedAt": sleep_started,
         "stageSince": stage_since,
         "stageLabel": owlet_log.stage_label(stage) if stage else None,
+        "liveStage": owlet_log.stage_label(live_stage) if live_stage else None,
+        "liveStageSince": live_stage_since,
         "bpm": vitals.get("bpm"),
         "spo2": vitals.get("spo2"),
     }
@@ -335,6 +384,21 @@ async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
                                 payload, push_type="background", collapse_id="owlet-refresh")
         except Exception:
             pass   # a silent nudge is best-effort by definition
+
+
+async def _push_deep_sleep_reached(baby: str) -> None:
+    """She just reached deep sleep and a parent armed the one-shot alert — "safe to put her
+    down". Time-sensitive so it pierces Sleep Focus; this is the rare case where waking the phone
+    is exactly what was asked for."""
+    try:
+        await push(PushEventBody(
+            event="owlet.deep_reached", household=config.PAIRING_CODE,
+            title=f"\U0001F634 {baby} is in deep sleep",
+            body="Good window to put her down.",
+            interruption_level="time-sensitive", collapse_id="owlet-deep-reached",
+        ))
+    except Exception:
+        pass
 
 
 async def _push_sleep_stage(state: str, baby: str) -> None:
@@ -604,6 +668,27 @@ async def home_sleep_sessions(days: int = 7, household: str = Depends(_household
         "segment_count": len(segments),
         "sessions": [s.as_dict() for s in sessions],
     }
+
+
+@app.post("/v1/home/sleep/arm-deep")
+async def arm_deep_sleep(household: str = Depends(_household)):
+    """Arm the one-shot "tell me when she's in deep sleep" alert. Auto-expires so a forgotten arm
+    can't fire hours later; if she's ALREADY in deep sleep the poller catches it on the next
+    tick only if it's a fresh entry, so arming during deep sleep waits for the next entry (which
+    is the honest behaviour — you want to know when she GOES deep, not that she is)."""
+    import time as _time
+    until = _time.time() + DEEP_ARM_WINDOW_SECONDS
+    db.set_config("owlet_deep_arm_until", str(until))
+    return {"armed": True, "expires_in_seconds": DEEP_ARM_WINDOW_SECONDS}
+
+
+@app.get("/v1/home/sleep/arm-deep")
+async def deep_arm_status(household: str = Depends(_household)):
+    """Whether the one-shot deep-sleep alert is currently armed (for the app's button state)."""
+    import time as _time
+    until = float(db.get_config("owlet_deep_arm_until") or 0)
+    armed = bool(until and _time.time() <= until)
+    return {"armed": armed, "expires_at": until if armed else None}
 
 
 @app.post("/v1/home/toggle")
