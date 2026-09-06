@@ -225,7 +225,13 @@ async def _owlet_sleep_poller() -> None:
                 db.set_config("owlet_activity_start", owlet_log.iso_at(
                     now_ts - owlet_log.WAKE_HOLD_SECONDS))
                 db.set_config("owlet_activity_stage_since", owlet_log.now_iso())
-                await _sleep_activity_start(baby=baby, state=_content(stage_state.confirmed))
+                # Only push-to-start if the APP hasn't already started (and registered) one. The
+                # app local-starts the card whenever it's open and she's asleep; a relay start on
+                # top of that would stack a duplicate card on the Lock Screen. This covers the
+                # app-suspended case; the app covers the app-open case. Both use the CONFIRMED
+                # class, so they never disagree.
+                if not db.activities_by_kind(OWLET_ACTIVITY_KIND):
+                    await _sleep_activity_start(baby=baby, state=_content(stage_state.confirmed))
             elif new_cls in ("awake", "nosignal"):
                 # End on wake OR sock-off. The old code ended only on "awake", so removing the
                 # sock (nosignal) left an orphaned card counting up forever while the sleep log
@@ -737,8 +743,20 @@ class ToggleBody(BaseModel):
 async def home_state(household: str = Depends(_household)):
     """Owlet vitals + the nursery strip, auto-discovered by entity name. `connected` tells
     the app whether this add-on could reach Home Assistant's own API at all — independent
-    of whether any matching entities exist yet."""
-    return await home.state()
+    of whether any matching entities exist yet.
+
+    Also carries the CONFIRMED (debounced) sleep state — the SAME signal that drives the
+    notifications, the auto-log, the hypnogram, and the Live Activity lifecycle. The app uses
+    this for every awake/asleep status word (Today hero, Owlet card, Sleep card, Live Activity)
+    so no two surfaces can ever contradict each other. The raw `vitals.sleep_state` is still
+    returned for the instant transfer-window ("she just hit deep sleep") only.
+    """
+    st = await home.state()
+    cls = owlet_log.Debounced.from_json(db.get_config("owlet_sleep_cls")).confirmed
+    stage = owlet_log.Debounced.from_json(db.get_config("owlet_stage")).confirmed
+    st["sleep_class"] = cls                # "awake" | "asleep" | "nosignal" | None
+    st["stage_confirmed"] = stage          # "light_sleep" | "deep_sleep" | None
+    return st
 
 
 @app.get("/v1/home/sleep/sessions")
