@@ -421,6 +421,31 @@ async def _sleep_activity_push(event: str, state: dict) -> None:
             db.delete_activity(act["activity_id"])
 
 
+def _current_sleep_summary(max_bands: int = 160) -> Optional[dict]:
+    """The newest Owlet-matched session as a COMPACT dict for the home-screen Sleep widget:
+    totals + downsampled barcode bands (kind 0=deep,1=light,2=awake; start/end seconds from the
+    session start). Returns None when there's no session yet."""
+    minutes = [(r["minute_ts"], r["state"]) for r in db.sleep_minutes(time.time() - 2 * 86400)]
+    sessions = sleep_history.owlet_sessions(minutes)
+    if not sessions:
+        return None
+    ss = max(sessions, key=lambda x: x.start)
+    bands = ss.segments
+    step = max(1, len(bands) // max_bands)
+    ROW = {"deep_sleep": 0, "light_sleep": 1, "awake": 2}
+    compact = [{"kind": ROW.get(b.band, 2),
+                "start": round(b.start - ss.start), "end": round(b.end - ss.start)}
+               for b in bands[::step]]
+    return {
+        "start": owlet_log.iso_at(ss.start), "end": owlet_log.iso_at(ss.end),
+        "asleep_seconds": ss.asleep_minutes * 60, "awake_seconds": ss.awake_minutes * 60,
+        "light_seconds": ss.light_minutes * 60, "deep_seconds": ss.deep_minutes * 60,
+        "wakings": ss.wakings,
+        "in_progress": (time.time() - ss.end) < 900,     # still her current sleep
+        "bands": compact,
+    }
+
+
 async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
                               sleep_class: str) -> None:
     """A silent (content-available) nudge carrying the current reading, so both phones can stamp
@@ -432,7 +457,7 @@ async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
     client = apns.get_client()
     if not client.is_configured():
         return
-    payload = apns.build_background_payload(data={
+    data = {
         "event": "owlet.refresh",
         "owlet": {
             "bpm": vitals.get("bpm"), "spo2": vitals.get("spo2"),
@@ -440,7 +465,11 @@ async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
             "sleep_state": stage, "sleep_class": sleep_class,
             "read_at": owlet_log.now_iso(),
         },
-    })
+    }
+    summary = _current_sleep_summary()
+    if summary:
+        data["sleep"] = summary       # the home-screen Sleep widget, refreshed in the background
+    payload = apns.build_background_payload(data=data)
     for dev in db.push_devices(config.PAIRING_CODE):
         try:
             await _send_and_log(client, "owlet.refresh", dev["device_token"], dev["env"],
