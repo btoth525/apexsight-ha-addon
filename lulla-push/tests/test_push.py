@@ -408,3 +408,29 @@ def test_monitoring_status_accessor(env):
     assert body["status"] == "green"
     assert body["healthy"] is True
     assert body["last_heartbeat"] is not None
+
+
+# ---- sleep Live Activity content-state --------------------------------------------------
+# CLAUDE.md non-negotiable: the content-state must round-trip the Swift ContentState EXACTLY.
+# A mismatch throws nowhere visible — the Lock Screen card just silently stops updating. The
+# Swift side asserts the same shape in LullaDataTests/OwletSleepContentStateTests.swift; these
+# two tests are a matched pair and must be changed together.
+
+def test_sleep_content_state_matches_the_swift_shape():
+    from app.main import _sleep_content_state
+    state = _sleep_content_state(sleep_started="2026-09-06T01:55:26Z",
+                                 stage_since="2026-09-06T02:10:00Z",
+                                 stage="deep_sleep", vitals={"bpm": 129, "spo2": 99})
+    assert set(state) == {"sleepStartedAt", "stageSince", "stageLabel", "bpm", "spo2"}
+    assert state["stageLabel"] == "Deep Sleep"        # raw sock vocabulary made readable
+    assert state["sleepStartedAt"].endswith("Z")      # Swift decodes with .iso8601
+
+
+def test_sleep_content_state_end_payload_is_all_nulls_not_missing_keys():
+    """Swift's synthesized decoder tolerates an explicit null for an Optional, but a MISSING key
+    would break a non-optional if this struct ever gains one. Keep every key present."""
+    from app.main import _sleep_content_state
+    state = _sleep_content_state(sleep_started="2026-09-06T01:55:26Z",
+                                 stage_since="2026-09-06T02:10:00Z", stage=None, vitals={})
+    assert set(state) == {"sleepStartedAt", "stageSince", "stageLabel", "bpm", "spo2"}
+    assert state["stageLabel"] is None and state["bpm"] is None and state["spo2"] is None

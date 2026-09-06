@@ -132,6 +132,33 @@ async def _owlet_sleep_poller() -> None:
             if new_stage or new_cls:
                 await _push_owlet_refresh(vitals, stage=stage_state.confirmed, sleep_class=cur)
 
+            # 3c-ii) The sleep Live Activity — the surface that actually answers "is she in deep
+            #        sleep RIGHT NOW". Pushed, so it costs no WidgetKit refresh budget and can't
+            #        go stale between updates the way a banner or a widget can.
+            #        Started when she's confirmed asleep, updated on every confirmed stage, ended
+            #        when she wakes. The stage clock is stored separately so a vitals-only update
+            #        can't reset "deep sleep for 12 minutes" back to zero.
+            if new_cls == "asleep":
+                db.set_config("owlet_activity_start", owlet_log.iso_at(
+                    now_ts - owlet_log.WAKE_HOLD_SECONDS))
+                db.set_config("owlet_activity_stage_since", owlet_log.now_iso())
+                await _sleep_activity_start(baby=baby, state=_sleep_content_state(
+                    sleep_started=db.get_config("owlet_activity_start"),
+                    stage_since=db.get_config("owlet_activity_stage_since"),
+                    stage=stage_state.confirmed, vitals=vitals))
+            elif new_cls == "awake":
+                await _sleep_activity_push("end", _sleep_content_state(
+                    sleep_started=db.get_config("owlet_activity_start") or owlet_log.now_iso(),
+                    stage_since=db.get_config("owlet_activity_stage_since") or owlet_log.now_iso(),
+                    stage=None, vitals=vitals))
+            elif new_stage and cur == "asleep":
+                db.set_config("owlet_activity_stage_since", owlet_log.iso_at(
+                    now_ts - owlet_log.STAGE_HOLD_SECONDS))
+                await _sleep_activity_push("update", _sleep_content_state(
+                    sleep_started=db.get_config("owlet_activity_start") or owlet_log.now_iso(),
+                    stage_since=db.get_config("owlet_activity_stage_since"),
+                    stage=new_stage, vitals=vitals))
+
             # 3d) Auto-log sleep off the CONFIRMED class. The edge is back-stamped to when the
             #     change actually started (now - hold) rather than when we believed it, so a
             #     debounced log still records the true times.
@@ -165,6 +192,63 @@ async def _push_wake_state(awake: bool, baby: str) -> None:
         ))
     except Exception:
         pass
+
+
+OWLET_ACTIVITY_KIND = "owletSleep"
+
+
+def _sleep_content_state(*, sleep_started: str, stage_since: str, stage: Optional[str],
+                         vitals: dict) -> dict:
+    """The Live Activity's `content-state`. Must round-trip EXACTLY with Swift's
+    `OwletSleepContentState` — same keys, same types, ISO-8601 dates (the app's decoder uses
+    `.iso8601`). Getting this wrong doesn't error; the activity just silently stops updating."""
+    return {
+        "sleepStartedAt": sleep_started,
+        "stageSince": stage_since,
+        "stageLabel": owlet_log.stage_label(stage) if stage else None,
+        "bpm": vitals.get("bpm"),
+        "spo2": vitals.get("spo2"),
+    }
+
+
+async def _sleep_activity_start(*, baby: str, state: dict) -> None:
+    """Push-to-start the sleep Live Activity on both phones. Needs a push-to-start token, which
+    the app registers once it observes one; devices without one are simply skipped."""
+    client = apns.get_client()
+    if not client.is_configured():
+        return
+    payload = apns.build_liveactivity_payload(
+        event="start", content_state=state,
+        attributes_type="OwletSleepAttributes", attributes={"childName": baby},
+    )
+    for dev in db.push_devices(config.PAIRING_CODE):
+        if not dev["push_to_start_token"]:
+            continue
+        try:
+            await _send_and_log(client, "activity.start", dev["push_to_start_token"],
+                                dev["env"], payload, push_type="liveactivity")
+        except Exception:
+            pass
+
+
+async def _sleep_activity_push(event: str, state: dict) -> None:
+    """Update (or end) every running sleep activity. On `end` the registry row goes too, so a
+    stale token can't keep a dead activity alive on the Lock Screen."""
+    client = apns.get_client()
+    if not client.is_configured():
+        return
+    acts = db.activities_by_kind(OWLET_ACTIVITY_KIND)
+    if not acts:
+        return
+    payload = apns.build_liveactivity_payload(event=event, content_state=state)
+    for act in acts:
+        try:
+            await _send_and_log(client, f"activity.{event}", act["push_token"], act["env"],
+                                payload, push_type="liveactivity")
+        except Exception:
+            pass
+        if event == "end":
+            db.delete_activity(act["activity_id"])
 
 
 async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],

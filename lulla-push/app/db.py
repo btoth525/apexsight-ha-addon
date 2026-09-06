@@ -343,6 +343,13 @@ def activities_for(activity_id: str = "", child_id: str = "") -> list[sqlite3.Ro
         return []
 
 
+def activities_by_kind(kind: str) -> list[sqlite3.Row]:
+    """Every live activity of one kind. The Owlet sleep activity isn't tied to a child row (it's
+    the sock's session, and the household has one baby), so the poller finds it by kind."""
+    with _conn() as c:
+        return c.execute("SELECT * FROM activities WHERE kind=?", (kind,)).fetchall()
+
+
 def delete_activity(activity_id: str) -> None:
     with _conn() as c:
         c.execute("DELETE FROM activities WHERE activity_id=?", (activity_id,))
