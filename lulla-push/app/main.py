@@ -21,7 +21,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from . import apns, config, db, home, owlet_log, routing, security
+from . import apns, config, db, home, owlet_log, routing, security, sleep_history
 
 app = FastAPI(title="Lulla Push + Sync Relay", docs_url=None, redoc_url=None)
 
@@ -46,6 +46,28 @@ async def _startup() -> None:
     # shared entry). Only when we actually have HA access; wrapped so it can never crash the app.
     if home.SUPERVISOR_TOKEN:
         asyncio.create_task(_owlet_sleep_poller())
+        asyncio.create_task(_backfill_sleep_segments())
+
+
+async def _backfill_sleep_segments() -> None:
+    """Seed the hypnogram ONCE from HA's recorder so it doesn't launch empty.
+
+    The recorder holds ~10 days; from here on the poller writes bands as they close and we keep
+    them indefinitely (Owlet keeps session history forever — a chart that goes blank a fortnight
+    back would be a step DOWN from what Taylor has today). Replayed through the same debounce the
+    poller uses, so backfilled days are shaped identically to live ones — a seam there would show
+    up as the chart changing character ten days back."""
+    if db.get_config("owlet_backfill_done"):
+        return
+    try:
+        readings = await home.sleep_state_history(days=10)
+        if not readings:
+            return          # sock never worn / recorder empty — try again next boot
+        for seg in sleep_history.segments_from_readings(readings):
+            db.add_sleep_segment(seg.band, seg.start, seg.end)
+        db.set_config("owlet_backfill_done", owlet_log.now_iso())
+    except Exception:
+        pass                # never let a backfill take the relay down
 
 
 # Poll fast enough that "she just woke up" reaches a parent in seconds, not a minute. The HA
@@ -158,6 +180,42 @@ async def _owlet_sleep_poller() -> None:
                     sleep_started=db.get_config("owlet_activity_start") or owlet_log.now_iso(),
                     stage_since=db.get_config("owlet_activity_stage_since"),
                     stage=new_stage, vitals=vitals))
+            elif cur == "asleep" and not db.activities_by_kind(OWLET_ACTIVITY_KIND):
+                # SELF-HEAL. The lifecycle above only fires on the falling-asleep EDGE, so a
+                # phone that installs (or reinstalls, or is rebooted) mid-nap would sit with no
+                # card until the next time she went down — "I installed it and nothing happened".
+                # If she's asleep and nothing is running, open one.
+                #
+                # Rate-limited because the loop can't tell "no phone has a push-to-start token"
+                # from "the start push hasn't been answered yet": without the guard, a phone that
+                # never registers back would make us fire a start every 15 seconds forever.
+                if now_ts - float(db.get_config("owlet_activity_retry_ts") or 0) >= 600:
+                    db.set_config("owlet_activity_retry_ts", str(now_ts))
+                    db.set_config("owlet_activity_start",
+                                  db.get_config("owlet_activity_start") or owlet_log.now_iso())
+                    db.set_config("owlet_activity_stage_since",
+                                  db.get_config("owlet_activity_stage_since") or owlet_log.now_iso())
+                    await _sleep_activity_start(baby=baby, state=_sleep_content_state(
+                        sleep_started=db.get_config("owlet_activity_start"),
+                        stage_since=db.get_config("owlet_activity_stage_since"),
+                        stage=stage_state.confirmed, vitals=vitals))
+
+            # 3c-iii) Record the hypnogram band. Written off the SAME confirmed signals as the
+            #         alerts and the auto-log, so the chart can never contradict them — an app
+            #         that re-derived bands from the raw state would strobe and count ~70
+            #         wakings for a night the log correctly calls eight.
+            band = sleep_history.band_for(cur, stage_state.confirmed)
+            open_band = db.get_config("owlet_band")
+            open_band_start = float(db.get_config("owlet_band_start") or 0)
+            if band != open_band:
+                if open_band and open_band_start:
+                    db.add_sleep_segment(open_band, open_band_start, now_ts)
+                db.set_config("owlet_band", band or "")
+                db.set_config("owlet_band_start", str(now_ts) if band else "")
+            elif band and open_band_start:
+                # Keep the OPEN band's end fresh so a chart drawn mid-nap reaches "now" instead
+                # of stopping at the last transition.
+                db.add_sleep_segment(band, open_band_start, now_ts)
 
             # 3d) Auto-log sleep off the CONFIRMED class. The edge is back-stamped to when the
             #     change actually started (now - hold) rather than when we believed it, so a
@@ -524,6 +582,28 @@ async def home_state(household: str = Depends(_household)):
     the app whether this add-on could reach Home Assistant's own API at all — independent
     of whether any matching entities exist yet."""
     return await home.state()
+
+
+@app.get("/v1/home/sleep/sessions")
+async def home_sleep_sessions(days: int = 7, household: str = Depends(_household)):
+    """Sleep sessions + their hypnogram bands, newest first — everything the app needs to draw
+    the chart and the session card without re-deriving anything.
+
+    A "session" is what a parent means by one sleep: brief wakings stay INSIDE it and are
+    counted, the way Owlet defines a waking, rather than being split into separate naps.
+    """
+    days = max(1, min(int(days), 120))
+    since = time.time() - days * 86400
+    segments = [sleep_history.Segment(r["band"], r["start_ts"], r["end_ts"])
+                for r in db.sleep_segments(since)]
+    sessions = sleep_history.sessions_from_segments(segments)
+    sessions.sort(key=lambda s: s.start, reverse=True)
+    return {
+        "days": days,
+        "backfilled": bool(db.get_config("owlet_backfill_done")),
+        "segment_count": len(segments),
+        "sessions": [s.as_dict() for s in sessions],
+    }
 
 
 @app.post("/v1/home/toggle")

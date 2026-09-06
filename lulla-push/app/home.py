@@ -274,6 +274,37 @@ async def vitals_history(hours: int = 12) -> dict:
     return {"connected": True, "hours": hours, **out}
 
 
+async def sleep_state_history(days: int = 10) -> list[tuple[float, str]]:
+    """Raw `(epoch, sleep_state)` samples from HA's recorder, oldest first — the input for the
+    one-time hypnogram backfill. The recorder keeps ~10 days, which is exactly why the relay
+    stores its own segments from then on rather than reading this every time."""
+    states = await _get("/states")
+    if states is None:
+        return []
+    entity = next((s.get("entity_id") for s in states
+                   if _owlet_role(s.get("entity_id", "")) == "sleep_state"
+                   and not _owlet_alert(s.get("entity_id", ""))), None)
+    if not entity:
+        return []
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    raw = await _get(f"/history/period/{start}"
+                     f"?filter_entity_id={entity}&minimal_response&no_attributes")
+    out: list[tuple[float, str]] = []
+    for series in (raw or []):
+        for row in series:
+            when = row.get("last_changed") or row.get("last_updated")
+            state = row.get("state")
+            if not when or state is None:
+                continue
+            try:
+                ts = datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                continue
+            out.append((ts, state))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
 async def toggle(entity_id: str) -> bool:
     domain = entity_id.split(".", 1)[0] if "." in entity_id else "homeassistant"
     return await _post(f"/services/{domain}/toggle", {"entity_id": entity_id})

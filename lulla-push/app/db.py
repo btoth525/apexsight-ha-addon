@@ -91,6 +91,16 @@ def init() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_activities_child ON activities(child_id);
 
+            -- Sleep-stage bands behind the hypnogram. HA's recorder keeps ~10 days; Owlet keeps
+            -- session history forever, so we keep our own. Written as each band CLOSES, off the
+            -- debounced signal, so the chart can never contradict the sleep log.
+            CREATE TABLE IF NOT EXISTS sleep_segments (
+                start_ts REAL NOT NULL PRIMARY KEY,
+                end_ts   REAL NOT NULL,
+                band     TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sleep_segments_end ON sleep_segments(end_ts);
+
             -- Delivery log for the admin dashboard + the watchdog's undeliverable signal.
             CREATE TABLE IF NOT EXISTS deliveries (
                 ts          REAL NOT NULL,
@@ -308,6 +318,42 @@ def delete_push_device(device_token: str) -> None:
     """Prune a token APNs reported as 410 Gone / dead."""
     with _conn() as c:
         c.execute("DELETE FROM push_devices WHERE device_token=?", (device_token,))
+
+
+# ---- Sleep segments (hypnogram) ---------------------------------------------
+
+def add_sleep_segment(band: str, start_ts: float, end_ts: float) -> None:
+    """Record one closed band. Keyed on `start_ts` so replaying a tick (or re-running the
+    backfill) overwrites rather than duplicating — the same idempotence the auto-logged sleep
+    events get from their deterministic uuid5."""
+    if end_ts <= start_ts or not band:
+        return
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO sleep_segments(start_ts, end_ts, band) VALUES(?,?,?)
+               ON CONFLICT(start_ts) DO UPDATE SET end_ts=excluded.end_ts, band=excluded.band""",
+            (start_ts, end_ts, band),
+        )
+
+
+def sleep_segments(since_ts: float) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT band, start_ts, end_ts FROM sleep_segments WHERE end_ts >= ? ORDER BY start_ts",
+            (since_ts,),
+        ).fetchall()
+
+
+def sleep_segment_count() -> int:
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM sleep_segments").fetchone()[0]
+
+
+def prune_sleep_segments(before_ts: float) -> None:
+    """Keep the history bounded. A year of bands is a few thousand rows — nothing — but an
+    unbounded table on a household relay is still a leak."""
+    with _conn() as c:
+        c.execute("DELETE FROM sleep_segments WHERE end_ts < ?", (before_ts,))
 
 
 # ---- Live Activity registry -------------------------------------------------
