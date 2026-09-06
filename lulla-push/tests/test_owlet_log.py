@@ -226,11 +226,18 @@ def test_arm_does_not_refire_while_already_deep():
                              cur_stage="deep_sleep", sleep_class_confirmed="asleep") == "hold"
 
 
-def test_arm_ignores_a_raw_deep_flicker_around_a_wake():
-    """The raw stage can flick to deep for one poll while she's actually waking; the confirmed
-    class gates it out so a flicker never fires the 'safe to put down' alert."""
+def test_arm_fires_during_the_post_feed_settle_even_though_class_is_still_awake():
+    """THE use case: mom holds the baby after a feed (sock reads awake, so the confirmed class is
+    still 'awake' for up to WAKE_HOLD), puts her down, the raw stage reaches deep. The alert must
+    fire on that deep edge — gating on confirmed-asleep would drop exactly this entry."""
     assert deep_arm_decision(armed_until=1000.0, now=500.0, prev_stage="light_sleep",
-                             cur_stage="deep_sleep", sleep_class_confirmed="awake") == "hold"
+                             cur_stage="deep_sleep", sleep_class_confirmed="awake") == "fire"
+
+
+def test_arm_never_fires_when_the_sock_is_off():
+    """No signal → no real deep reading → never fire (the only gate we keep)."""
+    assert deep_arm_decision(armed_until=1000.0, now=500.0, prev_stage="light_sleep",
+                             cur_stage="deep_sleep", sleep_class_confirmed="nosignal") == "hold"
 
 
 def test_arm_expires_on_its_own():

@@ -83,7 +83,8 @@ POLL_SECONDS = 15.0
 
 
 def _on_poll_grid(readings: list[tuple[float, Optional[str]]],
-                  poll_seconds: float = POLL_SECONDS) -> Iterable[tuple[float, Optional[str]]]:
+                  poll_seconds: float = POLL_SECONDS,
+                  until: Optional[float] = None) -> Iterable[tuple[float, Optional[str]]]:
     """Expand HA's change-only history into the regular sample stream the live poller sees.
 
     This is load-bearing, and getting it wrong is silent. HA's recorder stores a row only when a
@@ -93,7 +94,13 @@ def _on_poll_grid(readings: list[tuple[float, Optional[str]]],
     22-hour "sleep" with zero wakings. (It did, before this existed.)
     """
     for i, (ts, state) in enumerate(readings):
-        end = readings[i + 1][0] if i + 1 < len(readings) else ts + poll_seconds
+        # HA's history is change-only: the LAST row is the current state, held until "now". Expand
+        # it up to `until` (not just one sample) so the backfill reaches the present and connects
+        # to the session the live poller is currently extending, instead of leaving a gap.
+        if i + 1 < len(readings):
+            end = readings[i + 1][0]
+        else:
+            end = max(until, ts + poll_seconds) if until else ts + poll_seconds
         t = ts
         while t < end:
             yield t, state
@@ -103,7 +110,8 @@ def _on_poll_grid(readings: list[tuple[float, Optional[str]]],
 def segments_from_readings(readings: Iterable[tuple[float, Optional[str]]],
                            *, wake_hold: float = owlet_log.WAKE_HOLD_SECONDS,
                            stage_hold: float = owlet_log.STAGE_HOLD_SECONDS,
-                           already_gridded: bool = False) -> list[Segment]:
+                           already_gridded: bool = False,
+                           until: Optional[float] = None) -> list[Segment]:
     """Replay raw `(timestamp, sleep_state)` samples through the SAME debounce the live poller
     uses, and return closed bands.
 
@@ -115,7 +123,7 @@ def segments_from_readings(readings: Iterable[tuple[float, Optional[str]]],
     rows = list(readings)
     if not rows:
         return []
-    stream = rows if already_gridded else list(_on_poll_grid(rows))
+    stream = rows if already_gridded else list(_on_poll_grid(rows, until=until))
 
     cls_state = owlet_log.Debounced()
     stage_state = owlet_log.Debounced()

@@ -166,18 +166,27 @@ def now_iso() -> str:
 def deep_arm_decision(*, armed_until: float, now: float, prev_stage: Optional[str],
                       cur_stage: Optional[str], sleep_class_confirmed: str) -> str:
     """Pure decision for the one-shot "tell me at deep sleep" alert. Returns:
-      * "fire"   — a fresh deep-sleep entry while armed and confirmed-asleep → alert + disarm,
+      * "fire"   — a fresh deep-sleep entry while armed and the sock is reporting → alert + disarm,
       * "expire" — the arm window has passed → clear it,
       * "hold"   — nothing to do.
 
-    Fires on the EDGE (prev != deep, cur == deep), so being deep for a while can't re-fire, and
-    only while the debounced class says asleep, so a raw flicker around a wake can't trip it.
+    Fires on the EDGE (prev != deep, cur == deep), so being deep for a while can't re-fire.
+
+    It is gated on the sock REPORTING (not "nosignal"), NOT on the confirmed-asleep class — and
+    that distinction is the whole feature. The use case is a mom holding the baby after a feed:
+    the sock reads awake/settling, so the CONFIRMED class is still "awake" and needs a full
+    WAKE_HOLD (5 min) to flip. She puts the baby down and the raw stage reaches deep within a
+    couple of minutes — while the class is still confirmed-awake. Gating on confirmed-asleep
+    (as the first cut did) would drop exactly that entry and only fire on the NEXT deep re-entry
+    minutes later, defeating the point. A raw deep reading is trustworthy on its own: the sock's
+    own algorithm doesn't report deep from a one-poll flicker, it requires sustained sleep. So we
+    trust the deep edge and only require that the sock is actually on her (has signal).
     """
     if armed_until and now > armed_until:
         return "expire"
     if (armed_until and now <= armed_until
             and cur_stage == "deep_sleep" and prev_stage != "deep_sleep"
-            and sleep_class_confirmed == "asleep"):
+            and sleep_class_confirmed != "nosignal"):
         return "fire"
     return "hold"
 

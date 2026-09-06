@@ -63,7 +63,7 @@ async def _backfill_sleep_segments() -> None:
         readings = await home.sleep_state_history(days=10)
         if not readings:
             return          # sock never worn / recorder empty — try again next boot
-        for seg in sleep_history.segments_from_readings(readings):
+        for seg in sleep_history.segments_from_readings(readings, until=time.time()):
             db.add_sleep_segment(seg.band, seg.start, seg.end)
         db.set_config("owlet_backfill_done", owlet_log.now_iso())
     except Exception:
@@ -104,13 +104,40 @@ async def _owlet_sleep_poller() -> None:
 
             now_ts = time.time()
 
+            # 0) RESTART / GAP GUARD. The relay persists its debounce candidates and the open
+            #    hypnogram band across a restart. Without this, a deploy or reboot mid-sleep would
+            #    (a) bridge the open band straight across the downtime, hiding any waking that
+            #    happened while we were down, and (b) let a stale debounce candidate whose `since`
+            #    predates the gap instant-confirm a Focus-piercing wake push from a single sample.
+            #    On a detected gap we close the open band at the last poll and drop in-flight
+            #    candidates so nothing confirms on stale time.
+            last_poll = float(db.get_config("owlet_last_poll_ts") or 0)
+            gap = now_ts - last_poll if last_poll else 0
+            if last_poll and gap > _OWLET_POLL_SECONDS * 4:      # missed ~1 minute of polls
+                open_band = db.get_config("owlet_band")
+                open_band_start = float(db.get_config("owlet_band_start") or 0)
+                if open_band and open_band_start:
+                    db.add_sleep_segment(open_band, open_band_start, last_poll)
+                db.set_config("owlet_band", "")
+                db.set_config("owlet_band_start", "")
+                for k in ("owlet_stage", "owlet_sleep_cls"):
+                    d = owlet_log.Debounced.from_json(db.get_config(k))
+                    db.set_config(k, owlet_log.Debounced(confirmed=d.confirmed).to_json())
+            db.set_config("owlet_last_poll_ts", str(now_ts))
+
             # 2) Sleep STAGE, debounced. The sock's raw stage flaps (deep-sleep runs have a
             #    median length of ~2 minutes), so acting on the raw edge produced notes that
             #    were already wrong by the time a phone lit up. Only a stage that HOLDS is
             #    announced. Nothing is announced while she's awake — (3) owns that.
+            #
+            #    Only a real SLEEP stage (light/deep) feeds this and the live headline. A raw
+            #    "awake" while she's confirmed-asleep is a STIR, not a wake — `sleep_class("awake")`
+            #    is "awake", not "nosignal", so the old `!= "nosignal"` filter let it through and
+            #    flipped the Live Activity / widget headline to "Awake" mid-nap. Gate on
+            #    `== "asleep"` so a stir is dropped here exactly as `band_for` drops it for the chart.
             raw_stage = vitals.get("sleep_state")
             stage_reading = (raw_stage if raw_stage
-                             and owlet_log.sleep_class(raw_stage) != "nosignal" else None)
+                             and owlet_log.sleep_class(raw_stage) == "asleep" else None)
             stage_state, new_stage = owlet_log.debounce(
                 owlet_log.Debounced.from_json(db.get_config("owlet_stage")),
                 stage_reading, now_ts, owlet_log.STAGE_HOLD_SECONDS)
@@ -166,12 +193,16 @@ async def _owlet_sleep_poller() -> None:
             #            changes (~15-30s) rather than after a 2-minute confirm. The raw path only
             #            runs while she is CONFIRMED asleep, so it can never re-introduce the
             #            awake<->light flap storm the debounce exists to kill.
-            live_stage = stage_reading                        # raw sleep stage, or None
+            #        The live headline holds the last real SLEEP stage. `stage_reading` is None
+            #        during a raw "awake" stir (sanitized above) or nosignal, and on those ticks we
+            #        must NOT flip the card to "Awake" — she's still confirmed-asleep, so keep
+            #        showing "Deep sleep · 5 min". Only a real light/deep reading moves it.
             prev_live = db.get_config("owlet_live_stage") or ""
-            if (live_stage or "") != prev_live:
-                db.set_config("owlet_live_stage", live_stage or "")
-                if live_stage:
-                    db.set_config("owlet_live_stage_since", owlet_log.now_iso())
+            live_changed = bool(stage_reading and stage_reading != prev_live)
+            if live_changed:
+                db.set_config("owlet_live_stage", stage_reading)
+                db.set_config("owlet_live_stage_since", owlet_log.now_iso())
+            live_stage = db.get_config("owlet_live_stage") or None
             live_since = db.get_config("owlet_live_stage_since") or owlet_log.now_iso()
 
             def _content(stage_confirmed):
@@ -187,8 +218,13 @@ async def _owlet_sleep_poller() -> None:
                     now_ts - owlet_log.WAKE_HOLD_SECONDS))
                 db.set_config("owlet_activity_stage_since", owlet_log.now_iso())
                 await _sleep_activity_start(baby=baby, state=_content(stage_state.confirmed))
-            elif new_cls == "awake":
+            elif new_cls in ("awake", "nosignal"):
+                # End on wake OR sock-off. The old code ended only on "awake", so removing the
+                # sock (nosignal) left an orphaned card counting up forever while the sleep log
+                # had already closed — and the next sleep stacked a second card on top. Clearing
+                # the live stage here keeps the next session from inheriting a stale headline.
                 await _sleep_activity_push("end", _content(None))
+                db.set_config("owlet_live_stage", "")
             elif new_stage and cur == "asleep":
                 db.set_config("owlet_activity_stage_since", owlet_log.iso_at(
                     now_ts - owlet_log.STAGE_HOLD_SECONDS))
@@ -209,13 +245,14 @@ async def _owlet_sleep_poller() -> None:
                     db.set_config("owlet_activity_stage_since",
                                   db.get_config("owlet_activity_stage_since") or owlet_log.now_iso())
                     await _sleep_activity_start(baby=baby, state=_content(stage_state.confirmed))
-            elif ((live_stage or "") != prev_live and cur == "asleep"
+            elif (live_changed and cur == "asleep"
                   and db.activities_by_kind(OWLET_ACTIVITY_KIND)):
                 # RAW fast path. The confirmed-stage branch above didn't fire (no confirmed
-                # change this tick), but the raw stage moved — push it so the Live Activity
+                # change this tick), but the raw SLEEP stage moved — push it so the Live Activity
                 # headline flips to "Deep sleep" within a poll, not after a 2-minute confirm.
-                # No extra rate limit: the 15s poll IS the floor, and a running activity is a
-                # liveactivity push (not an iOS-budgeted background push), so per-poll is fine.
+                # `live_changed` is only ever a real light/deep transition (a stir is sanitized to
+                # None upstream), so this can never push an "Awake" flap. No extra rate limit: the
+                # 15s poll IS the floor, and a liveactivity push isn't iOS-budgeted.
                 await _sleep_activity_push("update", _content(stage_state.confirmed))
 
             # 3c-ii-arm) One-shot "tell me the moment she's in deep sleep" — the transfer-window
@@ -238,13 +275,26 @@ async def _owlet_sleep_poller() -> None:
             #         that re-derived bands from the raw state would strobe and count ~70
             #         wakings for a night the log correctly calls eight.
             band = sleep_history.band_for(cur, stage_state.confirmed)
+            # Back-stamp a band boundary caused by a CONFIRMED edge to when the change actually
+            # started (now - hold), exactly as the auto sleep-log does — otherwise the chart would
+            # show her asleep up to a full WAKE_HOLD (5 min) longer than the log at every waking,
+            # and the two would visibly disagree on bedtime/wake. A class edge uses WAKE_HOLD; a
+            # pure stage edge uses STAGE_HOLD; a plain fresh-signal tick uses now.
+            if new_cls in ("awake", "asleep", "nosignal"):
+                edge_ts = now_ts - owlet_log.WAKE_HOLD_SECONDS
+            elif new_stage:
+                edge_ts = now_ts - owlet_log.STAGE_HOLD_SECONDS
+            else:
+                edge_ts = now_ts
             open_band = db.get_config("owlet_band")
             open_band_start = float(db.get_config("owlet_band_start") or 0)
             if band != open_band:
+                # Never let a back-stamp run the boundary earlier than the open band's own start.
+                boundary = max(edge_ts, open_band_start) if open_band_start else edge_ts
                 if open_band and open_band_start:
-                    db.add_sleep_segment(open_band, open_band_start, now_ts)
+                    db.add_sleep_segment(open_band, open_band_start, boundary)
                 db.set_config("owlet_band", band or "")
-                db.set_config("owlet_band_start", str(now_ts) if band else "")
+                db.set_config("owlet_band_start", str(boundary) if band else "")
             elif band and open_band_start:
                 # Keep the OPEN band's end fresh so a chart drawn mid-nap reaches "now" instead
                 # of stopping at the last transition.

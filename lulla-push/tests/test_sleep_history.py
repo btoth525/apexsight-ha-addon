@@ -128,3 +128,15 @@ def test_change_only_history_is_expanded_onto_the_poll_grid():
     # ...and the same input read literally (no expansion) confirms nothing at all: one row per
     # state gives `debounce` no second look, so the whole span collapses into a single band.
     assert len(sh.segments_from_readings(change_only, already_gridded=True)) <= 1
+
+
+def test_backfill_extends_the_final_state_to_now():
+    """HA's change-only history's last row is the CURRENT state, held until now. Without
+    extending it, the backfill leaves a gap that could split the in-progress session from its
+    own history."""
+    # A single light_sleep change 2h ago; `until` = now.
+    now = 10_000.0
+    readings = [(now - 7200, "light_sleep")]
+    segs = sh.segments_from_readings(readings, until=now)
+    assert segs, "the final held state must produce a band"
+    assert segs[-1].end >= now - 60          # reaches (about) now, not just +15s after the change
