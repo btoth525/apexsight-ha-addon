@@ -162,16 +162,36 @@ async def _owlet_sleep_poller() -> None:
             db.set_config("owlet_sleep_cls", cls_state.to_json())
             cur = cls_state.confirmed or raw_cls
 
-            # 3a) AWAKE <-> ASLEEP, on the CONFIRMED edge only. Time-sensitive on wake (that's
-            #     the one worth piercing Focus for, now that it's trustworthy); falling asleep
-            #     stays a quiet note.
+            # 3a) AWAKE <-> ASLEEP, on the CONFIRMED edge only, and ONLY across a real sleep↔wake
+            #     transition. We compare against the last REAL class (awake/asleep), IGNORING any
+            #     nosignal in between. That matters both ways:
+            #       * nosignal→awake (sock put back on an already-awake baby) must NOT fire a
+            #         Focus-piercing "She's waking up",
+            #       * asleep→nosignal→awake (she wakes and they pull the sock to feed) MUST still
+            #         fire it — `sock_off` maps to nosignal and is evaluated before the awake flag,
+            #         so the immediately-previous confirmed class can be nosignal at the real wake.
+            #     Tracking the last real class (not the immediate previous) gets both right.
+            prev_real = db.get_config("owlet_last_real_cls") or None
+            if prev_real is None and cur in ("awake", "asleep"):
+                db.set_config("owlet_last_real_cls", cur)   # seed silently on first run / deploy
+                prev_real = cur
+            transition = owlet_log.wake_transition(prev_real, new_cls)
+            if transition == "wake":
+                if now_ts - float(db.get_config("owlet_awake_alert_ts") or 0) >= owlet_log.WAKE_ALERT_MIN_GAP:
+                    await _push_wake_state(True, baby)
+                    db.set_config("owlet_awake_alert_ts", str(now_ts))
+            elif transition == "asleep":
+                if now_ts - float(db.get_config("owlet_asleep_alert_ts") or 0) >= owlet_log.ASLEEP_ALERT_MIN_GAP:
+                    await _push_wake_state(False, baby)
+                    db.set_config("owlet_asleep_alert_ts", str(now_ts))
+            # Remember the last REAL (awake/asleep) confirmed class for the next transition; a
+            # nosignal (sock on the base) never overwrites it, so sock-off/on can't fake an edge.
             if new_cls in ("awake", "asleep"):
-                gap = (owlet_log.WAKE_ALERT_MIN_GAP if new_cls == "awake"
-                       else owlet_log.ASLEEP_ALERT_MIN_GAP)
-                key = f"owlet_{new_cls}_alert_ts"
-                if now_ts - float(db.get_config(key) or 0) >= gap:
-                    await _push_wake_state(new_cls == "awake", baby)
-                    db.set_config(key, str(now_ts))
+                db.set_config("owlet_last_real_cls", new_cls)
+                # A confirmed WAKE ends the settle: clear any one-shot "tell me at deep sleep" arm
+                # so it can't fire for a later, unrelated sleep the parent didn't ask about.
+                if new_cls == "awake":
+                    db.set_config("owlet_deep_arm_until", "")
 
             # 3b) A confirmed stage note, rate-limited PER STAGE (1.3.0 shared one 10-minute
             #     budget across every stage, so a light-sleep ping silently swallowed the

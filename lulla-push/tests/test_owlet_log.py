@@ -249,3 +249,33 @@ def test_arm_expires_on_its_own():
 def test_unarmed_is_always_a_hold():
     assert deep_arm_decision(armed_until=0.0, now=500.0, prev_stage="light_sleep",
                              cur_stage="deep_sleep", sleep_class_confirmed="asleep") == "hold"
+
+
+from app.owlet_log import wake_transition
+
+
+def test_wake_fires_on_asleep_to_awake():
+    assert wake_transition("asleep", "awake") == "wake"
+
+
+def test_wake_fires_through_a_nosignal_at_the_wake():
+    """She wakes and they pull the sock to feed her: asleep -> nosignal -> awake. The real wake
+    must still fire (compare against the last REAL class, not the immediate previous)."""
+    # prev_real stays "asleep" across the nosignal gap; the awake confirm then fires.
+    assert wake_transition("asleep", "awake") == "wake"
+
+
+def test_no_false_wake_when_sock_reapplied_to_awake_baby():
+    """awake -> nosignal (sock off) -> awake (sock back on): prev_real is 'awake', so NO wake."""
+    assert wake_transition("awake", "awake") is None
+
+
+def test_asleep_note_fires_on_awake_to_asleep():
+    assert wake_transition("awake", "asleep") is None or wake_transition("awake", "asleep") == "asleep"
+    assert wake_transition("awake", "asleep") == "asleep"
+
+
+def test_no_note_on_nosignal_edges():
+    assert wake_transition("asleep", "nosignal") is None
+    assert wake_transition("nosignal", "asleep") is None      # sock put on a sleeping baby
+    assert wake_transition(None, "awake") is None              # first ever / unseeded

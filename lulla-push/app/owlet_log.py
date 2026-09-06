@@ -163,6 +163,23 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def wake_transition(prev_real: Optional[str], new_cls: Optional[str]) -> Optional[str]:
+    """Which wake/asleep notification a CONFIRMED class change warrants, comparing against the
+    last REAL (awake/asleep) class so a nosignal (sock on/off) edge never fakes a transition.
+    Returns 'wake' | 'asleep' | None.
+
+      * asleep -> awake            => 'wake'   (a genuine wake — pierce Focus)
+      * asleep -> nosignal -> awake => 'wake'   (she woke, sock pulled to feed — still a wake)
+      * awake  -> nosignal -> awake => None     (sock re-applied to an already-awake baby)
+      * awake  -> asleep           => 'asleep' (she went down — quiet note)
+    """
+    if new_cls == "awake" and prev_real == "asleep":
+        return "wake"
+    if new_cls == "asleep" and prev_real == "awake":
+        return "asleep"
+    return None
+
+
 def deep_arm_decision(*, armed_until: float, now: float, prev_stage: Optional[str],
                       cur_stage: Optional[str], sleep_class_confirmed: str) -> str:
     """Pure decision for the one-shot "tell me at deep sleep" alert. Returns:
