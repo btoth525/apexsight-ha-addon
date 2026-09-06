@@ -82,6 +82,10 @@ async def _backfill_sleep_segments() -> None:
 # Core API call is local and cheap, so 15s is comfortable for a household relay.
 _OWLET_POLL_SECONDS = 15
 
+# The relay must be unable to reach Home Assistant for this long before it says "monitoring
+# offline" — long enough to ride out a transient blip or a restart, short enough to matter.
+HA_OUTAGE_SECONDS = 5 * 60
+
 
 async def _owlet_sleep_poller() -> None:
     """Poll HA, run the pure sleep state machine, and write a synced sleep LogEvent when the
@@ -106,7 +110,14 @@ async def _owlet_sleep_poller() -> None:
             #    time (e.g. sock_off while it's charging) doesn't fire a spurious alert.
             raw_prev = db.get_config("owlet_alerts")
             if raw_prev is not None:
+                last_real = db.get_config("owlet_last_real_cls")
                 for key in owlet_log.alert_transitions(json.loads(raw_prev), alerts):
+                    # "The sock came off" is an ALARM only if it came off while she was ASLEEP
+                    # (unmonitored during sleep). When she's awake, a parent removed it on purpose
+                    # (a feed, or putting it on the base to charge) — not an emergency. Suppressing
+                    # those stops charging the sock from firing a Focus-piercing "sock came off".
+                    if key in ("sock_off", "sock_disconnected") and last_real != "asleep":
+                        continue
                     await _push_owlet_alert(key, baby)
             db.set_config("owlet_alerts", json.dumps(alerts))
 
@@ -132,6 +143,28 @@ async def _owlet_sleep_poller() -> None:
                     d = owlet_log.Debounced.from_json(db.get_config(k))
                     db.set_config(k, owlet_log.Debounced(confirmed=d.confirmed).to_json())
             db.set_config("owlet_last_poll_ts", str(now_ts))
+
+            # 0b) MONITORING WATCHDOG (the supervised loop, done safely). Fire ONLY when the relay
+            #     genuinely loses the Home Assistant link — it can't read the sock at all — for a
+            #     sustained window. That is "we've gone blind", a real problem worth knowing about.
+            #     It is deliberately NARROW: it does NOT fire when the sock is merely on the base
+            #     (HA reachable, just no Owlet reading — normal), nor on the app's heartbeat (a
+            #     sleeping phone stops heart-beating overnight, which is also normal), nor as a
+            #     CRITICAL alert (no entitlement, and the Owlet base station stays the real alarm).
+            #     Edge-triggered: one "offline" note per outage, one "back" note on recovery.
+            if st.get("connected"):
+                if db.get_config("owlet_ha_out_fired"):
+                    await _push_monitoring(baby, offline=False)   # recovered
+                db.set_config("owlet_ha_out_since", "")
+                db.set_config("owlet_ha_out_fired", "")
+            else:
+                out_since = db.get_config("owlet_ha_out_since")
+                if not out_since:
+                    db.set_config("owlet_ha_out_since", str(now_ts))
+                elif (not db.get_config("owlet_ha_out_fired")
+                      and now_ts - float(out_since) >= HA_OUTAGE_SECONDS):
+                    await _push_monitoring(baby, offline=True)
+                    db.set_config("owlet_ha_out_fired", "1")
 
             # 2) Sleep STAGE, debounced. The sock's raw stage flaps (deep-sleep runs have a
             #    median length of ~2 minutes), so acting on the raw edge produced notes that
@@ -502,6 +535,24 @@ async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
                                 payload, push_type="background", collapse_id="owlet-refresh")
         except Exception:
             pass   # a silent nudge is best-effort by definition
+
+
+async def _push_monitoring(baby: str, *, offline: bool) -> None:
+    """The relay lost (or regained) its link to Home Assistant — i.e. it can't read the sock at
+    all. Active level, NOT critical: it's an FYI ("your monitor went offline, check it"), not an
+    alarm — the Owlet base station remains the real alarm. Goes to both phones (no actor)."""
+    try:
+        await push(PushEventBody(
+            event="monitoring.offline" if offline else "monitoring.back",
+            household=config.PAIRING_CODE,
+            title="\u26A0\uFE0F Monitor offline" if offline else "\u2705 Monitor back",
+            body=("Lulla can't reach the Owlet sock right now — check Home Assistant."
+                  if offline else f"Lulla can see {baby}'s sock again."),
+            interruption_level="active" if offline else "passive",
+            collapse_id="lulla-monitoring",
+        ))
+    except Exception:
+        pass
 
 
 async def _push_deep_sleep_reached(baby: str) -> None:
