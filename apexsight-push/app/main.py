@@ -845,6 +845,40 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
             if body.camera in disabled:
                 return {"ok": True, "sent": 0, "note": "ai description disabled for camera"}
 
+    # --- Duplicate-review dedup ---
+    # Frigate often splits ONE continuous activity (a delivery, a lingering visitor) into TWO
+    # overlapping review segments on the same camera, minutes apart, with the SAME objects — and
+    # each was pushed, so the user saw a "double notification" for one event. Suppress a DIFFERENT
+    # review on the SAME camera whose object set is IDENTICAL to the one we just alerted, within a
+    # short window. Deliberately strict (identical set, not subset/overlap): on a security system a
+    # missed real alert is worse than a stray buzz, so this only collapses truly-identical repeats.
+    # FAIL-OPEN: a new object class, a gap past the window, no prior alert, a same-review re-POST
+    # (retry/update — collapse_id already de-dupes those in iOS), or ANY parse error all DELIVER.
+    if body.review_id and body.camera and body.labels and not body.is_description and not body.silent:
+        try:
+            window = float(db.get_config(f"dedup_window:{code}", "") or 300)
+        except Exception:
+            window = 300.0
+        if window > 0:
+            key = f"recentnotif:{code}:{body.camera}"
+            try:
+                prev = json.loads(db.get_config(key, "") or "{}")
+            except Exception:
+                prev = {}
+            now = time.time()
+            new_labels = set(body.labels)
+            prev_labels = set(prev.get("labels") or [])
+            if (prev.get("review_id") and prev.get("review_id") != body.review_id
+                    and (now - float(prev.get("ts") or 0)) < window
+                    and new_labels and new_labels == prev_labels):
+                print(f"[dedup] {body.camera}: review {body.review_id} suppressed "
+                      f"(identical dupe of {prev.get('review_id')}, labels {sorted(new_labels)})", flush=True)
+                return {"ok": True, "sent": 0, "note": "duplicate review (dedup)"}
+            try:
+                db.set_config(key, json.dumps({"ts": now, "review_id": body.review_id, "labels": sorted(new_labels)}))
+            except Exception:
+                pass
+
     title, text = body.title, body.body
     snapshot_url, thumbnail_url = body.snapshot_url, body.thumbnail_url
 

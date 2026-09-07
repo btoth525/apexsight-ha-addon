@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.25.0
+
+**No more double notifications for one event.**
+
+Frigate often splits a single continuous activity (a delivery, a lingering visitor) into two
+overlapping review segments on the same camera, minutes apart, with identical objects — and the
+relay pushed each, so you got two notifications for one delivery. `/v1/notify` now suppresses a
+DIFFERENT review on the SAME camera whose object set is IDENTICAL to the one just alerted, within a
+5-minute window (`dedup_window:<code>` config, default 300s; 0 disables). Strict by design —
+identical object set only — because on a security system a missed real alert is worse than a stray
+buzz: a new object class, a gap past the window, a same-review re-POST, or any parse error all still
+deliver (fail-open).
+
 ## 1.24.0
 
 **House Mode removed — alerts follow only the disarm/snooze gate now.**
