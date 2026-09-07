@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.24.0
+
+**House Mode removed — alerts follow only the disarm/snooze gate now.**
+
+The iOS app dropped House Mode (arm/away/night). The relay no longer suppresses camera pushes by a
+stored Alarmo house mode in `/v1/notify` — with the app no longer setting a mode, that filter could
+freeze and silently mute a camera forever. Delivery now rides ONLY the real-time household
+disarm/global-snooze gate and each device's own notification prefs (fail-open throughout). The
+`/v1/mode` read and `gate.MODE_MUTES` remain as inert, tested code; `/v1/set-mode` is unused by the
+app but left in place (harmless) for now.
+
 ## 1.23.0
 
 **The app can now tell you what went wrong on the phone.**

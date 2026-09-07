@@ -825,14 +825,10 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         if snoozed_until and time.time() < float(snoozed_until):
             return {"ok": True, "sent": 0, "note": "snoozed"}
 
-    # House mode camera filter — the Alarmo house mode (Home / Night / Away), synced from HA via
-    # /v1/mode, silences camera-detection pushes for cameras that mode mutes (e.g. inside cams while
-    # Home). House-level (all devices), applied before the per-device loop. FAIL-OPEN: unknown/blank
-    # mode or a camera not in that mode's mute-list delivers; Away mutes nothing.
-    house_mode = db.get_config("house_mode", "") or ""
-    if gate.mode_mutes_camera(house_mode, body.camera, _load_mode_map()):
-        print(f"[mode] {house_mode}: {body.camera} muted → suppress all", flush=True)
-        return {"ok": True, "sent": 0, "note": f"mode {house_mode}: camera muted"}
+    # House Mode was removed from the app (v1.7). The per-mode camera mute is gone — delivery now
+    # rides ONLY the real-time disarm/snooze gate above + each device's own prefs below. (Left the
+    # /v1/mode read + gate.MODE_MUTES in place as inert, tested code; nothing consults the frozen
+    # house_mode any more, so a stale mode can never silence a camera.)
 
     # (Per-camera mute is no longer a household early-return — it now rides inside the per-device
     # soft gate below, so a trigger can re-open it exactly as in the app. The household
