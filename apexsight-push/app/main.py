@@ -78,6 +78,25 @@ async def _fire_panel_screen(slug: str) -> None:
     except Exception as exc:  # never let a panel hiccup block the doorbell voice
         print(f"doorpanel screen fire failed for {slug!r}: {exc}", flush=True)
 
+
+# Driveway deterrent: the app taps a button, the relay fires the matching HA webhook LOCALLY via the
+# Supervisor core proxy (same mechanism as _fire_panel_screen). The webhook IDs never leave the relay,
+# and the app only needs the household pairing code it already has — no HA URL/token on the phone.
+_DETERRENT_WEBHOOKS = {
+    "cop_lights":   "apexsight-cop-lights-7f3a9c2e",
+    "siren":        "apexsight-driveway-siren-b81e4d5a",
+    "voice":        "apexsight-driveway-voice-9e4c1a7f",
+    "lights_siren": "apexsight-lights-siren-5d2f8b3c",
+    "deterrent":    "apexsight-deterrent-2c9d7e61",
+}
+# Allowlist the clip filename — it reaches ffmpeg server-side, so never forward an arbitrary string.
+_DETERRENT_CLIPS = {
+    "warning_short_christopher.mp3",
+    "warning_medium_christopher.mp3",
+    "warning_christopher.mp3",
+    "warning_guy.mp3",
+}
+
 app = FastAPI(title="ApexSight Push Relay", docs_url=None, redoc_url=None)
 app.add_middleware(SessionMiddleware, secret_key=config.session_secret(), https_only=False)
 
@@ -481,6 +500,47 @@ async def turn_credentials(body: TurnCredentialsIn, _: None = Depends(rate_limit
         raise HTTPException(status_code=502, detail="cloudflare turn error")
     print(f"[turn] minted {len(servers)} ICE server group(s) for a paired device", flush=True)
     return servers
+
+
+class DeterrentIn(BaseModel):
+    pairing_code: str = ""
+    action: str = ""                     # cop_lights | siren | voice | lights_siren | deterrent
+    seconds: Optional[int] = None        # lights / siren duration
+    file: Optional[str] = None           # voice clip filename (allowlisted)
+
+
+@app.post("/v1/deterrent")
+async def deterrent(body: DeterrentIn, _: None = Depends(rate_limit)) -> dict:
+    """Fire a Front Driveway deterrent (cop lights / siren / voice / combos). Actuates hardware +
+    makes noise outside, so it's gated by the household pairing code. Forwards to the matching HA
+    webhook on the LOCAL core API (webhooks ignore auth; the Supervisor token authorizes the proxy)."""
+    _require_pairing(body.pairing_code)
+    hook = _DETERRENT_WEBHOOKS.get((body.action or "").strip())
+    if not hook:
+        raise HTTPException(status_code=400, detail="unknown deterrent action")
+    if not SUPERVISOR_TOKEN:
+        raise HTTPException(status_code=503, detail="relay has no supervisor token")
+    payload: dict = {}
+    if body.seconds is not None:
+        payload["seconds"] = max(1, min(int(body.seconds), 30))     # clamp; no runaway sirens
+    if body.file:
+        if body.file not in _DETERRENT_CLIPS:
+            raise HTTPException(status_code=400, detail="unknown clip")
+        payload["file"] = body.file
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(
+                f"{HA_CORE_URL}/api/webhook/{hook}",
+                headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+                json=payload,
+            )
+    except Exception as exc:
+        print(f"[deterrent] webhook {body.action!r} failed: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail="deterrent webhook failed")
+    if not (200 <= r.status_code < 300):
+        raise HTTPException(status_code=502, detail=f"HA webhook {r.status_code}")
+    print(f"[deterrent] fired {body.action!r} (seconds={payload.get('seconds')}, file={payload.get('file')})", flush=True)
+    return {"ok": True, "action": body.action}
 
 
 class DiagEntryIn(BaseModel):

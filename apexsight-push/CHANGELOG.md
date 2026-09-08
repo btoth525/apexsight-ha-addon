@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.26.0
+
+**Driveway deterrents from the app.** New `POST /v1/deterrent` (pairing-code gated) fires the Front
+Driveway deterrent webhooks — cop lights, siren, voice warning, lights+siren, and full deterrent —
+by forwarding to the matching Home Assistant webhook on the local core API (same Supervisor-proxy
+mechanism as the doorpanel screens). The webhook IDs stay on the relay; the app only sends the
+household pairing code + an action (+ optional seconds / voice-clip filename, both allowlisted/clamped).
+Additive — no existing route changed.
+
 ## 1.25.0
 
 **No more double notifications for one event.**
