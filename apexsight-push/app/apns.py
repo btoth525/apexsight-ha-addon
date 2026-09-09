@@ -147,29 +147,41 @@ async def send_background(device_token: str, environment: str, payload: dict) ->
     return False, f"{resp.status_code} {reason}".strip()
 
 
-async def send_voip(voip_token: str, environment: str, payload: dict) -> tuple[bool, str]:
+async def send_voip(voip_token: str, environment: str, payload: dict) -> tuple[bool, str, str]:
     """Send a PushKit VoIP push (rings the phone via CallKit). Uses the same .p8 provider token,
-    but the topic is `<bundle>.voip` and the push type is `voip`. Returns (ok, detail)."""
+    but the topic is `<bundle>.voip` and the push type is `voip`. Returns (ok, detail, apns_id).
+
+    `apns-expiration: 0` is deliberate. With the header absent, APNs STORES an undeliverable push
+    and retries it later — which for a doorbell means the phone can start ringing minutes after
+    the visitor gave up and left, for a doorstep that is now empty. A ring is a one-shot event
+    about this moment: deliver it now or not at all. The bridge already retries a genuinely failed
+    forward three times, so nothing is lost by refusing Apple's store-and-forward.
+
+    The returned `apns-id` is what Apple's own delivery logs are keyed on, so a ring that APNs
+    accepted but the phone never showed can be chased past our own logs.
+    """
     p8, key_id, team_id, bundle_id, env_mode = _credentials()
     headers = {
         "authorization": f"bearer {_provider_token(p8, key_id, team_id)}",
         "apns-topic": f"{bundle_id}.voip",
         "apns-push-type": "voip",
         "apns-priority": "10",
+        "apns-expiration": "0",
     }
     url = f"{_host_for(environment, env_mode)}/3/device/{voip_token}"
     try:
         resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
     except httpx.HTTPError as exc:
-        return False, f"network error: {exc}"
+        return False, f"network error: {exc}", ""
+    apns_id = resp.headers.get("apns-id", "")
     if resp.status_code == 200:
-        return True, "ok"
+        return True, "ok", apns_id
     reason = ""
     try:
         reason = resp.json().get("reason", "")
     except Exception:
         reason = resp.text.strip()
-    return False, f"{resp.status_code} {reason}".strip()
+    return False, f"{resp.status_code} {reason}".strip(), apns_id
 
 
 def build_payload(

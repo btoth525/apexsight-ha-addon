@@ -48,9 +48,28 @@ def init() -> None:
                 voip_token   TEXT PRIMARY KEY,
                 pairing_code TEXT NOT NULL,
                 environment  TEXT NOT NULL DEFAULT 'production',
+                device_name  TEXT,
                 updated_at   INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_voip_pairing ON voip_tokens(pairing_code);
+            -- Every doorbell ring, one row PER PHONE, with what APNs actually said.
+            --
+            -- Written because the 2026-09-08 miss could not be diagnosed from what we kept: the
+            -- only trace was one aggregate line, `ring -> 2 phones (failed 0)`, in a 100-line
+            -- rolling buffer. That cannot answer "which phone", "was it accepted", or "was this
+            -- token even the phone I think it is". `apns_id` is the identifier Apple's own
+            -- delivery logs are keyed on, so a ring can now be chased all the way to Apple.
+            CREATE TABLE IF NOT EXISTS ring_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                pairing_code TEXT NOT NULL,
+                ts           REAL NOT NULL,
+                device_name  TEXT,
+                token_tail   TEXT,
+                ok           INTEGER NOT NULL,
+                detail       TEXT,
+                apns_id      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ring_ts ON ring_log(pairing_code, ts);
             -- App-side diagnostics: the phone's own error log, shipped here so a problem seen
             -- while testing can be read back afterwards instead of being lost with the app.
             -- Deliberately dumb and append-only; `prune_diag` keeps it from growing without bound.
@@ -71,6 +90,12 @@ def init() -> None:
         # no-op on fresh installs (CREATE TABLE already has it), so swallow the dupe error.
         try:
             c.execute("ALTER TABLE devices ADD COLUMN device_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # Same, for VoIP tokens (v1.27.0). Without a name, `sent 2` is unattributable: there was
+        # no way to tell whose phone a token belonged to, or that one of them was stale.
+        try:
+            c.execute("ALTER TABLE voip_tokens ADD COLUMN device_name TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -209,24 +234,65 @@ def device_count() -> int:
 
 # ---- VoIP (PushKit) tokens — used to ring a phone via CallKit on a doorbell press ----
 
-def upsert_voip(voip_token: str, pairing_code: str, environment: str) -> None:
+def upsert_voip(voip_token: str, pairing_code: str, environment: str,
+                device_name: str = "") -> None:
+    """Register a phone's PushKit token. `device_name` is kept so a ring is attributable to a
+    PHONE rather than to an opaque 64-hex string — a household with a stale or unexpected
+    registration otherwise looks identical to one where every phone is fine."""
     with _conn() as c:
         c.execute(
-            "INSERT INTO voip_tokens(voip_token, pairing_code, environment, updated_at) "
-            "VALUES(?, ?, ?, ?) "
+            "INSERT INTO voip_tokens(voip_token, pairing_code, environment, device_name, updated_at) "
+            "VALUES(?, ?, ?, ?, ?) "
             "ON CONFLICT(voip_token) DO UPDATE SET "
             "  pairing_code = excluded.pairing_code, "
             "  environment  = excluded.environment, "
+            # An empty name must not blank a good one — older app builds don't send it at all.
+            "  device_name  = COALESCE(NULLIF(excluded.device_name, ''), voip_tokens.device_name), "
             "  updated_at   = excluded.updated_at",
-            (voip_token, pairing_code, environment, int(time.time())),
+            (voip_token, pairing_code, environment, (device_name or "").strip()[:64],
+             int(time.time())),
         )
 
 
 def voip_tokens_for(pairing_code: str) -> list[sqlite3.Row]:
     with _conn() as c:
         return c.execute(
-            "SELECT voip_token, environment FROM voip_tokens WHERE pairing_code = ?",
+            "SELECT voip_token, environment, device_name, updated_at "
+            "FROM voip_tokens WHERE pairing_code = ?",
             (pairing_code,),
+        ).fetchall()
+
+
+# ---- ring log: what happened to each phone on each doorbell press ------------
+
+# A doorbell is pressed a handful of times a day; 500 rows is months of history and a trivial
+# amount of disk. Bounded anyway, on the same principle as the diag log: an aid that can grow
+# without limit eventually becomes the outage.
+RING_LOG_MAX_ROWS = 500
+
+
+def insert_ring(pairing_code: str, device_name: str, token_tail: str,
+                ok: bool, detail: str, apns_id: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO ring_log(pairing_code, ts, device_name, token_tail, ok, detail, apns_id) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (pairing_code, time.time(), (device_name or "")[:64], token_tail,
+             1 if ok else 0, (detail or "")[:200], (apns_id or "")[:64]),
+        )
+        c.execute(
+            "DELETE FROM ring_log WHERE pairing_code = ? AND id NOT IN ("
+            "  SELECT id FROM ring_log WHERE pairing_code = ? ORDER BY id DESC LIMIT ?)",
+            (pairing_code, pairing_code, RING_LOG_MAX_ROWS),
+        )
+
+
+def rings_for(pairing_code: str, limit: int = 50) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT ts, device_name, token_tail, ok, detail, apns_id FROM ring_log "
+            "WHERE pairing_code = ? ORDER BY id DESC LIMIT ?",
+            (pairing_code, max(1, min(int(limit), 500))),
         ).fetchall()
 
 

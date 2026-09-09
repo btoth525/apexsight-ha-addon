@@ -294,6 +294,7 @@ class RegisterVoIPIn(BaseModel):
     voip_token: str = Field(min_length=32)
     pairing_code: str = Field(min_length=4, max_length=64)
     environment: str = "production"
+    device_name: str = ""                # so a ring is attributable to a PHONE, not to a hex blob
 
 
 class DoorbellRingIn(BaseModel):
@@ -477,7 +478,8 @@ def register_voip(body: RegisterVoIPIn, _: None = Depends(rate_limit)) -> dict:
     """An iPhone registers its PushKit VoIP token so the relay can ring it (CallKit) on a doorbell
     press. Separate from the APNs token — VoIP pushes use a different topic + push type."""
     env = body.environment if body.environment in ("production", "sandbox") else "production"
-    db.upsert_voip(body.voip_token, body.pairing_code.upper().strip(), env)
+    db.upsert_voip(body.voip_token, body.pairing_code.upper().strip(), env,
+                   device_name=(body.device_name or "").strip()[:64])
     return {"ok": True}
 
 
@@ -615,7 +617,18 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
     payload = {"aps": {"content-available": 1}, "doorbell": True, "camera": body.camera or "doorbell"}
     sent, failed, pruned = 0, 0, 0
     for row in rows:
-        ok, detail = await apns.send_voip(row["voip_token"], row["environment"], payload)
+        ok, detail, apns_id = await apns.send_voip(row["voip_token"], row["environment"], payload)
+        # One durable row PER PHONE, named. The aggregate counters below say a ring "worked";
+        # only this says WHICH phone Apple accepted it for, and under which apns-id.
+        name = (row["device_name"] or "").strip()
+        tail = row["voip_token"][-8:]
+        try:
+            db.insert_ring(code, name, tail, ok, detail, apns_id)
+        except Exception as exc:      # a log must never break the thing it logs
+            print(f"[doorbell] ring_log write failed: {exc!r}", flush=True)
+        print(f"[doorbell]   → {name or '(unnamed)'} …{tail}: "
+              f"{'accepted' if ok else 'FAILED ' + detail}"
+              + (f" apns-id={apns_id}" if apns_id else ""), flush=True)
         if ok:
             sent += 1
         else:
@@ -638,6 +651,22 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
         raise HTTPException(status_code=502,
                             detail=f"{failed - pruned} VoIP pushes failed transiently — retry")
     return {"ok": True, "sent": sent, "failed": failed, "pruned": pruned, "phones": len(rows)}
+
+
+@app.get("/v1/rings")
+def get_rings(pairing_code: str = "", limit: int = 50, _: None = Depends(rate_limit)) -> dict:
+    """Read back the per-phone outcome of recent doorbell rings.
+
+    Pairs with the app's own `doorbell-call` diag lines: this end says what APNs accepted and for
+    which phone, `/v1/diag` says whether that phone actually received the push and rang. Together
+    they answer "the doorbell rang and my phone didn't" in one read instead of an evening of
+    forensics. Pairing-gated — which phones are in a household is not world-readable.
+    """
+    code = _require_pairing(pairing_code)
+    rings = [dict(r) for r in db.rings_for(code, limit)]
+    for r in rings:
+        r["ok"] = bool(r["ok"])
+    return {"ok": True, "count": len(rings), "rings": rings}
 
 
 # ---- doorbell talkback (play audio to the Aqara speaker) ---------------------

@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.27.0
+
+**The doorbell rang, both phones were sent a ring, and neither one rang.**
+
+Diagnosed against the real miss on 2026-09-08 at 19:45:56. The chain up to Apple was clean the
+whole way — HA fired, the bridge forwarded, APNs returned 200 for both phones — and the only
+record of it was a single aggregate line, `ring → 2 phones (failed 0)`, in a 100-line rolling
+buffer. That line cannot answer *which* phone, *whose* token that is, or *what Apple said*, so
+the actual cause (an answered CallKit call on the phone that never ended, silently suppressing
+every later ring as a "duplicate") took an evening of forensics to corner. It is fixed in the
+app; this release makes sure the next one takes a single read.
+
+- **Every ring now writes one durable row per phone** — name, token tail, whether APNs accepted
+  it, Apple's reason if not, and the `apns-id` Apple's own delivery logs are keyed on. Readable
+  at `GET /v1/rings` (pairing-gated, like every other read of household detail) and printed
+  per-phone to the log. Bounded at 500 rows — months of doorbell history, and it discards the
+  oldest rather than growing.
+- **VoIP tokens carry the phone's name.** They were bare 64-hex strings, so "sent to 2 phones"
+  could not be checked against the two phones that exist. An older app build that sends no name
+  can no longer blank a name already stored.
+- **A ring is no longer stored and forwarded.** `send_voip` had no `apns-expiration`, so APNs
+  would hold an undeliverable ring and retry it later — a phone ringing minutes after the visitor
+  gave up, for a doorstep that is now empty. It is `0` now: deliver it at once or not at all. The
+  bridge already retries a genuinely failed forward three times, so nothing is lost.
+
+Together with the app's new `doorbell-call` diagnostics, the two ends now bracket the gap: this
+side says what APNs accepted and for which phone, `/v1/diag` says whether that phone received the
+push and rang.
+
+_Tests: 286 checks across 10 suites (new `test_ring_log.py`, 19 checks — name preservation on a
+nameless re-register, per-phone rows, cross-household isolation, rotation keeping the NEWEST
+rings, clamped limits, and the expiration header)._
+
 ## 1.26.0
 
 **Driveway deterrents from the app.** New `POST /v1/deterrent` (pairing-code gated) fires the Front
