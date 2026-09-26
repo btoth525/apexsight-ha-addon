@@ -198,11 +198,13 @@ def _ffmpeg_args(ffmpeg: str, input_args: Sequence[str], volume_gain: float,
         # pivot to file:// (local-file exfil) or other exotic protocols. (A redirect to another
         # internal HTTP host remains possible — play-url is pairing-gated and external callers are
         # already host-checked in main.py; that residual is accepted for this low-severity path.)
-        # 10s I/O timeout, microseconds. The RTSP demuxer has no -rw_timeout (ffmpeg refuses to
-        # open the input: "Option rw_timeout not found") — its socket timeout is -timeout.
+        # I/O timeout, microseconds. The RTSP demuxer has no -rw_timeout (ffmpeg refuses to open
+        # the input: "Option rw_timeout not found") — its socket timeout is -timeout. RTSP is only the live mic pull: go2rtc keeps the consumer open after the app's publish
+        # ends, so this timeout IS the release→speaker-free latency. A live mic sends a packet
+        # every 20 ms, so 2.5 s of nothing means the talk button was released.
         is_rtsp = any(str(a).startswith("rtsp://") for a in input_list)
-        args += ["-timeout" if is_rtsp else "-rw_timeout", "10000000",
-                 "-protocol_whitelist", "file,crypto,data,http,https,tcp,tls,rtp,rtsp,udp"]
+        args += ["-timeout", "2500000"] if is_rtsp else ["-rw_timeout", "10000000"]
+        args += ["-protocol_whitelist", "file,crypto,data,http,https,tcp,tls,rtp,rtsp,udp"]
     args += input_list
     args += vol
     args += ["-t", f"{max_seconds:.0f}",

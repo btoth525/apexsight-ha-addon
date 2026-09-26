@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.27.4
+
+**Live talk frees the door speaker 2.5 s after you let go, down from 10 s.** go2rtc keeps the
+relay's RTSP pull open after the app's mic publish ends, so the input timeout decides when the
+talk ends. The RTSP timeout is now 2.5 s. A live mic sends a packet every 20 ms, so a 2.5 s gap
+means the button was released. Verified end to end: a published test phrase played at the door
+(48 frames) and the call returned 200.
+
 ## 1.27.3
 
 **Live talk: the RTSP mic pull opens.** The talkback helper gave every network input
