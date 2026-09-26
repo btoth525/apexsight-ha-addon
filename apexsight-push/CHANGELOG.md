@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.27.3
+
+**Live talk: the RTSP mic pull opens.** The talkback helper gave every network input
+`-rw_timeout`, which ffmpeg's RTSP demuxer does not have ("Option rw_timeout not found"), so the
+mic stream never opened. RTSP inputs now get the demuxer's own `-timeout` (same 10 s);
+http(s) play-url inputs keep `-rw_timeout`.
+
 ## 1.27.2
 
 **Live talk: pull the mic stream over TCP.** go2rtc's RTSP server refuses UDP SETUP (`461
