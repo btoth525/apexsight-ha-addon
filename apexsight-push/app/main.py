@@ -853,7 +853,10 @@ async def doorbell_talk_live(body: DoorbellTalkLiveIn, _: None = Depends(rate_li
         frames = await run_in_threadpool(
             lambda: aqara_talk.play_audio(
                 doorbell.DOORBELL_IP,
-                ["-i", stream_url],          # NO -re: a live source is already real-time paced
+                # TCP: go2rtc's RTSP server refuses UDP SETUP (461 Unsupported transport), and
+                # ffmpeg's default UDP attempt failed the pull outright — 0 frames reached the door.
+                # NO -re: a live source is already real-time paced.
+                ["-rtsp_transport", "tcp", "-i", stream_url],
                 volume_gain=doorbell.DOORBELL_GAIN,
                 max_seconds=120.0,           # generous backstop; normal end = talk-button release
                 log=lambda m: print(m, flush=True),
@@ -868,6 +871,10 @@ async def doorbell_talk_live(body: DoorbellTalkLiveIn, _: None = Depends(rate_li
         # reason and print it, so the next failure names itself instead of needing a bisect.
         print(f"[doorbell] talk-live failed pulling {stream_url}: {exc!r}", flush=True)
         raise HTTPException(status_code=502, detail=f"talk-live failed: {exc}") from exc
+    if not frames:
+        # The pull opened nothing (ffmpeg couldn't read the mic stream) — a silent "ok" here is
+        # how the UDP failure above went unnoticed. Say so instead.
+        raise HTTPException(status_code=502, detail="no mic audio reached the doorbell")
     return {"ok": True, "frames": frames}
 
 

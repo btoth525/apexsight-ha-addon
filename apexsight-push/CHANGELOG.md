@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.27.2
+
+**Live talk: pull the mic stream over TCP.** go2rtc's RTSP server refuses UDP SETUP (`461
+Unsupported transport`), and ffmpeg tries UDP first by default, so the pull failed and no audio
+reached the doorbell. It now uses `-rtsp_transport tcp`. A talk that delivers zero frames now
+returns a 502 ("no mic audio reached the doorbell") instead of `{"ok": true, "frames": 0}`.
+
 ## 1.27.1
 
 **Live hold-to-talk at the doorbell: the relay now finds the app's mic stream.**
