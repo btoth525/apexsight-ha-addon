@@ -15,7 +15,7 @@ for eight hours, invisibly. A Focus belongs to one person's device. These pin:
 """
 import os, tempfile, importlib, json, time
 os.environ["APEX_DATA_DIR"] = tempfile.mkdtemp(prefix="apexfocus_")
-os.environ.setdefault("PAIRING_CODE", "APEX-PLEX-5250")
+os.environ.setdefault("PAIRING_CODE", "APEX-TEST-0000")
 os.environ["APEX_SECRET_KEY"] = "testsecret"
 from fastapi.testclient import TestClient
 
@@ -27,7 +27,7 @@ import app.main as m
 import app.db as db
 importlib.reload(m)
 
-CODE = "APEX-PLEX-5250"
+CODE = "APEX-TEST-0000"
 TOK = "a" * 64          # this phone (e.g. the wife's, whose Do Not Disturb is on)
 OTHER = "b" * 64        # the other phone in the household
 

@@ -19,7 +19,7 @@ import os, tempfile
 # apns -> db -> config creates DATA_DIR at import time; point it somewhere writable, exactly as
 # the other suites do.
 os.environ["APEX_DATA_DIR"] = tempfile.mkdtemp(prefix="apexsmart_")
-os.environ.setdefault("PAIRING_CODE", "APEX-PLEX-5250")
+os.environ.setdefault("PAIRING_CODE", "APEX-TEST-0000")
 os.environ["APEX_SECRET_KEY"] = "testsecret"
 from app import apns  # noqa: E402
 import bridge  # noqa: E402

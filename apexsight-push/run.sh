@@ -19,6 +19,14 @@ export TURN_API_TOKEN="$(bashio::config 'turn_api_token')"
 # ---- bridge env -------------------------------------------------------------
 export RELAY_URL="http://127.0.0.1:3421"
 export PAIRING_CODE="$(bashio::config 'pairing_code')"
+# Retired codes still accepted (as aliases of pairing_code) while phones update. Comma-separated.
+export LEGACY_PAIRING_CODES="$(bashio::config 'legacy_pairing_codes')"
+# Driveway deterrent HA webhook IDs — secrets, so they live in the options, not the repo.
+export WEBHOOK_COP_LIGHTS="$(bashio::config 'webhook_cop_lights')"
+export WEBHOOK_SIREN="$(bashio::config 'webhook_siren')"
+export WEBHOOK_VOICE="$(bashio::config 'webhook_voice')"
+export WEBHOOK_LIGHTS_SIREN="$(bashio::config 'webhook_lights_siren')"
+export WEBHOOK_DETERRENT="$(bashio::config 'webhook_deterrent')"
 export FRIGATE_BASE_URL="$(bashio::config 'frigate_base_url')"
 # LAN host for go2rtc's RTSP port (:8554). frigate_base_url is the PUBLIC hostname the
 # phones use; :8554 is not exposed there, so live two-way talk must pull over the LAN.

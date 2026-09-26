@@ -382,3 +382,21 @@ def clear_diag(pairing_code: str) -> int:
     with _conn() as c:
         cur = c.execute("DELETE FROM diag WHERE pairing_code = ?", (pairing_code,))
         return cur.rowcount or 0
+
+
+def migrate_pairing_codes(old_codes: set[str], new_code: str) -> int:
+    """Re-home everything registered under a retired pairing code onto the current one, so pushes
+    and rings keep reaching phones that registered before a rotation. Returns rows moved."""
+    if not old_codes or not new_code:
+        return 0
+    moved = 0
+    with _conn() as c:
+        for table in ("devices", "voip_tokens", "ring_log", "recap_events", "diag"):
+            for old in old_codes:
+                try:
+                    cur = c.execute(f"UPDATE OR IGNORE {table} SET pairing_code = ? WHERE pairing_code = ?",
+                                    (new_code, old))
+                    moved += cur.rowcount or 0
+                except Exception:
+                    pass
+    return moved

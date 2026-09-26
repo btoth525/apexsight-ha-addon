@@ -15,7 +15,7 @@ Head-truncating that same doorbell review would have shown an empty porch — th
 """
 import os
 
-os.environ.setdefault("PAIRING_CODE", "APEX-PLEX-5250")
+os.environ.setdefault("PAIRING_CODE", "APEX-TEST-0000")
 import bridge  # noqa: E402
 
 ok = []

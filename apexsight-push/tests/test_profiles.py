@@ -14,7 +14,7 @@ or worse, cameras they expect to alert would go quiet. Hence `is_default` gates 
 import json
 import os
 
-os.environ.setdefault("PAIRING_CODE", "APEX-PLEX-5250")
+os.environ.setdefault("PAIRING_CODE", "APEX-TEST-0000")
 import bridge  # noqa: E402
 
 ok = []

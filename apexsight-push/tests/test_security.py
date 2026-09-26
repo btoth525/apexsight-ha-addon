@@ -1,13 +1,13 @@
 """Security regression tests for the ApexSight push relay.
 
-Run:  PYTHONPATH=. PAIRING_CODE=APEX-PLEX-5250 python3 tests/test_security.py
+Run:  PYTHONPATH=. PAIRING_CODE=APEX-TEST-0000 python3 tests/test_security.py
 Exercises the pairing-gate authz, the alert-suppress endpoint gating, the body-size cap,
 the constant-time mode-extras check, the REQUIRE_MODE_CODE occupancy-oracle gate, and the
 trusted-proxy / in-house-bridge request classification.
 """
 import os, tempfile, importlib
 os.environ["APEX_DATA_DIR"] = tempfile.mkdtemp(prefix="apextest_")
-os.environ.setdefault("PAIRING_CODE", "APEX-PLEX-5250")
+os.environ.setdefault("PAIRING_CODE", "APEX-TEST-0000")
 os.environ["APEX_SECRET_KEY"] = "testsecret"
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -25,10 +25,10 @@ import app.main as m
 importlib.reload(m)
 with TestClient(m.app) as c:
     check("gate wrong code -> 403", c.post("/v1/gate", json={"pairing_code":"WRONG","disarmed":True,"snoozed_until":0}).status_code == 403)
-    check("gate correct (lowercased) -> 200", c.post("/v1/gate", json={"pairing_code":"apex-plex-5250","disarmed":False,"snoozed_until":0}).status_code == 200)
+    check("gate correct (lowercased) -> 200", c.post("/v1/gate", json={"pairing_code":"apex-test-0000","disarmed":False,"snoozed_until":0}).status_code == 200)
     check("muted-cameras wrong code -> 403", c.post("/v1/muted-cameras", json={"pairing_code":"WRONG","muted":["Garage"]}).status_code == 403)
-    check("muted-cameras correct -> 200", c.post("/v1/muted-cameras", json={"pairing_code":"APEX-PLEX-5250","muted":["Garage"]}).status_code == 200)
-    r = c.get("/v1/mode", params={"pairing_code":"APEX-PLEX-5250"})
+    check("muted-cameras correct -> 200", c.post("/v1/muted-cameras", json={"pairing_code":"APEX-TEST-0000","muted":["Garage"]}).status_code == 200)
+    r = c.get("/v1/mode", params={"pairing_code":"APEX-TEST-0000"})
     check("mode correct code -> gate extras present", r.status_code==200 and "disarmed" in r.json())
     r = c.get("/v1/mode", params={"pairing_code":"NOPE"})
     check("mode wrong code -> extras omitted", r.status_code==200 and "disarmed" not in r.json())
@@ -42,7 +42,7 @@ importlib.reload(m)
 with TestClient(m.app) as c:
     check("flag ON: no code -> 403 (oracle closed)", c.get("/v1/mode").status_code == 403)
     check("flag ON: wrong code -> 403", c.get("/v1/mode", params={"pairing_code":"NOPE"}).status_code == 403)
-    check("flag ON: correct code -> 200 + mode", (lambda r: r.status_code==200 and "mode" in r.json())(c.get("/v1/mode", params={"pairing_code":"APEX-PLEX-5250"})))
+    check("flag ON: correct code -> 200 + mode", (lambda r: r.status_code==200 and "mode" in r.json())(c.get("/v1/mode", params={"pairing_code":"APEX-TEST-0000"})))
 del os.environ["REQUIRE_MODE_CODE"]
 importlib.reload(m)
 

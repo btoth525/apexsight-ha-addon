@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.28.0
+
+**Secrets out of the repo, and pairing-code rotation without downtime.**
+
+- The driveway deterrent webhook IDs are no longer hard-coded. This repo is public and the ID is
+  the only secret on an HA webhook, so they now come from new options (`webhook_cop_lights`,
+  `webhook_siren`, `webhook_voice`, `webhook_lights_siren`, `webhook_deterrent`). An action with
+  no ID answers 503 instead of firing. Mark the HA webhook triggers **local only**: the relay
+  calls them through the Supervisor proxy, which counts as local.
+- New `legacy_pairing_codes` option (comma-separated). A retired code is accepted as an alias of
+  `pairing_code`: registrations land under the current code, gated calls pass, and on startup
+  every row stored under a retired code (devices, VoIP tokens, rings, recaps, diagnostics) moves
+  to the current one. Phones keep receiving pushes and rings while they update to a build with
+  the new code. Clear the option once they all have.
+- `pairing_code` no longer ships with a default. Set your own and never commit it.
+
 ## 1.27.4
 
 **Live talk frees the door speaker 2.5 s after you let go, down from 10 s.** go2rtc keeps the

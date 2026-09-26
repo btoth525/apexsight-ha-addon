@@ -13,7 +13,7 @@ APNs **relay** (with a web GUI to upload your Apple `.p8`) **and** the Frigate
 3. **Configuration** tab:
    - **Admin username / password** — for the web GUI login.
    - **Frigate URL** — where your phone can reach Frigate (for the alert image).
-   - **Pairing code** — leave the default (`APEX-PLEX-5250`) for a shared setup;
+   - **Pairing code** — set your own household code (`APEX-XXXX-XXXX`); never commit it;
      it must match the app's code (Settings → Instant Push).
    - MQTT auto-fills from your HA broker.
 4. **Start**. First launch builds Python — watch the **Log** until you see

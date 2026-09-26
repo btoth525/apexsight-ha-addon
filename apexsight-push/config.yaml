@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.27.4"
+version: "1.28.0"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -24,7 +24,13 @@ webui: "http://[HOST]:[PORT:3421]/admin"
 options:
   admin_username: admin
   admin_password: ""
-  pairing_code: "APEX-PLEX-5250"
+  pairing_code: ""
+  legacy_pairing_codes: ""
+  webhook_cop_lights: ""
+  webhook_siren: ""
+  webhook_voice: ""
+  webhook_lights_siren: ""
+  webhook_deterrent: ""
   frigate_base_url: ""
   frigate_rtsp_host: ""
   use_frigate_profiles: true
@@ -46,7 +52,13 @@ options:
 schema:
   admin_username: str
   admin_password: password
-  pairing_code: "match(^APEX-[A-Z0-9]{4}-[A-Z0-9]{4}$)"
+  pairing_code: "match(^(APEX-[A-Z0-9]{4}-[A-Z0-9]{4})?$)"
+  legacy_pairing_codes: str?
+  webhook_cop_lights: password?
+  webhook_siren: password?
+  webhook_voice: password?
+  webhook_lights_siren: password?
+  webhook_deterrent: password?
   frigate_base_url: url?
   frigate_rtsp_host: str?
   use_frigate_profiles: bool?

@@ -36,6 +36,18 @@ from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
 PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
+# Codes being retired. During a rotation the phones still carry the old code until they update,
+# so an old code is accepted as an ALIAS of the current one — everything it registers or reads
+# lands under PAIRING_CODE. Empty this option once every phone runs the new build.
+LEGACY_PAIRING_CODES = {
+    c.strip().upper() for c in os.environ.get("LEGACY_PAIRING_CODES", "").split(",") if c.strip()
+} - {PAIRING_CODE}
+
+
+def _canonical_code(code: str) -> str:
+    """Normalize a client's pairing code, mapping a retired code onto the current one."""
+    code = (code or "").upper().strip()
+    return PAIRING_CODE if PAIRING_CODE and code in LEGACY_PAIRING_CODES else code
 
 # GET /v1/mode exposes live house occupancy (home/away), armed_by, and the camera roster — a
 # burglary-timing oracle if left open. Gating it requires that every caller sends the pairing code;
@@ -82,12 +94,17 @@ async def _fire_panel_screen(slug: str) -> None:
 # Driveway deterrent: the app taps a button, the relay fires the matching HA webhook LOCALLY via the
 # Supervisor core proxy (same mechanism as _fire_panel_screen). The webhook IDs never leave the relay,
 # and the app only needs the household pairing code it already has — no HA URL/token on the phone.
+# IDs come from the add-on options, never the repo: they are the only secret on those webhooks,
+# and this repo is public. An action with no ID configured answers 503 instead of firing.
 _DETERRENT_WEBHOOKS = {
-    "cop_lights":   "apexsight-cop-lights-7f3a9c2e",
-    "siren":        "apexsight-driveway-siren-b81e4d5a",
-    "voice":        "apexsight-driveway-voice-9e4c1a7f",
-    "lights_siren": "apexsight-lights-siren-5d2f8b3c",
-    "deterrent":    "apexsight-deterrent-2c9d7e61",
+    action: os.environ.get(env, "").strip()
+    for action, env in (
+        ("cop_lights", "WEBHOOK_COP_LIGHTS"),
+        ("siren", "WEBHOOK_SIREN"),
+        ("voice", "WEBHOOK_VOICE"),
+        ("lights_siren", "WEBHOOK_LIGHTS_SIREN"),
+        ("deterrent", "WEBHOOK_DETERRENT"),
+    )
 }
 # Allowlist the clip filename — it reaches ffmpeg server-side, so never forward an arbitrary string.
 _DETERRENT_CLIPS = {
@@ -128,6 +145,9 @@ app.include_router(admin_router)
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
+    moved = db.migrate_pairing_codes(LEGACY_PAIRING_CODES, PAIRING_CODE)
+    if LEGACY_PAIRING_CODES:
+        print(f"[pairing] {len(LEGACY_PAIRING_CODES)} retired code(s) accepted as aliases; moved {moved} row(s)", flush=True)
     asyncio.create_task(_recap_scheduler())
 
 
@@ -461,10 +481,10 @@ def root() -> RedirectResponse:
 def register(body: RegisterIn, _: None = Depends(rate_limit)) -> dict:
     env = body.environment if body.environment in ("production", "sandbox") else "production"
     db.upsert_device(
-        body.device_token, body.pairing_code.upper().strip(), env, body.platform,
+        body.device_token, _canonical_code(body.pairing_code), env, body.platform,
         device_name=(body.device_name or "").strip()[:64],
     )
-    return {"ok": True, "pairing_code": body.pairing_code.upper().strip()}
+    return {"ok": True, "pairing_code": _canonical_code(body.pairing_code)}
 
 
 @app.post("/v1/unregister")
@@ -478,7 +498,7 @@ def register_voip(body: RegisterVoIPIn, _: None = Depends(rate_limit)) -> dict:
     """An iPhone registers its PushKit VoIP token so the relay can ring it (CallKit) on a doorbell
     press. Separate from the APNs token — VoIP pushes use a different topic + push type."""
     env = body.environment if body.environment in ("production", "sandbox") else "production"
-    db.upsert_voip(body.voip_token, body.pairing_code.upper().strip(), env,
+    db.upsert_voip(body.voip_token, _canonical_code(body.pairing_code), env,
                    device_name=(body.device_name or "").strip()[:64])
     return {"ok": True}
 
@@ -517,9 +537,12 @@ async def deterrent(body: DeterrentIn, _: None = Depends(rate_limit)) -> dict:
     makes noise outside, so it's gated by the household pairing code. Forwards to the matching HA
     webhook on the LOCAL core API (webhooks ignore auth; the Supervisor token authorizes the proxy)."""
     _require_pairing(body.pairing_code)
-    hook = _DETERRENT_WEBHOOKS.get((body.action or "").strip())
-    if not hook:
+    action = (body.action or "").strip()
+    if action not in _DETERRENT_WEBHOOKS:
         raise HTTPException(status_code=400, detail="unknown deterrent action")
+    hook = _DETERRENT_WEBHOOKS[action]
+    if not hook:
+        raise HTTPException(status_code=503, detail=f"no webhook id configured for {action}")
     if not SUPERVISOR_TOKEN:
         raise HTTPException(status_code=503, detail="relay has no supervisor token")
     payload: dict = {}
@@ -677,7 +700,7 @@ def _require_pairing(code: str) -> str:
     endpoint that makes noise at the front door (and that hands URLs to ffmpeg)."""
     if not PAIRING_CODE:
         raise HTTPException(status_code=503, detail="relay has no pairing code configured")
-    code = (code or "").upper().strip()
+    code = _canonical_code(code)
     # Constant-time compare so the one secret that gates every ring/talk/mode/suppress action
     # doesn't leak byte-by-byte through response timing.
     if not hmac.compare_digest(code, PAIRING_CODE):
@@ -903,7 +926,7 @@ async def test_push(body: TestIn, _: None = Depends(rate_limit)) -> dict:
 async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     if not apns.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured on relay")
-    code = body.pairing_code.upper().strip()
+    code = _canonical_code(body.pairing_code)
     if not db.devices_for(code):
         # Nothing registered under this code yet — not an error the bridge should retry on.
         return {"ok": True, "devices": 0, "sent": 0, "note": "no devices for pairing code"}
