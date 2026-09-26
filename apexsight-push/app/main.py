@@ -832,10 +832,14 @@ async def doorbell_talk_live(body: DoorbellTalkLiveIn, _: None = Depends(rate_li
     # speaker — the app fires this call the moment its WebRTC connect starts, and racing ahead
     # would play a stream that isn't there yet (speaker warms, then instant EOF).
     stream_url = f"rtsp://{host}:8554/apex_talkback"
+    # Ask go2rtc's own API on the same LAN host as the RTSP pull. `frigate_base_url` is the public,
+    # login-gated hostname: an unauthenticated GET of /api/go2rtc/streams there is a 401, so the
+    # producer never "appeared" and every live talk was refused as 409 (the app's "speaker busy").
+    streams_url = f"http://{host}:1984/api/streams"
     async with httpx.AsyncClient(timeout=3.0) as http:
         for _attempt in range(10):   # up to ~3s
             try:
-                r = await http.get(f"{frigate}/api/go2rtc/streams")
+                r = await http.get(streams_url)
                 producers = ((r.json() or {}).get("apex_talkback") or {}).get("producers") or []
                 if producers:
                     break

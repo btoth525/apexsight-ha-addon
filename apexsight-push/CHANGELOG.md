@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.27.1
+
+**Live hold-to-talk at the doorbell: the relay now finds the app's mic stream.**
+
+`/v1/doorbell/talk-live` checked that the app's mic publish had landed by asking
+`frigate_base_url` + `/api/go2rtc/streams`. That is the public, login-gated hostname, so the
+unauthenticated check always got a 401, the mic stream never "appeared", and every live talk
+ended in a 409 that the app shows as "The door speaker is busy". It now asks go2rtc's own API
+on `frigate_rtsp_host:1984` (the same LAN host the RTSP pull already uses). Needs app build 269,
+which publishes the mic with go2rtc's `dst=` form. Before that build the publish itself was
+refused with an HTTP 500, which is the error that showed on the phone.
+
 ## 1.27.0
 
 **The doorbell rang, both phones were sent a ring, and neither one rang.**
