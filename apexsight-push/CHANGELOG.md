@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.28.1
+
+**Adding a doorbell preset no longer plays it at the door.** `/v1/doorbell/clip` takes a new
+`play` form field (default `1`). With `play=0` it only saves the preset, and it requires
+`save_as`. App build 271 sends `play=0` from Settings → Doorbell Talkback (Record and Import),
+so the "Add" section no longer speaks through the front-door speaker. That included recordings
+made by accident while scrolling.
+
 ## 1.28.0
 
 **Secrets out of the repo, and pairing-code rotation without downtime.**

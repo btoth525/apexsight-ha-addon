@@ -746,18 +746,25 @@ async def doorbell_status(pairing_code: str = "", _: None = Depends(rate_limit))
 async def doorbell_clip(
     pairing_code: str = Form(""),
     save_as: str = Form(""),
+    play: str = Form("1"),
     audio: UploadFile = File(...),
     _: None = Depends(rate_limit),
 ) -> dict:
-    """Play an uploaded clip to the doorbell speaker right now; optionally save it as a preset."""
+    """Play an uploaded clip to the doorbell speaker right now; optionally save it as a preset.
+    `play=0` saves WITHOUT playing — adding a preset in Settings must not speak at the front door."""
     _require_pairing(pairing_code)
-    if not doorbell.is_configured():
+    should_play = play.strip() not in ("0", "false", "no")
+    if should_play and not doorbell.is_configured():
         raise HTTPException(status_code=503, detail="doorbell_ip not set in add-on config")
+    if not should_play and not save_as.strip():
+        raise HTTPException(status_code=400, detail="nothing to do: play=0 without save_as")
     data = await _read_clip(audio)   # read ONCE, bounded; reuse for both save and play
     saved = None
     if save_as.strip():
         ext = os.path.splitext(audio.filename or "")[1].lstrip(".") or "bin"
         saved = await run_in_threadpool(doorbell.save_clip, save_as.strip(), data, ext)
+    if not should_play:
+        return {"ok": True, "frames": 0, "saved": saved}
     try:
         frames = await _play_bytes(data, audio.filename or "")
     except aqara_talk.TalkbackError as exc:
