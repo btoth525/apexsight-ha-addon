@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.29.0"
+version: "1.29.1"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -33,7 +33,6 @@ options:
   webhook_deterrent: ""
   frigate_base_url: ""
   frigate_rtsp_host: ""
-  frigate_api_url: ""
   use_frigate_profiles: true
   alerts_only: true
   topic: "frigate/reviews"
@@ -62,7 +61,7 @@ schema:
   webhook_deterrent: password?
   frigate_base_url: url?
   frigate_rtsp_host: str?
-  frigate_api_url: url?
+  frigate_api_url: str?
   use_frigate_profiles: bool?
   alerts_only: bool
   topic: str

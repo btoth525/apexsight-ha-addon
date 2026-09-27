@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.29.1
+
+**Fix: 1.29.0 refused to start.** The new optional `frigate_api_url` shipped with an empty default
+and a `url?` schema, and Supervisor rejects an empty string as "expected a URL", so the add-on
+stayed stopped after the update. It is no longer in the defaults, and its schema is `str?`.
+
 ## 1.29.0
 
 **The follow-up push finally carries what it was built to carry: the AI story, this review's GIF,
