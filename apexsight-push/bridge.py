@@ -11,6 +11,8 @@ addon options + MQTT service):
   RELAY_URL          e.g. https://relay.plexserver525.com
   PAIRING_CODE       e.g. APEX-7F3K-2Q9P  (shown in the app)
   FRIGATE_BASE_URL   externally-reachable Frigate URL for snapshots/GIFs
+  FRIGATE_RTSP_HOST  Frigate's LAN host; the bridge's own API reads go to <host>:5000
+  FRIGATE_API_URL    optional override for that LAN API base URL (add-on option frigate_api_url)
   TOPIC              MQTT topic (default frigate/reviews)
   ALERTS_ONLY        "true" → only severity=alert; else also detections
   MQTT_HOST/PORT/USER/PASSWORD
@@ -31,6 +33,16 @@ import requests
 RELAY_URL = os.environ.get("RELAY_URL", "").rstrip("/")
 PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 FRIGATE_BASE_URL = os.environ.get("FRIGATE_BASE_URL", "").rstrip("/")
+# FRIGATE_BASE_URL is the PUBLIC, login-gated hostname the phones use: an unauthenticated GET there
+# is a 401 (the same trap as the 1.27.1 talk-live fix). Every server-side read below — the event's
+# best frame, the recordings probe, the AI review story — went there and got a 401 on every alert,
+# so the AI story never arrived and the follow-up push always waited out the full 25s poll.
+# Server-side reads go to Frigate's unauthenticated LAN API port instead. This URL is for the
+# bridge's OWN requests only and must never go into a payload: phones can't reach it off-LAN.
+_FRIGATE_LAN_HOST = (os.environ.get("FRIGATE_RTSP_HOST") or "").strip().split(":", 1)[0]
+FRIGATE_API_URL = (os.environ.get("FRIGATE_API_URL")
+                   or (f"http://{_FRIGATE_LAN_HOST}:5000" if _FRIGATE_LAN_HOST else FRIGATE_BASE_URL)
+                   ).rstrip("/")
 TOPIC = os.environ.get("TOPIC", "frigate/reviews")
 ALERTS_ONLY = os.environ.get("ALERTS_ONLY", "true").lower() in ("true", "1", "yes")
 # Frigate 0.18 Profiles: activating one applies every camera's alert override atomically, replacing
@@ -656,7 +668,43 @@ def _primary_detection(data: dict) -> str | None:
     return min(dets, key=_epoch)
 
 
-def _best_frame_time(det: str, start: float, end: float) -> float | None:
+# Every server-side read degrades quietly by design (no story, no pinned frame — the alert still
+# goes out), which is exactly how the public-URL 401s went unnoticed. Say so ONCE per process.
+# A 404 is not a fault (an event can be gone), so it never trips this.
+_frigate_read_warned = False
+
+
+def _note_frigate_problem(what: str, detail: str) -> None:
+    global _frigate_read_warned
+    if not _frigate_read_warned:
+        _frigate_read_warned = True
+        log(f"WARNING: Frigate {what} read failed ({detail}) at {FRIGATE_API_URL} — AI stories and "
+            "pinned frames need it; check frigate_rtsp_host. (Logged once.)")
+
+
+def _event_frame_time(det: str) -> float | None:
+    """The event's own highest-scoring frame time (`snapshot_frame_time`), unclamped.
+
+    ONE fetch feeds both the GIF window (`_best_frame_time`) and the pinned still
+    (`_pinned_frame_time`) — they used to GET the same event twice. Returns None if the event can't
+    be read, so every caller falls back to review-window defaults.
+    """
+    if not FRIGATE_API_URL or not det:
+        return None
+    try:
+        r = requests.get(f"{FRIGATE_API_URL}/api/events/{det}", timeout=4)
+        if r.status_code != 200:
+            if r.status_code != 404:
+                _note_frigate_problem("event", f"HTTP {r.status_code}")
+            return None
+        sft = ((r.json() or {}).get("data") or {}).get("snapshot_frame_time")
+        return float(sft) if sft else None
+    except Exception as exc:  # noqa: BLE001 — image quality is never worth failing an alert over
+        _note_frigate_problem("event", repr(exc))
+        return None
+
+
+def _best_frame_time(sft: float | None, start: float, end: float) -> float | None:
     """The event's own highest-scoring frame time, CLAMPED into this review's window.
 
     Frigate re-chooses that frame while the event lives, so it is the best available answer to
@@ -664,20 +712,11 @@ def _best_frame_time(det: str, start: float, end: float) -> float | None:
     frame it picked showed the delivery, while the review's `thumb_time` showed an empty porch.
     Clamping bounds the long tail (a parked-car track kept alive for hours points hours away).
 
-    Returns None if the event can't be read, so every caller falls back to review-window defaults.
+    `sft` is `_event_frame_time`'s answer; None (event unreadable) passes straight through.
     """
-    if not FRIGATE_BASE_URL or not det:
+    if sft is None:
         return None
-    try:
-        r = requests.get(f"{FRIGATE_BASE_URL}/api/events/{det}", timeout=4)
-        if r.status_code != 200:
-            return None
-        sft = ((r.json() or {}).get("data") or {}).get("snapshot_frame_time")
-        if not sft:
-            return None
-        return min(max(float(sft), float(start)), float(end))
-    except Exception:  # noqa: BLE001 — image quality is never worth failing an alert over
-        return None
+    return min(max(float(sft), float(start)), float(end))
 
 
 def _gif_window(best: float | None, start: float, end: float,
@@ -706,7 +745,25 @@ def _gif_window(best: float | None, start: float, end: float,
     return int(gs), math.ceil(ge)
 
 
-def _pinned_frame_time(det: str, camera: str, start: float, end: float) -> float | None:
+def _gif_centre(sft: float | None, thumb_time, start: float, end: float) -> float | None:
+    """Where to centre the final push's GIF: the event's best frame, else the review's own
+    thumbnail moment (`thumb_time`), both clamped into the review window.
+
+    Without the fallback an unreadable event (frigate_rtsp_host unset → 401, a 404, a timeout, or
+    no `snapshot_frame_time`) handed `_gif_window` no centre, and it returned the WHOLE review —
+    unbounded, now that the relay keeps the bridge's final GIF instead of the event preview.gif
+    Frigate caps at 20 s. `thumb_time` is on every review (50 of 50 checked live).
+    """
+    best = _best_frame_time(sft, start, end)
+    if best is None and thumb_time is not None:
+        try:
+            best = _best_frame_time(float(thumb_time), start, end)
+        except (TypeError, ValueError):
+            best = None
+    return best
+
+
+def _pinned_frame_time(sft: float | None, camera: str, start: float, end: float) -> float | None:
     """A FIXED moment inside this review to render the notification image from.
 
     `/api/events/{id}/snapshot.jpg` returns the event's HIGHEST-SCORING frame, and Frigate keeps
@@ -719,7 +776,8 @@ def _pinned_frame_time(det: str, camera: str, start: float, end: float) -> float
     So take the event's chosen frame time but CLAMP it into the review's own window, then render
     that exact frame from recordings. Clamping is what kills the long tail: a parked-car track
     that Frigate keeps alive for hours has a best frame hours away, and clamping pulls it back to
-    the alert. Returns None if the event can't be read, so callers fall back to the old URL.
+    the alert. `sft` is `_event_frame_time`'s answer; None (event unreadable) returns None, so
+    callers fall back to the old URL.
 
     Deliberately NOT `thumb_time`: it reads as the review's canonical moment but rendering that
     frame from recordings produced an empty porch on a verified person+package review, while the
@@ -732,15 +790,9 @@ def _pinned_frame_time(det: str, camera: str, start: float, end: float) -> float
     this deliberately does not second-guess Frigate's choice — it only rescues the outlier where
     a long-lived track (a parked car Frigate keeps alive for hours) points hours from the alert.
     """
-    if not FRIGATE_BASE_URL or not det:
+    if sft is None or not FRIGATE_API_URL:
         return None
     try:
-        r = requests.get(f"{FRIGATE_BASE_URL}/api/events/{det}", timeout=4)
-        if r.status_code != 200:
-            return None
-        sft = ((r.json() or {}).get("data") or {}).get("snapshot_frame_time")
-        if not sft:
-            return None
         sft = float(sft)
         pinned = min(max(sft, float(start)), float(end))
         # Frigate's own frame is already inside the review — leave it alone.
@@ -750,7 +802,7 @@ def _pinned_frame_time(det: str, camera: str, start: float, end: float) -> float
         # a camera whose recording is broken both make this 404, and a 404 means the push lands
         # with NO image at all — strictly worse than a drifted one.
         probe = requests.get(
-            f"{FRIGATE_BASE_URL}/api/{camera}/recordings/{pinned}/snapshot.jpg?height=720",
+            f"{FRIGATE_API_URL}/api/{camera}/recordings/{pinned}/snapshot.jpg?height=720",
             timeout=4,
         )
         if probe.status_code != 200 or not probe.content[:2] == b"\xff\xd8":
@@ -799,13 +851,18 @@ def _review_ai_story(review_id: str, wait_s: float = 25.0) -> dict | None:
     Returns None on timeout — the caller then sends exactly the alert it would have sent before, so
     a slow or disabled model degrades to the old behaviour rather than delaying or dropping alerts.
     """
-    if not FRIGATE_BASE_URL or not review_id:
+    if not FRIGATE_API_URL or not review_id:
         return None
     deadline = time.time() + wait_s
     delay = 1.5
     while time.time() < deadline:
         try:
-            r = requests.get(f"{FRIGATE_BASE_URL}/api/review/{review_id}", timeout=6)
+            r = requests.get(f"{FRIGATE_API_URL}/api/review/{review_id}", timeout=6)
+            if r.status_code in (401, 403):
+                # An auth failure won't fix itself inside the wait — polling it out only made
+                # every follow-up push ~26s late for a story that could never arrive.
+                _note_frigate_problem("review", f"HTTP {r.status_code}")
+                return None
             if r.status_code == 200:
                 meta = ((r.json() or {}).get("data") or {}).get("metadata")
                 # Require real prose — Frigate writes the key before the model has filled it in.
@@ -813,7 +870,8 @@ def _review_ai_story(review_id: str, wait_s: float = 25.0) -> dict | None:
                     return meta
         except Exception:  # noqa: BLE001 — never let this path fail an alert
             pass
-        time.sleep(delay)
+        # Never sleep past the deadline: the uncapped last sleep let a 25s wait run to ~29s.
+        time.sleep(max(0.0, min(delay, deadline - time.time())))
         delay = min(delay * 1.5, 5.0)
     return None
 
@@ -931,7 +989,12 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
     #   • final update   → the now-complete animated GIF, swapped in place via the
     #     shared collapse id (no duplicate notification).
     if FRIGATE_BASE_URL and det:
-        cropped = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg?bbox=1&crop=1"
+        # quality=70 roughly halves the crop (measured 196 KB → 112 KB on the doorbell, 43-46%
+        # across every camera) at no visible cost on a lock screen; Frigate's stored snapshots stay
+        # at 90. MUST stay byte-identical to render.py's `cropped` — the phone's notification
+        # media cache keys on the exact URL, which is what lets the follow-up push reuse the
+        # instant push's picture instead of downloading it again.
+        cropped = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg?bbox=1&crop=1&quality=70"
         gif = f"{FRIGATE_BASE_URL}/api/events/{det}/preview.gif"
         full_snapshot = f"{FRIGATE_BASE_URL}/api/events/{det}/snapshot.jpg"
         if final:
@@ -939,8 +1002,10 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
             # carries is the image the user is left looking at. Pin both to the review's own
             # window so neither can drift to a later moment:
             #   • GIF     → the camera's preview for exactly this review's start→end, instead of
-            #               the event's preview.gif, which spans the event's whole lifetime (82s
-            #               on a verified case) and can be mostly unrelated footage.
+            #               the event's preview.gif, which starts at the EVENT's start (Frigate 0.18
+            #               caps it at 20s from there). A re-linked long-lived track's event can
+            #               start long before the review — measured ~50 min early on 2 of 20
+            #               alerts — so that GIF showed none of what the alert was about.
             #   • still   → the event's best frame CLAMPED into the review window (see
             #               _pinned_frame_time), rendered from recordings at that fixed instant.
             #               height=720 keeps it ~57KB instead of ~262KB, so the notification
@@ -987,7 +1052,8 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
             if rs and re_:
                 # ONE event fetch feeds both the GIF window and the still, so this costs the same
                 # as before despite doing more with the answer.
-                best = _best_frame_time(det, rs, re_)
+                sft = _event_frame_time(det)
+                best = _gif_centre(sft, data.get("thumb_time"), rs, re_)
                 gs, ge = _gif_window(best, rs, re_)
                 payload["snapshot_url"] = (
                     f"{FRIGATE_BASE_URL}/api/{camera}/start/{gs}/end/{ge}/preview.gif"
@@ -996,7 +1062,7 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
                 # event's own choice pointed outside this review. Across 20 real alerts that never
                 # fired, which is the intent: Frigate's pick is normally right, and a recordings
                 # 404 (retention gap, broken camera) would mean no image at all.
-                pinned = _pinned_frame_time(det, camera, rs, re_)
+                pinned = _pinned_frame_time(sft, camera, rs, re_)
                 payload["thumbnail_url"] = (
                     f"{FRIGATE_BASE_URL}/api/{camera}/recordings/{pinned}/snapshot.jpg?height=720"
                     if pinned else cropped
@@ -1472,6 +1538,9 @@ def main():
         sys.exit(1)
     if not FRIGATE_BASE_URL:
         log("WARNING: frigate_base_url is empty — notifications will have no image.")
+    elif FRIGATE_API_URL == FRIGATE_BASE_URL:
+        log("WARNING: frigate_rtsp_host is empty — Frigate reads go to the public URL, where they "
+            "401 behind the login, so pushes get no AI story or pinned frame.")
 
     _ensure_recap_table()
 

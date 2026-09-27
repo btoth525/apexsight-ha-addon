@@ -131,7 +131,11 @@ def render(ev: dict, style: dict | None, stage: str) -> dict:
     snapshot_url = ""
     thumbnail_url = ""
     if base and det:
-        cropped = f"{base}/api/events/{det}/snapshot.jpg?bbox=1&crop=1"
+        # quality=70 roughly halves the crop the instant alert downloads (43-46% smaller across
+        # every camera, measured) — the lock-screen picture lands sooner on cellular. Frigate's
+        # stored snapshots stay at 90. MUST stay byte-identical to bridge.py's `cropped`: the
+        # phone's notification media cache keys on the exact URL.
+        cropped = f"{base}/api/events/{det}/snapshot.jpg?bbox=1&crop=1&quality=70"
         gif = f"{base}/api/events/{det}/preview.gif"
         full = f"{base}/api/events/{det}/snapshot.jpg"
         if stage == "final":

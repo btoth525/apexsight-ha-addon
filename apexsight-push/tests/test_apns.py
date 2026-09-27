@@ -152,6 +152,83 @@ restore(*saved)
 check("gate suppression -> counted as suppressed, no send attempted, nothing pruned",
       result["suppressed"] == 1 and result["sent"] == 0 and deletes == [])
 
+# ---- Fan-out is concurrent: phone 2 no longer waits out phone 1's round trip ----
+
+import httpx  # noqa: E402
+
+inflight = {"now": 0, "max": 0}
+
+
+async def slow_send(device_token, environment, payload, collapse_id=""):
+    inflight["now"] += 1
+    inflight["max"] = max(inflight["max"], inflight["now"])
+    await asyncio.sleep(0.02)
+    inflight["now"] -= 1
+    return (True, "ok") if device_token != "tok-dead3" else (False, "410 Unregistered")
+
+
+rows = [
+    {"device_token": "tok-a", "environment": "production", "updated_at": 1},
+    {"device_token": "tok-muted2", "environment": "production", "updated_at": 2},
+    {"device_token": "tok-dead3", "environment": "production", "updated_at": 3},
+]
+deletes = []
+saved = with_devices(rows, {}, deletes)
+apns.send_to_token = slow_send
+result = run(apns.deliver_to_pairing(
+    "APEX-TEST-0001", {"aps": {}}, gate=lambda t: (t != "tok-muted2", "test")))
+restore(*saved)
+check("every deliverable phone is sent to at once, not one after another", inflight["max"] == 2)
+check("concurrent fan-out keeps per-row results aligned (only the dead token pruned)",
+      deletes == [("tok-dead3", 3)])
+check("concurrent fan-out counts: sent=1 failed=1 pruned=1 suppressed=1",
+      (result["sent"], result["failed"], result["pruned"], result["suppressed"]) == (1, 1, 1, 1))
+
+# ---- The APNs connection is kept warm, and a dead kept-alive socket is retried ONCE ----
+# httpx's default keepalive is 5 s; alerts are minutes apart, so every push paid a cold handshake.
+
+check("APNs keepalive outlives the gap between alerts", apns._APNS_LIMITS.keepalive_expiry >= 300)
+check("a stalled APNs read fails fast (a NAT-dropped socket can't hold a ring for 10 s)",
+      apns._APNS_TIMEOUT.read is not None and apns._APNS_TIMEOUT.read <= 5)
+
+
+class FakeClient:
+    def __init__(self, failures):
+        self.failures = list(failures)
+        self.calls = 0
+
+    async def post(self, url, headers=None, content=None):
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return httpx.Response(200, headers={"apns-id": "id-1"})
+
+
+orig_client, orig_creds = apns._apns_client, apns._credentials
+apns._credentials = lambda: ("p8", "KID", "TEAM", "com.example.app", "auto")
+orig_token = apns._provider_token
+apns._provider_token = lambda p8, kid, team: "jwt"
+
+fake = FakeClient([httpx.ReadError("connection reset")])
+apns._apns_client = lambda: fake
+ok_, detail, apns_id = run(apns.send_voip("v" * 64, "production", {"aps": {}}))
+check("a dead kept-alive socket is retried once and the ring goes out",
+      ok_ and fake.calls == 2 and apns_id == "id-1")
+
+fake = FakeClient([httpx.RemoteProtocolError("GOAWAY"), httpx.RemoteProtocolError("GOAWAY")])
+apns._apns_client = lambda: fake
+ok_, detail = run(apns.send_to_token("t" * 64, "production", {"aps": {}}))
+check("the retry is ONCE, then it reports a network error (the bridge retries from there)",
+      not ok_ and fake.calls == 2 and detail.startswith("network error"))
+
+fake = FakeClient([httpx.ReadTimeout("slow")])
+apns._apns_client = lambda: fake
+ok_, detail = run(apns.send_background("t" * 64, "production", {"aps": {}}))
+check("a timeout is NOT retried in the relay (that would stack a second stall onto a ring)",
+      not ok_ and fake.calls == 1)
+
+apns._apns_client, apns._credentials, apns._provider_token = orig_client, orig_creds, orig_token
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 if not all(ok):
     raise SystemExit(1)

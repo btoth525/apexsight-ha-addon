@@ -56,6 +56,21 @@ for label, best in (("at start", RS), ("mid-review", (RS + RE) / 2), ("at end", 
 gs, ge = bridge._gif_window(RE, RS, RE)
 check("end is rounded up so the final fractional second isn't dropped", ge >= RE)
 
+# The final push's centre: an unreadable event (401 / 404 / timeout) must NOT leave the GIF
+# unbounded — the relay now ships the bridge's GIF as-is, so the review's thumb_time stands in.
+THUMB = RS + 60
+check("centre uses the event's best frame when it was read",
+      bridge._gif_centre(BEST, THUMB, RS, RE) == BEST)
+check("centre falls back to the review's thumb_time when the event is unreadable",
+      bridge._gif_centre(None, THUMB, RS, RE) == THUMB)
+gs, ge = bridge._gif_window(bridge._gif_centre(None, THUMB, RS, RE), RS, RE)
+check("an unreadable event still gets a bounded GIF", 19 <= ge - gs <= 21)
+check("that GIF covers the thumbnail moment", gs <= THUMB <= ge)
+check("a thumb_time outside the review is clamped into it",
+      bridge._gif_centre(None, RE + 500, RS, RE) == RE)
+check("no best frame and no thumb_time → no centre (full-window fallback)",
+      bridge._gif_centre(None, None, RS, RE) is None)
+
 # Degenerate inputs must not produce an inverted or negative window.
 gs, ge = bridge._gif_window(RS, RS, RS)
 check("zero-length review yields a non-inverted window", ge >= gs)

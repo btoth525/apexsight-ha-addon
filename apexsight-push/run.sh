@@ -31,6 +31,11 @@ export FRIGATE_BASE_URL="$(bashio::config 'frigate_base_url')"
 # LAN host for go2rtc's RTSP port (:8554). frigate_base_url is the PUBLIC hostname the
 # phones use; :8554 is not exposed there, so live two-way talk must pull over the LAN.
 export FRIGATE_RTSP_HOST="$(bashio::config 'frigate_rtsp_host')"
+# The bridge's own (unauthenticated) Frigate API reads default to http://<frigate_rtsp_host>:5000.
+# Only for a Frigate whose API isn't there. has_value: an unset optional can read back as "null".
+if bashio::config.has_value 'frigate_api_url'; then
+  export FRIGATE_API_URL="$(bashio::config 'frigate_api_url')"
+fi
 # Frigate 0.18 Profiles: one MQTT publish per mode change instead of 18 HA switch calls.
 export USE_FRIGATE_PROFILES="$(bashio::config 'use_frigate_profiles')"
 export TOPIC="$(bashio::config 'topic')"

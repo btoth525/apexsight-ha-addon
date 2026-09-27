@@ -639,8 +639,12 @@ async def doorbell_ring(body: DoorbellRingIn, _: None = Depends(rate_limit)) -> 
     rows = db.voip_tokens_for(code)
     payload = {"aps": {"content-available": 1}, "doorbell": True, "camera": body.camera or "doorbell"}
     sent, failed, pruned = 0, 0, 0
-    for row in rows:
-        ok, detail, apns_id = await apns.send_voip(row["voip_token"], row["environment"], payload)
+    # Ring every phone AT ONCE, then log. Serially, each later phone waited for the previous one's
+    # APNs round trip plus its ring_log write (58-82 ms apart in ring_log) — on the one push where
+    # every millisecond is a visitor standing at the door. gather() keeps results in row order.
+    results = await asyncio.gather(
+        *(apns.send_voip(row["voip_token"], row["environment"], payload) for row in rows))
+    for row, (ok, detail, apns_id) in zip(rows, results):
         # One durable row PER PHONE, named. The aggregate counters below say a ring "worked";
         # only this says WHICH phone Apple accepted it for, and under which apns-id.
         name = (row["device_name"] or "").strip()
@@ -929,6 +933,75 @@ async def test_push(body: TestIn, _: None = Depends(rate_limit)) -> dict:
     return {"ok": True}
 
 
+# How many recently-suppressed review ids the dedup state remembers, so their FINAL follow-ups can
+# be dropped too. A handful covers the dedup window many times over.
+_DEDUP_SUPPRESSED_KEEP = 20
+
+
+def _dedup_decision(prev: dict, review_id: str, labels, stage: str, silent: bool,
+                    now: float, window: float) -> tuple[bool, dict | None]:
+    """The duplicate-review verdict for one push: (suppress?, state to write — None writes nothing).
+
+    An ALERT is compared against the last alert delivered for this camera (see the notify comment);
+    a suppressed one is remembered by id, with the delivered alert's state left untouched.
+
+    A FINAL is never compared and never re-stamps the state: it replaces its own review's alert in
+    place (shared collapse id), so it is not a new visit. Letting a non-silent (AI level >= 1)
+    final through the comparison re-stamped the clock with its own time, ~105 s after the alert,
+    so a distinct visit minutes later was dropped as a "duplicate"; and a final whose labels had
+    grown to match another review could be dropped itself, losing the escalation. The one final
+    that IS dropped: a silent one whose own alert was suppressed — with nothing on the phone to
+    replace, it would land as a second notification for one activity. A non-silent final there
+    still goes out: the model rated it worth attention, and a missed real alert is worse than a
+    stray buzz.
+
+    Pure (no DB, no APNs) so tests/test_dedup.py can pin it directly.
+    """
+    suppressed = [r for r in (prev.get("suppressed") or []) if isinstance(r, str)]
+    if stage == "final":
+        return (silent and review_id in suppressed), None
+    new_labels = set(labels or [])
+    prev_labels = set(prev.get("labels") or [])
+    if (prev.get("review_id") and prev.get("review_id") != review_id
+            and (now - float(prev.get("ts") or 0)) < window
+            and new_labels and new_labels == prev_labels):
+        state = dict(prev)
+        if review_id not in suppressed:
+            state["suppressed"] = (suppressed + [review_id])[-_DEDUP_SUPPRESSED_KEEP:]
+        return True, state
+    return False, {"ts": now, "review_id": review_id, "labels": sorted(new_labels),
+                   "suppressed": suppressed}
+
+
+def _merge_final(body: NotifyIn, style, title: str, text: str,
+                 snapshot_url: str, thumbnail_url: str) -> tuple[str, str, str, str]:
+    """Keep the bridge's own values on the FINAL push, over the style renderer's.
+
+    The renderer only knows the EVENT, so its final media is `/api/events/{det}/preview.gif`,
+    which starts at the event's start — on a re-linked long-lived track that was ~50 min before the
+    review (measured on 2 of 20 alerts), footage with nothing to do with the alert. The bridge
+    scoped its GIF to THIS review's window and may have pinned the still into it, and it may carry
+    Frigate's AI story, which the renderer can't know. Overwriting all of that on every final push
+    meant the AI headline/summary and the bounded GIF never reached a lock screen.
+
+    Style still decides GIF vs still (`finalGif`), and a field the bridge left empty keeps the
+    rendered value, so a bridge without the story or the media degrades to exactly the old push.
+    Pure (no DB, no APNs) so tests/test_final_merge.py can pin it directly.
+    """
+    final_gif = style.get("finalGif", True) if isinstance(style, dict) else True
+    if body.thumbnail_url:
+        thumbnail_url = body.thumbnail_url
+    if final_gif and body.snapshot_url:
+        snapshot_url = body.snapshot_url
+    elif not final_gif and body.thumbnail_url:
+        snapshot_url = body.thumbnail_url
+    if body.ai_title and body.title:
+        title = body.title      # the bridge already prefixed the traffic-light dot
+    if body.ai_summary and body.body:
+        text = body.body
+    return title, text, snapshot_url, thumbnail_url
+
+
 @app.post("/v1/notify")
 async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     if not apns.is_configured():
@@ -984,7 +1057,11 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     # missed real alert is worse than a stray buzz, so this only collapses truly-identical repeats.
     # FAIL-OPEN: a new object class, a gap past the window, no prior alert, a same-review re-POST
     # (retry/update — collapse_id already de-dupes those in iOS), or ANY parse error all DELIVER.
-    if body.review_id and body.camera and body.labels and not body.is_description and not body.silent:
+    # A FINAL follow-up is never compared and never re-stamps the clock; it is dropped only when it
+    # is silent and its own alert was (see _dedup_decision).
+    stage = body.stage or "alert"
+    if (body.review_id and body.camera and not body.is_description
+            and (stage == "final" or (body.labels and not body.silent))):
         try:
             window = float(db.get_config(f"dedup_window:{code}", "") or 300)
         except Exception:
@@ -993,21 +1070,25 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
             key = f"recentnotif:{code}:{body.camera}"
             try:
                 prev = json.loads(db.get_config(key, "") or "{}")
+                if not isinstance(prev, dict):
+                    prev = {}
             except Exception:
                 prev = {}
-            now = time.time()
-            new_labels = set(body.labels)
-            prev_labels = set(prev.get("labels") or [])
-            if (prev.get("review_id") and prev.get("review_id") != body.review_id
-                    and (now - float(prev.get("ts") or 0)) < window
-                    and new_labels and new_labels == prev_labels):
-                print(f"[dedup] {body.camera}: review {body.review_id} suppressed "
-                      f"(identical dupe of {prev.get('review_id')}, labels {sorted(new_labels)})", flush=True)
-                return {"ok": True, "sent": 0, "note": "duplicate review (dedup)"}
             try:
-                db.set_config(key, json.dumps({"ts": now, "review_id": body.review_id, "labels": sorted(new_labels)}))
+                suppress, state = _dedup_decision(prev, body.review_id, body.labels, stage,
+                                                  bool(body.silent), time.time(), window)
             except Exception:
-                pass
+                suppress, state = False, None
+            if state is not None:
+                try:
+                    db.set_config(key, json.dumps(state))
+                except Exception:
+                    pass
+            if suppress:
+                what = ("its alert was a dupe" if stage == "final"
+                        else f"identical dupe of {prev.get('review_id')}, labels {sorted(set(body.labels or []))}")
+                print(f"[dedup] {body.camera}: review {body.review_id} [{stage}] suppressed ({what})", flush=True)
+                return {"ok": True, "sent": 0, "note": "duplicate review (dedup)"}
 
     title, text = body.title, body.body
     snapshot_url, thumbnail_url = body.snapshot_url, body.thumbnail_url
@@ -1051,6 +1132,11 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
             text = rendered["body"] or text
             snapshot_url = rendered["snapshot_url"] or snapshot_url
             thumbnail_url = rendered["thumbnail_url"] or thumbnail_url
+            # The instant "alert" stays fully style-rendered; the final push keeps what only the
+            # bridge knows (see _merge_final).
+            if (body.stage or "alert") == "final":
+                title, text, snapshot_url, thumbnail_url = _merge_final(
+                    body, style, title, text, snapshot_url, thumbnail_url)
         except Exception as exc:
             print(f"[notify] render failed ({exc}); using bridge-supplied title/body", flush=True)
 

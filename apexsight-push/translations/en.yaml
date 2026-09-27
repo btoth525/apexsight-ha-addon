@@ -17,6 +17,13 @@ configuration:
     description: >-
       A URL your phone can reach Frigate at, used to load the notification
       image/GIF — e.g. https://frigate.yourdomain.com. Leave blank for text-only.
+  frigate_api_url:
+    name: Frigate LAN API URL (optional)
+    description: >-
+      Where the add-on itself reads Frigate's API (event best frames, AI review
+      stories, the recordings probe) — never sent to phones. Leave blank to use
+      http://<frigate_rtsp_host>:5000; set it only if Frigate's unauthenticated
+      API is somewhere else, e.g. http://192.168.1.204:5001.
   alerts_only:
     name: Alerts only
     description: On = only Frigate "alert" reviews. Off = also send detections.

@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.29.0
+
+**The follow-up push finally carries what it was built to carry: the AI story, this review's GIF,
+and the pinned still.** Two bugs stacked. Ship them together (plus the crop change below, which
+has to land on both sides in the same version).
+
+- **The bridge's Frigate reads all got 401.** They went to `frigate_base_url`, the public,
+  login-gated hostname, with no auth. This is the same trap as the 1.27.1 talk-live fix. The event's
+  best frame, the recordings probe and the AI review story therefore never arrived. Every
+  follow-up push waited out the whole 25 s story poll, and then some. The GIF window never centred,
+  so long reviews got the full-window GIF. Server-side reads now go to Frigate's LAN API,
+  `http://<frigate_rtsp_host>:5000` (or the new optional `frigate_api_url`, for a Frigate whose API
+  is elsewhere). URLs that go to the phones stay on `frigate_base_url`. With both empty the reads
+  still go to the public URL and 401, and the bridge warns about it at startup and on the first
+  failed read. Unlike before, that no longer means a full-window GIF: when the event can't be read
+  (401, 404, timeout, no `snapshot_frame_time`) the GIF now centres on the review's `thumb_time`,
+  so it stays ~20 s. A 401/403 on the story no longer polls out the full wait. The last poll
+  sleep no longer overruns the deadline. The event is fetched once instead of twice.
+- **`/v1/notify` re-rendered the final push and overwrote the bridge's values.** The AI headline
+  and summary, the review-window GIF and the pinned still were all replaced with the renderer's.
+  The final stage now keeps the bridge's values, via `_merge_final`. Style still picks GIF or still
+  (`finalGif`), and any field the bridge left empty keeps the rendered value. The instant alert is
+  unchanged.
+- **Behaviour change to expect:** a trusted AI rating of level 1 or above now actually reaches the
+  phones, so those follow-ups arrive time-sensitive (level 2 also audible). This had never happened
+  in production. Final follow-ups are no longer compared by the duplicate-review check and never
+  re-stamp its clock: a non-silent final used to, so a distinct visit a few minutes after an
+  AI-rated alert was dropped as a duplicate. A silent final whose own alert was suppressed as a
+  duplicate is now dropped too (it had nothing to replace, so it landed as a second notification);
+  an AI-escalated one still goes out.
+- **Correction to 1.16.1 / 1.18.0:** Frigate 0.18 caps the event `preview.gif` at 20 s from the
+  *event's* start. It does not span the whole event lifetime. The real defect was that on a
+  re-linked long-lived track the event started long before the review (about 50 min early on 2 of
+  20 measured alerts), so that GIF showed none of the alert.
+- **The instant alert's crop is requested at `quality=70`**, in `render.py` and `bridge.py`, which
+  stay byte-identical because the phone's media cache keys on the exact URL. The crop is 43–46%
+  smaller on every camera (doorbell 196 → 112 KB), so the lock-screen picture lands sooner on
+  cellular. Frigate's stored snapshots stay at quality 90.
+- **APNs connection kept warm.** httpx dropped the idle HTTP/2 connection after 5 s, so every ring
+  and alert (usually minutes apart) paid a cold TCP+TLS handshake: about 108–141 ms, against 33 ms
+  warm. Keepalive is now 10 min. The read timeout is 5 s, and one immediate retry covers a
+  kept-alive socket that died while idle. Timeouts are not retried in the relay. Doorbell rings and
+  alert fan-out now go to every phone at once instead of one after another.
+- Tests: new `tests/test_final_merge.py`, `tests/test_frigate_lan_reads.py` and `tests/test_dedup.py`,
+  `thumb_time` fallback checks in `test_gif_window.py`, plus fan-out and
+  retry checks added to `test_apns.py` and `test_ring_log.py`.
+
 ## 1.28.1
 
 **Adding a doorbell preset no longer plays it at the door.** `/v1/doorbell/clip` takes a new

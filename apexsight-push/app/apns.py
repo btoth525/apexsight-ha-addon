@@ -8,6 +8,7 @@ registration.
 No secrets live here — the .p8 PEM, Key ID, Team ID and Bundle ID are read
 from the DB config table (populated via the admin GUI).
 """
+import asyncio
 import json
 import time
 from typing import Optional
@@ -79,6 +80,24 @@ def is_configured() -> bool:
 
 _shared_client: Optional[httpx.AsyncClient] = None
 
+# httpx's default keepalive_expiry is 5s. Alerts and rings are minutes apart (median gap measured
+# ~12 min), so the pooled connection was ALWAYS gone and every ring and alert paid a fresh
+# TCP+TLS handshake to APNs first (measured ~108-141 ms cold vs ~33 ms warm). Keep it for 10 min;
+# Apple recommends holding the connection open. A person alert usually goes out seconds before the
+# doorbell press, so the ring now rides that warm connection.
+#
+# The short read timeout bounds the one real cost of a long keepalive: a socket a NAT silently
+# dropped would otherwise stall a ring for the full old 10s before failing. APNs answers in well
+# under a second when it answers at all.
+_APNS_TIMEOUT = httpx.Timeout(5.0, connect=3.0, pool=3.0)
+_APNS_LIMITS = httpx.Limits(max_connections=10, max_keepalive_connections=4, keepalive_expiry=600.0)
+# What a kept-alive socket that APNs or a NAT closed while idle raises on first use (plus a
+# reconnect that fails once). httpcore has already discarded that connection, so one immediate
+# retry opens a fresh one. Timeouts are deliberately NOT here: a read timeout falls through to the
+# caller's 502/503, which the bridge already retries — retrying it here too would stack a second
+# 5s stall onto a ring.
+_RETRY_ON_STALE = (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError)
+
 
 def _apns_client() -> httpx.AsyncClient:
     """One long-lived HTTP/2 client, reused across sends. Fanning an alert to N phones then
@@ -86,8 +105,16 @@ def _apns_client() -> httpx.AsyncClient:
     connection — instead of doing N TLS handshakes + N fresh HTTP/2 connections per push."""
     global _shared_client
     if _shared_client is None or _shared_client.is_closed:
-        _shared_client = httpx.AsyncClient(http2=True, timeout=10.0)
+        _shared_client = httpx.AsyncClient(http2=True, timeout=_APNS_TIMEOUT, limits=_APNS_LIMITS)
     return _shared_client
+
+
+async def _post(url: str, headers: dict, body: str) -> httpx.Response:
+    """POST to APNs, retrying ONCE on a dead kept-alive socket (see _RETRY_ON_STALE)."""
+    try:
+        return await _apns_client().post(url, headers=headers, content=body)
+    except _RETRY_ON_STALE:
+        return await _apns_client().post(url, headers=headers, content=body)
 
 
 async def send_to_token(
@@ -108,7 +135,7 @@ async def send_to_token(
         headers["apns-collapse-id"] = collapse_id[:64]
     url = f"{_host_for(environment, env_mode)}/3/device/{device_token}"
     try:
-        resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
+        resp = await _post(url, headers, json.dumps(payload))
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}"
 
@@ -135,7 +162,7 @@ async def send_background(device_token: str, environment: str, payload: dict) ->
     }
     url = f"{_host_for(environment, env_mode)}/3/device/{device_token}"
     try:
-        resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
+        resp = await _post(url, headers, json.dumps(payload))
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}"
     if resp.status_code == 200:
@@ -170,7 +197,7 @@ async def send_voip(voip_token: str, environment: str, payload: dict) -> tuple[b
     }
     url = f"{_host_for(environment, env_mode)}/3/device/{voip_token}"
     try:
-        resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
+        resp = await _post(url, headers, json.dumps(payload))
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}", ""
     apns_id = resp.headers.get("apns-id", "")
@@ -298,6 +325,7 @@ async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str 
     rows = db.devices_for(pairing_code)
     sent, failed, pruned, suppressed = 0, 0, 0, 0
     errors: list[str] = []
+    deliverable = []
     for row in rows:
         token = row["device_token"]
         if gate is not None:
@@ -306,7 +334,14 @@ async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str 
             if not deliver:
                 suppressed += 1
                 continue
-        ok, detail = await send_to_token(token, row["environment"], payload, collapse_id)
+        deliverable.append(row)
+    # Every phone AT ONCE: serially, each later phone waited out the previous one's APNs round
+    # trip. They multiplex over the shared HTTP/2 client, and gather() keeps results in row order.
+    results = await asyncio.gather(
+        *(send_to_token(row["device_token"], row["environment"], payload, collapse_id)
+          for row in deliverable))
+    for row, (ok, detail) in zip(deliverable, results):
+        token = row["device_token"]
         if ok:
             sent += 1
             continue

@@ -89,5 +89,38 @@ src = inspect.getsource(apns.send_voip)
 check("send_voip sets apns-expiration: 0", '"apns-expiration": "0"' in src)
 check("send_voip returns the apns-id too", src.count("apns_id") >= 3)
 
+# ---- every phone rings AT ONCE, and each still gets its own named row ----
+# Serially, phone 2 waited out phone 1's APNs round trip plus its ring_log write (58-82 ms apart
+# in the real ring_log) — on the one push where a visitor is standing at the door.
+import asyncio  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+import app.main as m  # noqa: E402
+
+RING_CODE = m.PAIRING_CODE
+db.upsert_voip("c" * 64, RING_CODE, "production", device_name="Phone C")
+db.upsert_voip("d" * 64, RING_CODE, "production", device_name="Phone D")
+inflight = {"now": 0, "max": 0}
+
+
+async def fake_voip(voip_token, environment, payload):
+    inflight["now"] += 1
+    inflight["max"] = max(inflight["max"], inflight["now"])
+    await asyncio.sleep(0.02)
+    inflight["now"] -= 1
+    return True, "ok", f"apns-{voip_token[0]}"
+
+
+phones = len(db.voip_tokens_for(RING_CODE))    # 4 when RING_CODE is CODE (the a/b phones above)
+apns.is_configured = lambda: True
+apns.send_voip = fake_voip
+with TestClient(m.app) as client:
+    r = client.post("/v1/doorbell-ring", json={"pairing_code": RING_CODE, "camera": "doorbell"})
+check("the ring is accepted", r.status_code == 200 and r.json().get("sent") == phones)
+check("every phone is rung concurrently, not one after the other", inflight["max"] == phones)
+rows = {x["device_name"]: dict(x) for x in db.rings_for(RING_CODE)}
+check("each phone still gets its own row with ITS apns-id",
+      rows.get("Phone C", {}).get("apns_id") == "apns-c"
+      and rows.get("Phone D", {}).get("apns_id") == "apns-d")
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 raise SystemExit(0 if all(ok) else 1)
