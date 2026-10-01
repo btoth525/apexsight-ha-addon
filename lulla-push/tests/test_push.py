@@ -499,3 +499,20 @@ def test_household_survives_a_pairing_code_change(env, monkeypatch):
     r = env.http.post("/v1/register", json={"pairing_code": "LULLA-NEW0-CODE", "device_id": "p2"})
     assert r.status_code == 200 and r.json()["household"] == hid
     assert env.http.post("/v1/register", json={"pairing_code": "LULLA-TEST-0001", "device_id": "p3"}).status_code == 403
+
+
+def test_sync_push_silently_wakes_the_other_phone(env):
+    a = _register_push(env, "phoneA", "phoneA", "tok-a")["token"]
+    _register_push(env, "phoneB", "phoneB", "tok-b")
+    env.main._last_poke.clear()
+    rec = {"type": "LogEvent", "id": "E1", "updated_at": 100.0, "created_by": "phoneA",
+           "is_tombstoned": False, "payload": "{}"}
+    r = env.http.post("/v1/sync/push", json={"records": [rec]}, headers={"Authorization": f"Bearer {a}"})
+    assert r.status_code == 200 and r.json()["applied"] == 1
+    import time as _t
+    for _ in range(50):
+        if any(c["body"].get("event") == "sync.refresh" for c in env.fake.calls): break
+        _t.sleep(0.02)
+    pokes = [c for c in env.fake.calls if c["body"].get("event") == "sync.refresh"]
+    assert len(pokes) == 1 and pokes[0]["url"].endswith("tok-b")      # never the phone that wrote it
+    assert pokes[0]["body"]["aps"] == {"content-available": 1}

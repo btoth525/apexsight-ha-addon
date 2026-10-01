@@ -833,8 +833,41 @@ async def set_settings(body: SettingsBody, household: str = Depends(_household))
     return {"ok": True, "settings": body.model_dump()}
 
 
+def _caller_device(authorization: Optional[str] = Header(default=None)) -> str:
+    """The calling phone's device id (same token check as _household)."""
+    _household(authorization)
+    row = db.resolve_token(authorization.split(" ", 1)[1].strip())
+    return row["device_id"] if row else ""
+
+
+_last_poke: dict[str, float] = {}
+
+
+async def _poke_partners(household: str, exclude_device: str) -> None:
+    """Silently wake the OTHER phones so they pull this change now. Without it, a dose given on
+    one phone left the other's "Tylenol due" reminder armed until that phone was next opened.
+    At most one poke per household every 30 s (iOS budgets background pushes)."""
+    now = time.time()
+    if now - _last_poke.get(household, 0) < 30:
+        return
+    _last_poke[household] = now
+    client = apns.get_client()
+    if not client.is_configured():
+        return
+    payload = apns.build_background_payload(data={"event": "sync.refresh"})
+    for dev in db.push_devices(household):
+        if dev["parent_id"] == exclude_device:
+            continue
+        try:
+            await _send_and_log(client, "sync.refresh", dev["device_token"], dev["env"], payload,
+                                push_type="background")
+        except Exception:
+            log.exception("sync poke failed")
+
+
 @app.post("/v1/sync/push")
-async def sync_push(body: PushBody, household: str = Depends(_household)):
+async def sync_push(body: PushBody, household: str = Depends(_household),
+                    device: str = Depends(_caller_device)):
     applied = 0
     max_seq = 0
     now = time.time()
@@ -847,6 +880,8 @@ async def sync_push(body: PushBody, household: str = Depends(_household)):
         if res["applied"]:
             applied += 1
         max_seq = max(max_seq, res["server_seq"])
+    if applied:
+        asyncio.create_task(_poke_partners(household, device))
     return {"applied": applied, "received": len(body.records), "cursor": max_seq}
 
 
