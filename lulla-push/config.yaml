@@ -1,5 +1,5 @@
 name: Lulla Push + Sync
-version: "1.9.0"
+version: "1.10.0"
 slug: lulla_push
 description: Self-hosted household sync + APNs relay for the Lulla baby tracker.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/lulla-push
@@ -25,7 +25,8 @@ webui: "http://[HOST]:[PORT:6969]/healthz"
 options:
   admin_username: admin
   admin_password: ""
-  pairing_code: "LULLA-X1W0-PL0E"
+  # Set your own in the add-on Configuration tab. Never commit the real one (this repo is public).
+  pairing_code: "LULLA-SETM-E000"
   apns_environment: auto
   quiet_hours_start: "22:00"
   quiet_hours_end: "07:00"

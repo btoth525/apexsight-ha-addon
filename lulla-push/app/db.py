@@ -146,12 +146,18 @@ def _conn():
 # ---- device registration / auth --------------------------------------------
 
 def register_device(household: str, device_id: str, name: Optional[str]) -> str:
-    """Idempotent per (household, device_id): re-registering returns a fresh token but
-    keeps the device identity stable."""
-    token = secrets.token_urlsafe(24)
+    """Idempotent per (household, device_id): re-registering returns the device's EXISTING token.
+    It used to mint a new one and delete the old, and the app registers for push with the same
+    device id, so every APNs token refresh silently logged the phone out of sync."""
     now = time.time()
     with _conn() as c:
-        c.execute("DELETE FROM devices WHERE household=? AND device_id=?", (household, device_id))
+        row = c.execute("SELECT token FROM devices WHERE household=? AND device_id=?",
+                        (household, device_id)).fetchone()
+        if row is not None:
+            c.execute("UPDATE devices SET last_seen=?, name=COALESCE(?, name) WHERE token=?",
+                      (now, name, row["token"]))
+            return row["token"]
+        token = secrets.token_urlsafe(24)
         c.execute(
             "INSERT INTO devices(token, household, device_id, name, created_at, last_seen) VALUES(?,?,?,?,?,?)",
             (token, household, device_id, name, now, now),
@@ -204,7 +210,13 @@ def upsert(household: str, type_: str, id_: str, updated_at: float, created_by: 
             (household, type_, id_),
         ).fetchone()
         if existing is not None and not _incoming_wins(existing, updated_at, created_by):
-            return {"applied": False, "server_seq": existing["server_seq"]}
+            # The sender's copy lost. Re-sequence the winner so the sender pulls it back —
+            # otherwise that phone keeps showing its losing edit forever while the other shows
+            # the winner (a clock a few seconds behind was enough to split them).
+            seq = _next_seq(c, household)
+            c.execute("UPDATE records SET server_seq=? WHERE household=? AND type=? AND id=?",
+                      (seq, household, type_, id_))
+            return {"applied": False, "server_seq": seq}
         seq = _next_seq(c, household)
         c.execute(
             """
@@ -472,3 +484,35 @@ def get_monitoring(key: str) -> Optional[float]:
     with _conn() as c:
         row = c.execute("SELECT value FROM monitoring WHERE key=?", (key,)).fetchone()
     return row["value"] if row else None
+
+
+def main_household() -> Optional[str]:
+    """The household most records belong to (used once to pin household_id)."""
+    with _conn() as c:
+        row = c.execute("SELECT household, COUNT(*) n FROM records GROUP BY household ORDER BY n DESC LIMIT 1").fetchone()
+        return row["household"] if row else None
+
+
+def legacy_push_clients(min_build: int) -> bool:
+    """True while any registered phone reports an app build older than `min_build` (or none)."""
+    with _conn() as c:
+        rows = c.execute("SELECT app_version FROM push_devices").fetchall()
+    def old(v):
+        try:
+            return int(str(v).strip()) < min_build
+        except (TypeError, ValueError):
+            return True
+    return any(old(r["app_version"]) for r in rows)
+
+
+def prune_deliveries(older_than_days: float = 30) -> int:
+    with _conn() as c:
+        return c.execute("DELETE FROM deliveries WHERE ts < ?", (time.time() - older_than_days * 86400,)).rowcount
+
+
+def keep_devices(household: str, device_ids: list) -> int:
+    """Revoke every sync token in `household` except these device ids. Returns rows removed."""
+    with _conn() as c:
+        q = ",".join("?" * len(device_ids))
+        return c.execute(f"DELETE FROM devices WHERE household=? AND device_id NOT IN ({q})",
+                         (household, *device_ids)).rowcount

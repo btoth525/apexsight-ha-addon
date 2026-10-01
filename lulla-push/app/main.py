@@ -1,3 +1,4 @@
+import logging
 """Lulla Push + Sync relay — FastAPI app.
 
 Self-hosted household sync (plan §2.3 Path D, docs/DECISIONS.md D-003) + the APNs push
@@ -30,18 +31,37 @@ app = FastAPI(title="Lulla Push + Sync Relay", docs_url=None, redoc_url=None)
 # it via timing. Exempt only the test harness's ACCEPT_ANY_PAIRING mode, which registers
 # many households per run and is never reachable outside `swift test`.
 _register_limiter = security.RateLimiter(max_attempts=10, window_seconds=300)
+# Unauthenticated partner pushes from build-41 phones (see _caller_household): a phone sends a
+# handful per feed/diaper, so 30 a minute per client is generous and stops a flood.
+_legacy_limiter = security.RateLimiter(max_attempts=30, window_seconds=60)
+log = logging.getLogger("lulla")
 _admin_limiter = security.RateLimiter(max_attempts=5, window_seconds=300)
 
 
 def _client_key(request: Request) -> str:
-    # Honor Cloudflare's real-client-IP header when present (the tunnel proxies from it),
-    # else fall back to the socket peer.
-    return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
+    # Cloudflare's real-client-IP header is only trusted from a private peer (the tunnel runs on
+    # the LAN); anyone hitting :6969 directly could otherwise pick a fresh "IP" per attempt.
+    peer = request.client.host if request.client else "unknown"
+    cf = request.headers.get("cf-connecting-ip")
+    return cf if cf and security.is_private(peer) else peer
+
+
+def household_id() -> str:
+    """The household all data lives under. It used to BE the pairing code, so changing the code
+    orphaned every record. Now it is pinned once (to the household the existing records use)
+    and the pairing code is only the join secret, which can be rotated freely."""
+    hid = db.get_config("household_id")
+    if not hid:
+        hid = db.main_household() or config.PAIRING_CODE
+        db.set_config("household_id", hid)
+    return hid
 
 
 @app.on_event("startup")
 async def _startup() -> None:
     db.init()
+    household_id()                 # pin the household before the pairing code can change
+    db.prune_deliveries(30)        # the delivery log only needs recent history
     # Watch the Owlet sock and auto-log sleep sessions (single-writer → both phones get one
     # shared entry). Only when we actually have HA access; wrapped so it can never crash the app.
     if home.SUPERVISOR_TOKEN:
@@ -97,13 +117,29 @@ async def _owlet_sleep_poller() -> None:
             tz = cfg["time_zone"]        # render sleep times in the household's local zone
     except Exception:
         pass
-    household = config.PAIRING_CODE
+    household = household_id()
     while True:
         try:
+            if tz == "UTC":
+                # Booting before HA is up used to stamp every sleep "UTC" until the next restart.
+                try:
+                    cfg = await home._get("/config")
+                    if cfg and cfg.get("time_zone"):
+                        tz = cfg["time_zone"]
+                except Exception:
+                    pass
             st = await home.state()
             vitals = st.get("vitals") or {}
             alerts = st.get("alerts") or {}
             baby = st.get("baby_name") or "Ryleigh"
+            if not st.get("connected"):
+                # Home Assistant unreachable (restart/update): we can't SEE the sock, which is not
+                # the same as "no signal". Treating it as nosignal ended the night's sleep log and
+                # the Live Activity and wiped the alert baseline (re-firing alerts on recovery).
+                # Only the outage watchdog runs; everything else waits for HA to come back.
+                await _watch_ha_link(False, baby, time.time())
+                await asyncio.sleep(_OWLET_POLL_SECONDS)
+                continue
 
             # 1) Relay Owlet's OWN alert flags — push once per OFF→ON episode. On the FIRST poll
             #    ever (no stored baseline) we seed silently, so a flag that's already on at deploy
@@ -111,6 +147,13 @@ async def _owlet_sleep_poller() -> None:
             raw_prev = db.get_config("owlet_alerts")
             if raw_prev is not None:
                 last_real = db.get_config("owlet_last_real_cls")
+                # The confirmed class lags reality by the 5-minute hold. A real class still being
+                # timed (she JUST fell asleep, or JUST woke) is the better guide: the sock slipping
+                # off 3 minutes after she dozed off is an alarm, and a parent pulling it off 3
+                # minutes after she woke is not.
+                pending = owlet_log.Debounced.from_json(db.get_config("owlet_sleep_cls")).candidate
+                if pending in ("asleep", "awake"):
+                    last_real = pending
                 for key in owlet_log.alert_transitions(json.loads(raw_prev), alerts):
                     # "The sock came off" is an ALARM only if it came off while she was ASLEEP
                     # (unmonitored during sleep). When she's awake, a parent removed it on purpose
@@ -152,19 +195,7 @@ async def _owlet_sleep_poller() -> None:
             #     sleeping phone stops heart-beating overnight, which is also normal), nor as a
             #     CRITICAL alert (no entitlement, and the Owlet base station stays the real alarm).
             #     Edge-triggered: one "offline" note per outage, one "back" note on recovery.
-            if st.get("connected"):
-                if db.get_config("owlet_ha_out_fired"):
-                    await _push_monitoring(baby, offline=False)   # recovered
-                db.set_config("owlet_ha_out_since", "")
-                db.set_config("owlet_ha_out_fired", "")
-            else:
-                out_since = db.get_config("owlet_ha_out_since")
-                if not out_since:
-                    db.set_config("owlet_ha_out_since", str(now_ts))
-                elif (not db.get_config("owlet_ha_out_fired")
-                      and now_ts - float(out_since) >= HA_OUTAGE_SECONDS):
-                    await _push_monitoring(baby, offline=True)
-                    db.set_config("owlet_ha_out_fired", "1")
+            await _watch_ha_link(True, baby, now_ts)
 
             # 2) Sleep STAGE, debounced. The sock's raw stage flaps (deep-sleep runs have a
             #    median length of ~2 minutes), so acting on the raw edge produced notes that
@@ -284,14 +315,21 @@ async def _owlet_sleep_poller() -> None:
                 # app-suspended case; the app covers the app-open case. Both use the CONFIRMED
                 # class, so they never disagree.
                 if not db.activities_by_kind(OWLET_ACTIVITY_KIND):
+                    # Stamp the self-heal clock too, so a phone that's slow to register this card
+                    # doesn't get a SECOND start from the self-heal branch 15 seconds later.
+                    db.set_config("owlet_activity_retry_ts", str(now_ts))
                     await _sleep_activity_start(baby=baby, state=_content(stage_state.confirmed))
             elif new_cls in ("awake", "nosignal"):
                 # End on wake OR sock-off. The old code ended only on "awake", so removing the
                 # sock (nosignal) left an orphaned card counting up forever while the sleep log
                 # had already closed — and the next sleep stacked a second card on top. Clearing
                 # the live stage here keeps the next session from inheriting a stale headline.
-                await _sleep_activity_push("end", _content(None))
+                # Clear the live stage BEFORE building the final state (the ended card used to keep
+                # reading "Light Sleep"), and dismiss it now — without a dismissal date iOS leaves an
+                # ended card on the Lock Screen for up to 4 hours.
                 db.set_config("owlet_live_stage", "")
+                live_stage = None
+                await _sleep_activity_push("end", _content(None), dismissal_date=int(now_ts))
             elif new_stage and cur == "asleep":
                 db.set_config("owlet_activity_stage_since", owlet_log.iso_at(
                     now_ts - owlet_log.STAGE_HOLD_SECONDS))
@@ -387,8 +425,26 @@ async def _owlet_sleep_poller() -> None:
                 db.upsert(household, "LogEvent", payload["id"], time.time(),
                           "owlet", False, json.dumps(payload))
         except Exception:
-            pass   # a bad poll must never take the relay down
+            # A bad poll must never take the relay down — but say what broke.
+            log.exception("owlet poll failed")
         await asyncio.sleep(_OWLET_POLL_SECONDS)
+
+
+async def _watch_ha_link(connected: bool, baby: str, now_ts: float) -> None:
+    """Edge-triggered HA-outage note: one "offline" per outage, one "back" on recovery."""
+    if connected:
+        if db.get_config("owlet_ha_out_fired"):
+            await _push_monitoring(baby, offline=False)   # recovered
+        db.set_config("owlet_ha_out_since", "")
+        db.set_config("owlet_ha_out_fired", "")
+        return
+    out_since = db.get_config("owlet_ha_out_since")
+    if not out_since:
+        db.set_config("owlet_ha_out_since", str(now_ts))
+    elif (not db.get_config("owlet_ha_out_fired")
+          and now_ts - float(out_since) >= HA_OUTAGE_SECONDS):
+        await _push_monitoring(baby, offline=True)
+        db.set_config("owlet_ha_out_fired", "1")
 
 
 async def _push_wake_state(awake: bool, baby: str) -> None:
@@ -397,7 +453,7 @@ async def _push_wake_state(awake: bool, baby: str) -> None:
     try:
         await push(PushEventBody(
             event="owlet.awake" if awake else "owlet.asleep",
-            household=config.PAIRING_CODE,
+            household=household_id(),
             title=f"{'👀' if awake else '😴'} {baby}",
             body="She's waking up." if awake else "She's fallen asleep.",
             interruption_level="time-sensitive" if awake else "passive",
@@ -450,7 +506,7 @@ async def _sleep_activity_start(*, baby: str, state: dict) -> None:
         event="start", content_state=state,
         attributes_type="OwletSleepAttributes", attributes={"childName": baby},
     )
-    for dev in db.push_devices(config.PAIRING_CODE):
+    for dev in db.push_devices(household_id()):
         if not dev["push_to_start_token"]:
             continue
         try:
@@ -460,7 +516,7 @@ async def _sleep_activity_start(*, baby: str, state: dict) -> None:
             pass
 
 
-async def _sleep_activity_push(event: str, state: dict) -> None:
+async def _sleep_activity_push(event: str, state: dict, dismissal_date: Optional[int] = None) -> None:
     """Update (or end) every running sleep activity. On `end` the registry row goes too, so a
     stale token can't keep a dead activity alive on the Lock Screen."""
     client = apns.get_client()
@@ -469,7 +525,8 @@ async def _sleep_activity_push(event: str, state: dict) -> None:
     acts = db.activities_by_kind(OWLET_ACTIVITY_KIND)
     if not acts:
         return
-    payload = apns.build_liveactivity_payload(event=event, content_state=state)
+    payload = apns.build_liveactivity_payload(event=event, content_state=state,
+                                              dismissal_date=dismissal_date)
     for act in acts:
         try:
             await _send_and_log(client, f"activity.{event}", act["push_token"], act["env"],
@@ -529,7 +586,7 @@ async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
     if summary:
         data["sleep"] = summary       # the home-screen Sleep widget, refreshed in the background
     payload = apns.build_background_payload(data=data)
-    for dev in db.push_devices(config.PAIRING_CODE):
+    for dev in db.push_devices(household_id()):
         try:
             await _send_and_log(client, "owlet.refresh", dev["device_token"], dev["env"],
                                 payload, push_type="background", collapse_id="owlet-refresh")
@@ -544,7 +601,7 @@ async def _push_monitoring(baby: str, *, offline: bool) -> None:
     try:
         await push(PushEventBody(
             event="monitoring.offline" if offline else "monitoring.back",
-            household=config.PAIRING_CODE,
+            household=household_id(),
             title="\u26A0\uFE0F Monitor offline" if offline else "\u2705 Monitor back",
             body=("Lulla can't reach the Owlet sock right now — check Home Assistant."
                   if offline else f"Lulla can see {baby}'s sock again."),
@@ -561,7 +618,7 @@ async def _push_deep_sleep_reached(baby: str) -> None:
     is exactly what was asked for."""
     try:
         await push(PushEventBody(
-            event="owlet.deep_reached", household=config.PAIRING_CODE,
+            event="owlet.deep_reached", household=household_id(),
             title=f"\U0001F634 {baby} is in deep sleep",
             body="Good window to put her down.",
             interruption_level="time-sensitive", collapse_id="owlet-deep-reached",
@@ -575,7 +632,7 @@ async def _push_sleep_stage(state: str, baby: str) -> None:
     buzzes overnight; it just appears for a glance."""
     try:
         await push(PushEventBody(
-            event="owlet.sleep_stage", household=config.PAIRING_CODE,
+            event="owlet.sleep_stage", household=household_id(),
             title=f"😴 {baby}", body=f"Now: {owlet_log.stage_label(state)}",
             interruption_level="passive", collapse_id="owlet-stage",
         ))
@@ -592,7 +649,7 @@ async def _push_owlet_alert(key: str, baby: str) -> None:
     phrase, critical = meta
     try:
         await push(PushEventBody(
-            event=f"owlet.{key}", household=config.PAIRING_CODE,
+            event=f"owlet.{key}", household=household_id(),
             title=f"⚠️ {baby}", body=f"Owlet alert — {phrase}. Check the base station.",
             interruption_level="time-sensitive" if critical else "active",
             collapse_id=f"owlet-{key}",
@@ -687,16 +744,11 @@ def _household(authorization: Optional[str] = Header(default=None)) -> str:
 
 @app.get("/healthz")
 async def healthz():
-    st = db.global_stats()
     return {
         "status": "ok",
         "service": "lulla-push",
         "pairing_code_set": bool(config.PAIRING_CODE),
         "apns_configured": apns.get_client().is_configured(),
-        "records": st["records"],
-        "devices": st["devices"],
-        "push_devices": len(db.push_devices()),
-        "households": st["households"],
     }
 
 
@@ -710,7 +762,7 @@ async def register(body: RegisterBody, request: Request):
             raise HTTPException(status_code=429, detail="too many attempts, try again later")
         if not security.safe_equals(code, config.PAIRING_CODE):
             raise HTTPException(status_code=403, detail="pairing code mismatch")
-        household = config.PAIRING_CODE
+        household = household_id()
     token = db.register_device(household, body.device_id, body.device_name)
     if body.device_token:
         db.upsert_push_device(
@@ -755,10 +807,10 @@ async def home_history(hours: int = 12, household: str = Depends(_household)):
 
 
 class SettingsBody(BaseModel):
-    feed_day_hours: float
-    feed_night_hours: float
-    night_start: int
-    night_end: int
+    feed_day_hours: float = Field(gt=0, le=24)
+    feed_night_hours: float = Field(ge=0, le=24)     # 0 = overnight feeds "on demand" (app build 42+)
+    night_start: int = Field(ge=0, le=23)
+    night_end: int = Field(ge=0, le=23)
     updated_at: float          # client stamp; the newest write wins (LWW), like every record
 
 
@@ -785,8 +837,12 @@ async def set_settings(body: SettingsBody, household: str = Depends(_household))
 async def sync_push(body: PushBody, household: str = Depends(_household)):
     applied = 0
     max_seq = 0
+    now = time.time()
     for r in body.records:
-        res = db.upsert(household, r.type, r.id, r.updated_at, r.created_by,
+        # A record stamped in the future (bad clock, or a hostile client) would beat every later
+        # real edit under last-write-wins. Cap it at "now".
+        updated_at = min(r.updated_at, now + 300)
+        res = db.upsert(household, r.type, r.id, updated_at, r.created_by,
                         r.is_tombstoned, r.payload)
         if res["applied"]:
             applied += 1
@@ -874,6 +930,12 @@ async def deep_arm_status(household: str = Depends(_household)):
 
 @app.post("/v1/home/toggle")
 async def home_toggle(body: ToggleBody, household: str = Depends(_household)):
+    # Only the nursery strip's own switches/lights. This runs with the Supervisor's admin token,
+    # so passing any entity through let a client open covers, run scripts or flip automations.
+    st = await home.state()
+    allowed = {n.get("entity_id") for n in st.get("nursery") or [] if n.get("is_toggle")}
+    if body.entity_id not in allowed:
+        raise HTTPException(status_code=403, detail="only the nursery toggles can be switched here")
     ok = await home.toggle(body.entity_id)
     return {"ok": ok}
 
@@ -972,17 +1034,44 @@ async def _send_and_log(client, event, token, env, payload, *, push_type, collap
     return {"token": token, "ok": ok, "status": status, "reason": reason, "pruned": False}
 
 
+def _caller_household(request: Request, authorization: Optional[str]) -> str:
+    """Bearer token → household. Phones on LullaSight build 41 and earlier send no token on
+    /v1/push and /v1/register/activity; those calls are still accepted (sanitized, rate-limited)
+    ONLY while a registered phone still runs such a build. Once both phones report build 42+,
+    an unauthenticated call is refused, with no config change needed."""
+    if authorization:
+        return _household(authorization)
+    if not db.legacy_push_clients(min_build=42):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if not _legacy_limiter.allow(_client_key(request)):
+        raise HTTPException(status_code=429, detail="too many requests")
+    return household_id()
+
+
 @app.post("/v1/register/activity")
-async def register_activity(body: ActivityRegisterBody):
+async def register_activity(body: ActivityRegisterBody, request: Request,
+                            authorization: Optional[str] = Header(default=None)):
+    _caller_household(request, authorization)
     db.register_activity(body.activity_id, body.child_id, body.kind, body.push_token, body.env)
     return {"status": "ok", "activity_id": body.activity_id}
 
 
+# Keys a caller may never set inside `data`: they would replace the APNs header or drive the
+# app's silent Owlet handler (fake vitals on the Lock Screen, ending the sleep Live Activity).
+_RESERVED_DATA_KEYS = {"aps", "owlet", "sleep", "event"}
+
+
 @app.post("/v1/push")
-async def push(body: PushEventBody):
+async def push(body: PushEventBody, request: Request,
+               authorization: Optional[str] = Header(default=None)):
     """Fan an event out to push devices, applying §7.4 routing (non-negotiable):
     never notify exclude_parent_id, collapse by collapse_id, respect quiet hours except
     time-sensitive, and downgrade non-urgent to silent when nap_aware + child asleep."""
+    body.household = _caller_household(request, authorization)
+    body.data = {k: v for k, v in body.data.items()
+                 if k not in _RESERVED_DATA_KEYS and isinstance(v, (str, int, float, bool))}
+    if body.interruption_level == "critical":
+        body.interruption_level = "time-sensitive"   # no critical entitlement; never let a caller fake one
     client = apns.get_client()
     if not client.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured")
@@ -1035,7 +1124,7 @@ async def push(body: PushEventBody):
 
 
 @app.post("/v1/activity/start")
-async def activity_start(body: ActivityStartBody):
+async def activity_start(body: ActivityStartBody, household: str = Depends(_household)):
     """Push-to-start a Live Activity on the OTHER parent's phone (iOS 17.2+)."""
     client = apns.get_client()
     if not client.is_configured():
@@ -1060,7 +1149,7 @@ async def activity_start(body: ActivityStartBody):
 
 
 @app.post("/v1/activity/update")
-async def activity_update(body: ActivityUpdateBody):
+async def activity_update(body: ActivityUpdateBody, household: str = Depends(_household)):
     client = apns.get_client()
     if not client.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured")
@@ -1081,7 +1170,7 @@ async def activity_update(body: ActivityUpdateBody):
 
 
 @app.post("/v1/activity/end")
-async def activity_end(body: ActivityEndBody):
+async def activity_end(body: ActivityEndBody, household: str = Depends(_household)):
     client = apns.get_client()
     if not client.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured")
@@ -1103,7 +1192,7 @@ async def activity_end(body: ActivityEndBody):
 
 
 @app.post("/v1/test")
-async def test_push(body: TestBody):
+async def test_push(body: TestBody, household: str = Depends(_household)):
     """GUI 'send test notification' — also the 'Test critical alert' button (§7.7)."""
     client = apns.get_client()
     if not client.is_configured():
@@ -1124,7 +1213,7 @@ async def test_push(body: TestBody):
 # ---- supervised watchdog (§7.7) ---------------------------------------------
 
 @app.post("/v1/heartbeat")
-async def heartbeat(body: HeartbeatBody):
+async def heartbeat(body: HeartbeatBody, household: str = Depends(_household)):
     """The app checks in. Records last-heartbeat + the HA/Owlet health it observed so the
     watchdog can tell 'watching and fine' from 'quietly broken'."""
     now = time.time()
@@ -1152,7 +1241,7 @@ def _watchdog_decision(now: Optional[float] = None) -> routing.WatchdogDecision:
 
 
 @app.post("/v1/watchdog/run")
-async def watchdog_run():
+async def watchdog_run(household: str = Depends(_household)):
     """Evaluate the monitoring chain; fire monitoring.chain_broken as a CRITICAL alert if
     any link is stale. Meant to be poked on a schedule (HA automation / cron)."""
     decision = _watchdog_decision()
@@ -1180,7 +1269,7 @@ async def watchdog_run():
 
 
 @app.get("/v1/monitoring/status")
-async def monitoring_status():
+async def monitoring_status(household: str = Depends(_household)):
     """Status pip accessor for the app's Today screen (green/amber/red + last-checked)."""
     decision = _watchdog_decision()
     last_hb = db.get_monitoring("last_heartbeat")

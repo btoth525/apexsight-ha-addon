@@ -13,7 +13,7 @@ export QUIET_HOURS_START="$(bashio::config 'quiet_hours_start')"
 export QUIET_HOURS_END="$(bashio::config 'quiet_hours_end')"
 export NAP_AWARE="$(bashio::config 'nap_aware')"
 
-bashio::log.info "Starting Lulla Push + Sync on :${PORT} (household ${PAIRING_CODE})"
+bashio::log.info "Starting Lulla Push + Sync on :${PORT}"
 
 exec python3 -m uvicorn app.main:app \
     --host 0.0.0.0 \

@@ -34,3 +34,13 @@ def safe_equals(a: str, b: str) -> bool:
     """Constant-time string compare — a plain `==` on a secret can leak it one byte at a
     time via response-timing differences; this closes that side channel."""
     return hmac.compare_digest(a.encode(), b.encode())
+
+
+def is_private(host: str) -> bool:
+    """True for loopback / RFC1918 / link-local peers (the Cloudflare tunnel runs on the LAN)."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local

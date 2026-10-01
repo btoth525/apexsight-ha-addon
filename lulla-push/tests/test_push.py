@@ -85,8 +85,10 @@ def env(monkeypatch):
     # hours; tests that exercise quiet hours override this explicitly.
     monkeypatch.setattr(mainmod, "_now_local_minutes", lambda: 12 * 60)
 
+    # The control routes now need a household token (relay 1.10.0); the test client carries one.
+    test_token = dbmod.register_device(mainmod.household_id(), "test-runner", None)
     ns = types.SimpleNamespace(
-        http=TestClient(mainmod.app), db=dbmod, apns=apnsmod, routing=routingmod,
+        http=TestClient(mainmod.app, headers={"Authorization": f"Bearer {test_token}"}), db=dbmod, apns=apnsmod, routing=routingmod,
         main=mainmod, config=cfg, fake=fake, pem=pem,
     )
     yield ns
@@ -450,3 +452,50 @@ def test_live_stage_carries_the_raw_transfer_window_fields():
     assert state["stageLabel"] == "Light Sleep"       # confirmed, stable
     assert state["liveStage"] == "Deep Sleep"         # raw, instant
     assert state["liveStageSince"] == "2026-09-06T02:12:00Z"
+
+
+# ---- relay 1.10.0 hardening ----------------------------------------------------
+
+def test_unauthenticated_push_only_while_an_old_build_is_registered(env):
+    anon = TestClient(env.main.app)
+    _register_push(env, "phoneA", "mom", "tok-mom")          # no app_version → counts as old build
+    r = anon.post("/v1/push", json={"event": "event.logged", "title": "t", "body": "b",
+                                    "household": "someone-else", "interruption_level": "critical",
+                                    "data": {"aps": {"alert": "spoof"}, "owlet": {"bpm": 1}, "route": "timeline"}})
+    assert r.status_code == 200, r.text
+    sent = env.fake.calls[-1]["body"]
+    assert sent["aps"]["alert"]["title"] == "t"              # our header, not the caller's
+    assert "owlet" not in sent and sent.get("route") == "timeline"
+    assert sent["aps"].get("interruption-level") != "critical"
+    # Once every phone runs build 42+, a token is required.
+    env.db.upsert_push_device(device_token="tok-mom", household=env.main.household_id(), parent_id="mom",
+                              env="prod", app_version="42")
+    assert anon.post("/v1/push", json={"event": "event.logged", "title": "t", "body": "b"}).status_code == 401
+    assert env.http.post("/v1/push", json={"event": "event.logged", "title": "t", "body": "b"}).status_code == 200
+
+
+def test_control_routes_need_a_token(env):
+    anon = TestClient(env.main.app)
+    for path, body in [("/v1/test", {}), ("/v1/watchdog/run", None), ("/v1/heartbeat", {}),
+                       ("/v1/activity/start", {}), ("/v1/activity/update", {}), ("/v1/activity/end", {})]:
+        r = anon.post(path, json=body) if body is not None else anon.post(path)
+        assert r.status_code == 401, path
+    assert anon.get("/v1/monitoring/status").status_code == 401
+    h = anon.get("/healthz").json()
+    assert "devices" not in h and "households" not in h
+
+
+def test_reregistering_keeps_the_same_sync_token(env):
+    a = _register_push(env, "phoneA", "mom", "tok-1")["token"]
+    b = _register_push(env, "phoneA", "mom", "tok-2")["token"]
+    assert a == b
+    assert env.http.get("/v1/sync/pull", headers={"Authorization": f"Bearer {a}"}).status_code == 200
+
+
+def test_household_survives_a_pairing_code_change(env, monkeypatch):
+    hid = env.main.household_id()
+    monkeypatch.setattr(env.config, "PAIRING_CODE", "LULLA-NEW0-CODE")
+    assert env.main.household_id() == hid
+    r = env.http.post("/v1/register", json={"pairing_code": "LULLA-NEW0-CODE", "device_id": "p2"})
+    assert r.status_code == 200 and r.json()["household"] == hid
+    assert env.http.post("/v1/register", json={"pairing_code": "LULLA-TEST-0001", "device_id": "p3"}).status_code == 403
