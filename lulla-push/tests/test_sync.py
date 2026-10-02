@@ -53,6 +53,24 @@ def test_register_rate_limited_after_repeated_wrong_codes(client):
     assert last.status_code == 429
 
 
+def test_register_never_rate_limits_correct_code(client):
+    # Both phones share one client key behind the tunnel (cf-connecting-ip = the home's public
+    # IP) and the app registers 2-3 times per cold launch. A correct code must never count
+    # toward the brute-force budget: it used to, so ordinary use tripped 429 and left a phone
+    # token-less (no sync, no Owlet card, no camera) for the whole session.
+    for _ in range(12):
+        r = client.post("/v1/register", json={"pairing_code": "LULLA-TEST-0001", "device_id": "A"})
+        assert r.status_code == 200, r.text
+    # ...while wrong guesses are still throttled: ten 403s, then 429.
+    codes = [client.post("/v1/register", json={"pairing_code": "WRONG", "device_id": "A"}).status_code
+             for _ in range(11)]
+    assert codes == [403] * 10 + [429]
+    # A throttled key still accepts the real code — the phones share it with any wrong guesser
+    # on the same NAT, and the correct code is the thing being protected, not the key.
+    r = client.post("/v1/register", json={"pairing_code": "LULLA-TEST-0001", "device_id": "A"})
+    assert r.status_code == 200, r.text
+
+
 def test_sync_requires_bearer(client):
     assert client.get("/v1/sync/pull").status_code == 401
     assert client.post("/v1/sync/push", json={"records": []}).status_code == 401

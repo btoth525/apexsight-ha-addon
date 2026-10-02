@@ -863,3 +863,78 @@ def test_deep_arm_survives_a_nosignal_to_awake_edge_but_not_a_real_wake(env, mon
     _one_poller_tick(env, monkeypatch)
     assert env.db.get_config("owlet_deep_arm_until") in ("", None)
     assert env.http.get("/v1/home/state").json()["deep_armed"] is False
+
+
+# ---- poller-side alerts fan out again (1.12.0 regression) ---------------------------------
+# Relay 1.10.0 gave the /v1/push route a `request` parameter for the legacy limiter; the
+# poller's helpers kept calling it with one argument, so every wake/asleep, Owlet flag,
+# deep-sleep one-shot, stage note and monitor offline/back push raised TypeError — swallowed
+# by `except Exception: pass`. 0 sends, 0 log lines, and nothing in this suite drove the
+# helpers. These do.
+
+def _alerts(env, event):
+    return [c for c in env.fake.calls if c["body"].get("event") == event]
+
+
+def test_wake_state_push_reaches_both_phones_as_time_sensitive(env):
+    import asyncio
+    _register_push(env, "phoneA", "mom", "tok-mom")
+    _register_push(env, "phoneB", "dad", "tok-dad")          # distinct tokens: two rows
+    asyncio.run(env.main._push_wake_state(True, "R"))
+    sent = _alerts(env, "owlet.awake")
+    assert len(sent) == 2 and len(env.fake.calls) == 2
+    assert sorted(c["url"].split("/3/device/")[1] for c in sent) == ["tok-dad", "tok-mom"]
+    for c in sent:
+        assert c["body"]["aps"]["interruption-level"] == "time-sensitive"
+        assert c["body"]["aps"]["alert"] == {"title": "👀 R", "body": "She's waking up."}
+        assert c["headers"]["apns-collapse-id"] == "owlet-wake"
+        assert c["headers"]["apns-push-type"] == "alert"
+    rows = [r for r in env.db.recent_deliveries() if r["event"] == "owlet.awake"]
+    assert len(rows) == 2 and all(r["status_code"] == 200 for r in rows)
+
+
+def test_owlet_alert_push_reaches_both_phones(env):
+    import asyncio
+    _register_push(env, "phoneA", "mom", "tok-mom")
+    _register_push(env, "phoneB", "dad", "tok-dad")
+    asyncio.run(env.main._push_owlet_alert("low_o2", "R"))
+    sent = _alerts(env, "owlet.low_o2")
+    assert len(sent) == 2
+    for c in sent:
+        assert c["body"]["aps"]["interruption-level"] == "time-sensitive"   # safety flag pierces Focus
+        assert "low oxygen" in c["body"]["aps"]["alert"]["body"]
+    assert len([r for r in env.db.recent_deliveries() if r["event"] == "owlet.low_o2"]) == 2
+
+
+def test_every_poller_alert_helper_actually_sends(env):
+    """One assertion per helper, so a future change on the shared path can't take a single
+    alert type down silently again."""
+    import asyncio
+    _register_push(env, "phoneA", "mom", "tok-mom")
+    cases = [
+        (env.main._push_wake_state(False, "R"), "owlet.asleep"),
+        (env.main._push_monitoring("R", offline=True), "monitoring.offline"),
+        (env.main._push_monitoring("R", offline=False), "monitoring.back"),
+        (env.main._push_deep_sleep_reached("R"), "owlet.deep_reached"),
+        (env.main._push_sleep_stage("deep_sleep", "R"), "owlet.sleep_stage"),
+        (env.main._push_owlet_alert("sock_off", "R"), "owlet.sock_off"),
+    ]
+    for coro, event in cases:
+        asyncio.run(coro)
+        assert len(_alerts(env, event)) == 1, event
+    assert len(env.fake.calls) == len(cases)
+
+
+def test_poller_push_failure_is_logged_not_swallowed(env, monkeypatch, caplog):
+    """The regression's other half: a failure inside the fan-out must leave a trace in the
+    add-on log, never a silent `pass`."""
+    import asyncio
+    import logging
+    _register_push(env, "phoneA", "mom", "tok-mom")
+
+    async def boom(body):
+        raise RuntimeError("simulated fan-out failure")
+    monkeypatch.setattr(env.main, "_fan_out", boom)
+    with caplog.at_level(logging.ERROR, logger="lulla"):
+        asyncio.run(env.main._push_wake_state(True, "R"))      # must not raise
+    assert any("owlet.awake push failed" in r.getMessage() for r in caplog.records)

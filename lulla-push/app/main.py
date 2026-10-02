@@ -465,17 +465,14 @@ async def _watch_ha_link(connected: bool, baby: str, now_ts: float) -> None:
 async def _push_wake_state(awake: bool, baby: str) -> None:
     """She just woke up / just fell asleep. Waking is time-sensitive (that's the one you want to
     catch through Focus — a feed usually follows); falling asleep is a quiet note."""
-    try:
-        await push(PushEventBody(
-            event="owlet.awake" if awake else "owlet.asleep",
-            household=household_id(),
-            title=f"{'👀' if awake else '😴'} {baby}",
-            body="She's waking up." if awake else "She's fallen asleep.",
-            interruption_level="time-sensitive" if awake else "passive",
-            collapse_id="owlet-wake",
-        ))
-    except Exception:
-        pass
+    await _push_internal(PushEventBody(
+        event="owlet.awake" if awake else "owlet.asleep",
+        household=household_id(),
+        title=f"{'👀' if awake else '😴'} {baby}",
+        body="She's waking up." if awake else "She's fallen asleep.",
+        interruption_level="time-sensitive" if awake else "passive",
+        collapse_id="owlet-wake",
+    ))
 
 
 OWLET_ACTIVITY_KIND = "owletSleep"
@@ -670,46 +667,37 @@ async def _push_monitoring(baby: str, *, offline: bool) -> None:
     """The relay lost (or regained) its link to Home Assistant — i.e. it can't read the sock at
     all. Active level, NOT critical: it's an FYI ("your monitor went offline, check it"), not an
     alarm — the Owlet base station remains the real alarm. Goes to both phones (no actor)."""
-    try:
-        await push(PushEventBody(
-            event="monitoring.offline" if offline else "monitoring.back",
-            household=household_id(),
-            title="\u26A0\uFE0F Monitor offline" if offline else "\u2705 Monitor back",
-            body=("Lulla can't reach the Owlet sock right now — check Home Assistant."
-                  if offline else f"Lulla can see {baby}'s sock again."),
-            interruption_level="active" if offline else "passive",
-            collapse_id="lulla-monitoring",
-        ))
-    except Exception:
-        pass
+    await _push_internal(PushEventBody(
+        event="monitoring.offline" if offline else "monitoring.back",
+        household=household_id(),
+        title="\u26A0\uFE0F Monitor offline" if offline else "\u2705 Monitor back",
+        body=("Lulla can't reach the Owlet sock right now — check Home Assistant."
+              if offline else f"Lulla can see {baby}'s sock again."),
+        interruption_level="active" if offline else "passive",
+        collapse_id="lulla-monitoring",
+    ))
 
 
 async def _push_deep_sleep_reached(baby: str) -> None:
     """She just reached deep sleep and a parent armed the one-shot alert — "safe to put her
     down". Time-sensitive so it pierces Sleep Focus; this is the rare case where waking the phone
     is exactly what was asked for."""
-    try:
-        await push(PushEventBody(
-            event="owlet.deep_reached", household=household_id(),
-            title=f"\U0001F634 {baby} is in deep sleep",
-            body="Good window to put her down.",
-            interruption_level="time-sensitive", collapse_id="owlet-deep-reached",
-        ))
-    except Exception:
-        pass
+    await _push_internal(PushEventBody(
+        event="owlet.deep_reached", household=household_id(),
+        title=f"\U0001F634 {baby} is in deep sleep",
+        body="Good window to put her down.",
+        interruption_level="time-sensitive", collapse_id="owlet-deep-reached",
+    ))
 
 
 async def _push_sleep_stage(state: str, baby: str) -> None:
     """A quiet, collapsing note that the baby moved to a new sleep stage. Passive so it never
     buzzes overnight; it just appears for a glance."""
-    try:
-        await push(PushEventBody(
-            event="owlet.sleep_stage", household=household_id(),
-            title=f"😴 {baby}", body=f"Now: {owlet_log.stage_label(state)}",
-            interruption_level="passive", collapse_id="owlet-stage",
-        ))
-    except Exception:
-        pass
+    await _push_internal(PushEventBody(
+        event="owlet.sleep_stage", household=household_id(),
+        title=f"😴 {baby}", body=f"Now: {owlet_log.stage_label(state)}",
+        interruption_level="passive", collapse_id="owlet-stage",
+    ))
 
 
 async def _push_owlet_alert(key: str, baby: str) -> None:
@@ -719,15 +707,12 @@ async def _push_owlet_alert(key: str, baby: str) -> None:
     if not meta:
         return
     phrase, critical = meta
-    try:
-        await push(PushEventBody(
-            event=f"owlet.{key}", household=household_id(),
-            title=f"⚠️ {baby}", body=f"Owlet alert — {phrase}. Check the base station.",
-            interruption_level="time-sensitive" if critical else "active",
-            collapse_id=f"owlet-{key}",
-        ))
-    except Exception:
-        pass   # APNs not configured / transient — never crash the poller
+    await _push_internal(PushEventBody(
+        event=f"owlet.{key}", household=household_id(),
+        title=f"⚠️ {baby}", body=f"Owlet alert — {phrase}. Check the base station.",
+        interruption_level="time-sensitive" if critical else "active",
+        collapse_id=f"owlet-{key}",
+    ))
 
 
 class APNsConfigBody(BaseModel):
@@ -830,9 +815,14 @@ async def register(body: RegisterBody, request: Request):
     if config.ACCEPT_ANY_PAIRING:
         household = code                       # TEST mode: pairing code IS the household
     else:
-        if not _register_limiter.allow(_client_key(request)):
-            raise HTTPException(status_code=429, detail="too many attempts, try again later")
         if not security.safe_equals(code, config.PAIRING_CODE):
+            # Charge the limiter only on a WRONG code. Behind the Cloudflare tunnel both phones
+            # share one client key (the home's public IP), and the app registers 2-3 times per
+            # cold launch — counting correct registrations tripped 429 in ordinary use and
+            # left a phone token-less (no sync, no Owlet card, no camera) for the whole
+            # session. Brute force is still throttled: 10 wrong guesses per 5 min.
+            if not _register_limiter.allow(_client_key(request)):
+                raise HTTPException(status_code=429, detail="too many attempts, try again later")
             raise HTTPException(status_code=403, detail="pairing code mismatch")
         household = household_id()
     token = db.register_device(household, body.device_id, body.device_name)
@@ -1216,6 +1206,28 @@ async def push(body: PushEventBody, request: Request,
                  if k not in _RESERVED_DATA_KEYS and isinstance(v, (str, int, float, bool))}
     if body.interruption_level == "critical":
         body.interruption_level = "time-sensitive"   # no critical entitlement; never let a caller fake one
+    return await _fan_out(body)
+
+
+async def _push_internal(body: PushEventBody) -> None:
+    """The poller's way to fan an alert out (wake/asleep, Owlet flags, deep-sleep one-shot,
+    stage notes, monitor offline/back). It bypasses the HTTP route on purpose: the route's
+    signature carries `request` + `authorization` for the legacy limiter (1.10.0), and calling
+    it directly raised TypeError — swallowed by a bare `except: pass`, so every one of these
+    alerts was silently dead for two releases. Never crash the poller, but never hide a failure
+    either: anything that goes wrong is in the add-on log."""
+    if not apns.get_client().is_configured():
+        log.warning("%s push skipped: APNs not configured", body.event)
+        return
+    try:
+        await _fan_out(body)
+    except Exception:
+        log.exception("%s push failed", body.event)
+
+
+async def _fan_out(body: PushEventBody) -> dict:
+    """Route + deliver one already-authorized event to every push device in its household.
+    Shared by the /v1/push route and the poller-side helpers (`_push_internal`)."""
     client = apns.get_client()
     if not client.is_configured():
         raise HTTPException(status_code=503, detail="APNs not configured")
