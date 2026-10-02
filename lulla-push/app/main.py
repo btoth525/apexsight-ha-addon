@@ -243,6 +243,12 @@ async def _owlet_sleep_poller() -> None:
                 prev_real = cur
             transition = owlet_log.wake_transition(prev_real, new_cls)
             if transition == "wake":
+                # A confirmed WAKE ends the settle: clear any one-shot "tell me at deep sleep" arm
+                # so it can't fire for a later, unrelated sleep the parent didn't ask about. Only
+                # on a REAL sleep→wake edge: a nosignal→awake edge (sock back on after a feed,
+                # she reads awake for five minutes, then drifts off) used to clear an arm the
+                # parent had just set — while the app kept saying "You'll be alerted".
+                db.set_config("owlet_deep_arm_until", "")
                 if now_ts - float(db.get_config("owlet_awake_alert_ts") or 0) >= owlet_log.WAKE_ALERT_MIN_GAP:
                     await _push_wake_state(True, baby)
                     db.set_config("owlet_awake_alert_ts", str(now_ts))
@@ -254,10 +260,6 @@ async def _owlet_sleep_poller() -> None:
             # nosignal (sock on the base) never overwrites it, so sock-off/on can't fake an edge.
             if new_cls in ("awake", "asleep"):
                 db.set_config("owlet_last_real_cls", new_cls)
-                # A confirmed WAKE ends the settle: clear any one-shot "tell me at deep sleep" arm
-                # so it can't fire for a later, unrelated sleep the parent didn't ask about.
-                if new_cls == "awake":
-                    db.set_config("owlet_deep_arm_until", "")
 
             # 3b) A confirmed stage note, rate-limited PER STAGE (1.3.0 shared one 10-minute
             #     budget across every stage, so a light-sleep ping silently swallowed the
@@ -280,6 +282,10 @@ async def _owlet_sleep_poller() -> None:
                 db.set_config("owlet_activity_start", owlet_log.iso_at(
                     now_ts - owlet_log.WAKE_HOLD_SECONDS))
             if new_stage or new_cls:
+                await _push_owlet_refresh(vitals, stage=stage_state.confirmed, sleep_class=cur)
+            elif cur != "nosignal" and now_ts - float(db.get_config("owlet_refresh_push_ts") or 0) >= OWLET_REFRESH_HEARTBEAT_S:
+                # Heartbeat: a 35-minute light-sleep run sent no push at all, so the widgets'
+                # 15-minute staleness rule read "No reading" for ~3 h of every quiet night.
                 await _push_owlet_refresh(vitals, stage=stage_state.confirmed, sleep_class=cur)
 
             # 3c-ii) The sleep Live Activity — the surface that actually answers "is she in deep
@@ -630,9 +636,15 @@ async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
     """A silent (content-available) nudge carrying the current reading, so both phones can stamp
     their App Group snapshot and redraw the widget / Lock Screen immediately.
 
-    Sent only on a CONFIRMED change (a handful of times a day), because iOS budgets background
-    pushes and a per-poll nudge would simply be dropped. No alert, no sound, no badge — this is
-    the data path behind the glance, not a notification."""
+    Sent on a CONFIRMED change (a handful of times a day), plus a heartbeat at most every
+    OWLET_REFRESH_HEARTBEAT_S while the sock is reporting (see the poller) — so the Lock Screen
+    glance never ages past one heartbeat during a long quiet stage. iOS budgets background pushes
+    at "two or three an hour", so a per-poll nudge would simply be dropped. No alert, no sound,
+    no badge — this is the data path behind the glance, not a notification.
+
+    Every send (change-driven or heartbeat) stamps `owlet_refresh_push_ts`, so the heartbeat
+    only fires in genuinely quiet stretches."""
+    db.set_config("owlet_refresh_push_ts", str(time.time()))
     client = apns.get_client()
     if not client.is_configured():
         return
@@ -900,29 +912,56 @@ def _caller_device(authorization: Optional[str] = Header(default=None)) -> str:
     return row["device_id"] if row else ""
 
 
+POKE_WINDOW_S = 30.0                       # iOS budgets background pushes
+OWLET_REFRESH_HEARTBEAT_S = 1200.0         # ≤3 background pushes/hour incl. change-driven ones
 _last_poke: dict[str, float] = {}
+_pending_poke: dict[str, "asyncio.Task"] = {}
+_pending_exclude: dict[str, Optional[str]] = {}
 
 
-async def _poke_partners(household: str, exclude_device: str) -> None:
-    """Silently wake the OTHER phones so they pull this change now. Without it, a dose given on
-    one phone left the other's "Tylenol due" reminder armed until that phone was next opened.
-    At most one poke per household every 30 s (iOS budgets background pushes)."""
-    now = time.time()
-    if now - _last_poke.get(household, 0) < 30:
-        return
-    _last_poke[household] = now
+async def _send_poke(household: str, exclude_device: Optional[str]) -> None:
+    _last_poke[household] = time.time()
     client = apns.get_client()
     if not client.is_configured():
         return
     payload = apns.build_background_payload(data={"event": "sync.refresh"})
     for dev in db.push_devices(household):
-        if dev["parent_id"] == exclude_device:
+        if exclude_device and dev["parent_id"] == exclude_device:
             continue
         try:
             await _send_and_log(client, "sync.refresh", dev["device_token"], dev["env"], payload,
                                 push_type="background")
         except Exception:
             log.exception("sync poke failed")
+
+
+async def _poke_later(household: str, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await _send_poke(household, _pending_exclude.pop(household, None))
+    finally:
+        _pending_poke.pop(household, None)
+
+
+async def _poke_partners(household: str, exclude_device: str) -> None:
+    """Silently wake the OTHER phones so they pull this change now. Without it, a dose given on
+    one phone left the other's "Tylenol due" reminder armed until that phone was next opened.
+
+    At most one poke per household per window (iOS budgets background pushes) — but the LAST
+    write inside a window is DEFERRED to the window's end, never dropped: a dose logged 20 s
+    after a diaper used to lose its poke, leaving the partner's "Tylenol due" armed and its
+    banner's double-dose guard blind until that phone was next opened."""
+    elapsed = time.time() - _last_poke.get(household, 0)
+    if elapsed >= POKE_WINDOW_S:
+        await _send_poke(household, exclude_device)
+        return
+    if household in _pending_poke:
+        if _pending_exclude.get(household) != exclude_device:
+            _pending_exclude[household] = None     # both phones wrote: wake both
+        return
+    _pending_exclude[household] = exclude_device
+    _pending_poke[household] = asyncio.create_task(
+        _poke_later(household, max(0.0, POKE_WINDOW_S - elapsed)))
 
 
 @app.post("/v1/sync/push")
@@ -981,6 +1020,10 @@ async def home_state(household: str = Depends(_household)):
     # When she fell asleep THIS time ("...Z" ISO, back-stamped to the real edge) — the anchor
     # for every "asleep for 2h" clock, including the Live Activity. null unless confirmed asleep.
     st["asleep_since"] = _asleep_since(cls)
+    # Whether the one-shot deep-sleep alert is armed (same expression as deep_arm_status), so the
+    # app's 10-second poll sees the relay fire/clear it instead of the button staying greyed out.
+    until = float(db.get_config("owlet_deep_arm_until") or 0)
+    st["deep_armed"] = bool(until and time.time() <= until)
     return st
 
 

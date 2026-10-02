@@ -93,6 +93,12 @@ def env(monkeypatch):
     )
     yield ns
     apnsmod.set_client(None)
+    # A deferred partner poke must never leak into the next test's fake sender.
+    for t in list(mainmod._pending_poke.values()):
+        t.cancel()
+    mainmod._pending_poke.clear()
+    mainmod._pending_exclude.clear()
+    mainmod._last_poke.clear()
 
 
 def _register_push(env, device_id, parent_id, token, push_env="prod", pts=None):
@@ -704,3 +710,156 @@ def test_sessions_window_drops_a_night_cut_by_since(env, monkeypatch):
     # minute_count still describes the requested window only.
     assert body["minute_count"] == sum(1 for r in env.db.sleep_minutes(since)
                                        if r["minute_ts"] >= since)
+
+
+# ---- sync.refresh poke: throttled, never dropped (1.12.0) ---------------------------------
+
+def _pokes(env):
+    return [c for c in env.fake.calls if c["body"].get("event") == "sync.refresh"]
+
+
+def test_a_second_write_inside_the_poke_window_is_deferred_not_dropped(env, monkeypatch):
+    """Dad logs a diaper, then the dose 20 s later. The second poke used to be dropped by the
+    30 s rate limit, so Mom's backgrounded phone never pulled the dose and her "Tylenol due"
+    kept firing. Now it is deferred to the end of the window — one real send per window, but
+    the last write always wakes her. (Driven directly: the TestClient tears its loop down after
+    each request, which would cancel a deferred task before it fires.)"""
+    import asyncio
+    monkeypatch.setattr(env.main, "POKE_WINDOW_S", 0.3)
+    _register_push(env, "phoneA", "phoneA", "tok-a")
+    _register_push(env, "phoneB", "phoneB", "tok-b")
+    hid = env.main.household_id()
+    env.main._last_poke.clear()
+    seen = {}
+
+    async def scenario():
+        await env.main._poke_partners(hid, "phoneA")          # diaper: sent now
+        seen["after_first"] = len(_pokes(env))
+        await env.main._poke_partners(hid, "phoneA")          # dose, 20 "s" later: deferred
+        await env.main._poke_partners(hid, "phoneA")          # and a third: folded into it
+        await asyncio.sleep(0.05)
+        seen["inside_window"] = len(_pokes(env))
+        await asyncio.sleep(0.4)
+        seen["after_window"] = len(_pokes(env))
+        await asyncio.sleep(0.4)
+        seen["much_later"] = len(_pokes(env))
+    asyncio.run(scenario())
+
+    assert seen["after_first"] == 1
+    assert seen["inside_window"] == 1, "inside the window: nothing sent yet"
+    assert seen["after_window"] == 2, "the window's last write is deferred, not dropped"
+    assert seen["much_later"] == 2, "three writes, two sends: one per window"
+    assert all(p["url"].endswith("tok-b") for p in _pokes(env)), "never the phone that wrote it"
+
+
+def test_both_phones_writing_inside_the_window_wakes_both(env, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(env.main, "POKE_WINDOW_S", 0.3)
+    _register_push(env, "phoneA", "phoneA", "tok-a")
+    _register_push(env, "phoneB", "phoneB", "tok-b")
+    hid = env.main.household_id()
+    env.main._last_poke.clear()
+
+    async def scenario():
+        await env.main._poke_partners(hid, "phoneA")          # sent now, to B
+        await env.main._poke_partners(hid, "phoneB")          # inside the window: deferred, for A
+        await env.main._poke_partners(hid, "phoneA")          # A again: the deferred poke now wakes BOTH
+        await asyncio.sleep(0.5)
+    asyncio.run(scenario())
+
+    pokes = _pokes(env)
+    assert pokes[0]["url"].endswith("tok-b")
+    assert sorted(p["url"][-5:] for p in pokes[1:]) == ["tok-a", "tok-b"], "both wrote: both are woken"
+    assert len(pokes) == 3
+
+
+# ---- owlet.refresh heartbeat + deep-arm survives a nosignal→awake edge (1.12.0) ------------
+
+def _one_poller_tick(env, monkeypatch):
+    import asyncio
+
+    class _Stop(BaseException):
+        pass
+
+    async def stop(_seconds):
+        raise _Stop()
+    monkeypatch.setattr(env.main, "asyncio", types.SimpleNamespace(sleep=stop, create_task=asyncio.create_task))
+    with pytest.raises(_Stop):
+        asyncio.run(env.main._owlet_sleep_poller())
+
+
+def _quiet_asleep_setup(env, monkeypatch, now):
+    """A confirmed light sleep that has not changed: no stage edge, no class edge."""
+    import asyncio
+    _register_push(env, "phoneA", "phoneA", "tok-a")
+    _fake_home_state(env, monkeypatch, sleep_state="light_sleep")
+    monkeypatch.setattr(env.main.home, "_get", lambda *a, **k: asyncio.sleep(0, result=None))
+    D = env.main.owlet_log.Debounced
+    env.db.set_config("owlet_last_poll_ts", str(now - 15))
+    env.db.set_config("owlet_last_real_cls", "asleep")
+    env.db.set_config("owlet_sleep_cls", D(confirmed="asleep").to_json())
+    env.db.set_config("owlet_stage", D(confirmed="light_sleep").to_json())
+    env.db.set_config("owlet_activity_start", env.main.owlet_log.iso_at(now - 3600))
+
+
+def test_quiet_stage_gets_a_heartbeat_refresh_only_after_the_interval(env, monkeypatch):
+    import time as _t
+    now = _t.time()
+    _quiet_asleep_setup(env, monkeypatch, now)
+    env.db.set_config("owlet_refresh_push_ts", str(now - env.main.OWLET_REFRESH_HEARTBEAT_S + 5))
+    _one_poller_tick(env, monkeypatch)
+    assert not [c for c in env.fake.calls if c["body"].get("event") == "owlet.refresh"], "1195 s: too soon"
+    env.db.set_config("owlet_refresh_push_ts", str(now - env.main.OWLET_REFRESH_HEARTBEAT_S))
+    _one_poller_tick(env, monkeypatch)
+    refresh = [c for c in env.fake.calls if c["body"].get("event") == "owlet.refresh"]
+    assert len(refresh) == 1, "1200 s of the same stage: one heartbeat"
+    assert float(env.db.get_config("owlet_refresh_push_ts")) >= now, "the heartbeat stamps the clock"
+    _one_poller_tick(env, monkeypatch)
+    assert len([c for c in env.fake.calls if c["body"].get("event") == "owlet.refresh"]) == 1, "and not again"
+
+
+def test_no_heartbeat_while_the_sock_is_off(env, monkeypatch):
+    import asyncio
+    import time as _t
+    now = _t.time()
+    _register_push(env, "phoneA", "phoneA", "tok-a")
+    _fake_home_state(env, monkeypatch, alerts={"sock_off": True}, sleep_state="unavailable")
+    monkeypatch.setattr(env.main.home, "_get", lambda *a, **k: asyncio.sleep(0, result=None))
+    D = env.main.owlet_log.Debounced
+    env.db.set_config("owlet_last_poll_ts", str(now - 15))
+    env.db.set_config("owlet_last_real_cls", "awake")
+    env.db.set_config("owlet_alerts", json.dumps({"sock_off": True}))
+    env.db.set_config("owlet_sleep_cls", D(confirmed="nosignal").to_json())
+    env.db.set_config("owlet_refresh_push_ts", str(now - 7200))
+    _one_poller_tick(env, monkeypatch)
+    assert not [c for c in env.fake.calls if c["body"].get("event") == "owlet.refresh"]
+
+
+def test_deep_arm_survives_a_nosignal_to_awake_edge_but_not_a_real_wake(env, monkeypatch):
+    """Sock back on after a feed → she reads awake for five minutes → confirmed awake. That is
+    NOT a wake-up, and the arm the parent just set must stay (the app kept saying "You'll be
+    alerted" while the relay had quietly disarmed)."""
+    import asyncio
+    import time as _t
+    now = _t.time()
+    _register_push(env, "phoneA", "phoneA", "tok-a")
+    _fake_home_state(env, monkeypatch, sleep_state="awake")
+    monkeypatch.setattr(env.main.home, "_get", lambda *a, **k: asyncio.sleep(0, result=None))
+    D = env.main.owlet_log.Debounced
+    env.db.set_config("owlet_last_poll_ts", str(now - 15))
+    env.db.set_config("owlet_deep_arm_until", str(now + 600))
+    # nosignal → awake (prev REAL class was already awake).
+    env.db.set_config("owlet_last_real_cls", "awake")
+    env.db.set_config("owlet_sleep_cls", D(confirmed="nosignal", candidate="awake",
+                                           since=now - env.main.owlet_log.WAKE_HOLD_SECONDS - 10).to_json())
+    _one_poller_tick(env, monkeypatch)
+    assert float(env.db.get_config("owlet_deep_arm_until") or 0) > now, "a nosignal→awake edge keeps the arm"
+    assert env.http.get("/v1/home/state").json()["deep_armed"] is True
+    # asleep → awake: a real wake ends the settle and clears it.
+    env.db.set_config("owlet_last_poll_ts", str(now - 15))
+    env.db.set_config("owlet_last_real_cls", "asleep")
+    env.db.set_config("owlet_sleep_cls", D(confirmed="asleep", candidate="awake",
+                                           since=now - env.main.owlet_log.WAKE_HOLD_SECONDS - 10).to_json())
+    _one_poller_tick(env, monkeypatch)
+    assert env.db.get_config("owlet_deep_arm_until") in ("", None)
+    assert env.http.get("/v1/home/state").json()["deep_armed"] is False
