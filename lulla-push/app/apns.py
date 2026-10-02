@@ -201,6 +201,21 @@ def build_background_payload(*, data: Optional[dict] = None) -> dict:
     return payload
 
 
+# APNs rejects any payload over 4096 bytes outright — the WHOLE push, not just the extra keys.
+MAX_PAYLOAD_BYTES = 4096
+
+
+def encode_payload(payload: dict) -> str:
+    """The exact body sent to Apple. Compact separators: the default `", "` / `": "` cost ~15% on
+    a band-heavy `owlet.refresh`, which is what pushed busy nights past the 4 KB limit."""
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def payload_size(payload: dict) -> int:
+    """Bytes on the wire for `payload`, measured with the same encoder `send_to_token` uses."""
+    return len(encode_payload(payload).encode("utf-8"))
+
+
 # ---- sender interface -------------------------------------------------------
 
 class Sender(Protocol):
@@ -296,7 +311,7 @@ class APNsClient:
             topic_override=topic_override,
         )
         url = f"{host_for(environment, env_mode)}/3/device/{device_token}"
-        status, reason = await self._sender.send(url, headers, json.dumps(payload))
+        status, reason = await self._sender.send(url, headers, encode_payload(payload))
         return status == 200, status, reason
 
 

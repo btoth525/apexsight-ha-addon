@@ -91,9 +91,10 @@ def init() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_activities_child ON activities(child_id);
 
-            -- Sleep-stage bands behind the hypnogram. HA's recorder keeps ~10 days; Owlet keeps
-            -- session history forever, so we keep our own. Written as each band CLOSES, off the
-            -- debounced signal, so the chart can never contradict the sleep log.
+            -- DEBOUNCED sleep-stage bands, written as each band closes off the same confirmed
+            -- signal as the alerts and the auto sleep log. WRITE-ONLY: no endpoint reads this
+            -- table — the hypnogram, the sessions endpoint, and the widget summary are all built
+            -- from `sleep_minute` below. Kept as an audit trail of the debounced signal.
             CREATE TABLE IF NOT EXISTS sleep_segments (
                 start_ts REAL NOT NULL PRIMARY KEY,
                 end_ts   REAL NOT NULL,
@@ -349,9 +350,9 @@ def delete_push_device(device_token: str) -> None:
 # ---- Sleep segments (hypnogram) ---------------------------------------------
 
 def add_sleep_segment(band: str, start_ts: float, end_ts: float) -> None:
-    """Record one closed band. Keyed on `start_ts` so replaying a tick (or re-running the
-    backfill) overwrites rather than duplicating — the same idempotence the auto-logged sleep
-    events get from their deterministic uuid5."""
+    """Record one closed DEBOUNCED band (audit trail only — the chart reads `sleep_minute`).
+    Keyed on `start_ts` so replaying a tick (or re-running the backfill) overwrites rather than
+    duplicating — the same idempotence the auto-logged sleep events get from their uuid5."""
     if end_ts <= start_ts or not band:
         return
     with _conn() as c:
@@ -363,6 +364,7 @@ def add_sleep_segment(band: str, start_ts: float, end_ts: float) -> None:
 
 
 def sleep_segments(since_ts: float) -> list[sqlite3.Row]:
+    """Debounced bands since `since_ts`. Not called by the app; kept for inspection / tests."""
     with _conn() as c:
         return c.execute(
             "SELECT band, start_ts, end_ts FROM sleep_segments WHERE end_ts >= ? ORDER BY start_ts",

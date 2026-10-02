@@ -516,3 +516,191 @@ def test_sync_push_silently_wakes_the_other_phone(env):
     pokes = [c for c in env.fake.calls if c["body"].get("event") == "sync.refresh"]
     assert len(pokes) == 1 and pokes[0]["url"].endswith("tok-b")      # never the phone that wrote it
     assert pokes[0]["body"]["aps"] == {"content-available": 1}
+
+
+# ---- owlet.refresh payload size + sleep anchor (1.11.0) -----------------------------------
+
+from app import sleep_history as _sh                      # noqa: E402
+
+_T0 = 1_788_000_000.0
+# A realistic owlet part, so the base size of the payload is honest.
+_OWLET = {"bpm": 142, "spo2": 98, "battery_pct": 63, "sock_on": True,
+          "sleep_state": "light_sleep", "sleep_class": "asleep",
+          "asleep_since": "2026-09-28T02:10:00Z", "read_at": "2026-09-28T11:22:33Z"}
+
+
+def _session(segments):
+    return _sh.OwletSession(
+        start=segments[0].start, end=segments[-1].end, asleep_minutes=400, light_minutes=250,
+        deep_minutes=150, awake_minutes=240, wakings=8, longest_stretch_minutes=90,
+        segments=segments)
+
+
+def _busy_night(n_bands, seed=3):
+    """`n_bands` contiguous 1–4 minute runs with a real (>=5 min) waking every 25 bands."""
+    import random
+    rng = random.Random(seed)
+    out, t, prev = [], _T0, None
+    for i in range(n_bands):
+        if i % 25 == 12 and prev != "awake":
+            kind, minutes = "awake", rng.randint(5, 8)
+        else:
+            kind = rng.choice([k for k in ("light_sleep", "deep_sleep", "awake") if k != prev])
+            minutes = rng.randint(1, 4)
+        out.append(_sh.Segment(kind, t, t + minutes * 60))
+        t += minutes * 60
+        prev = kind
+    return out
+
+
+def test_encode_payload_is_compact_and_is_what_gets_sent(env):
+    p = {"aps": {"content-available": 1}, "sleep": {"bands": [{"kind": 1, "start": 0, "end": 60}]}}
+    body = env.apns.encode_payload(p)
+    assert ", " not in body and ": " not in body
+    assert json.loads(body) == p
+    assert env.apns.payload_size(p) == len(body.encode())
+
+    class RawSender:
+        def __init__(self): self.bodies = []
+        async def send(self, url, headers, body):
+            self.bodies.append(body)
+            return 200, "ok"
+    raw = RawSender()
+    import asyncio
+    client = env.apns.APNsClient(sender=raw)
+    asyncio.run(client.send_to_token("tok", "prod", p, push_type="background"))
+    assert raw.bodies == [body]
+
+
+def test_a_94_band_night_now_fits_without_merging(env):
+    """The 9/21 night (94 bands) went out at 4,428 bytes and APNs rejected the whole push. The
+    compact encoding alone brings a night that size under budget with every band intact."""
+    night = _busy_night(94)
+    p = env.main.build_owlet_refresh_payload(dict(_OWLET), _session(night), now=night[-1].end)
+    assert len(p["sleep"]["bands"]) == 94
+    assert env.apns.payload_size(p) <= env.main.REFRESH_PAYLOAD_BUDGET
+    assert len(json.dumps(p).encode()) > 4096          # ...the old encoding would not have
+
+
+def test_a_300_band_night_is_merged_to_fit_and_still_covers_the_whole_night(env):
+    night = _busy_night(300)
+    span = round(night[-1].end - night[0].start)
+    p = env.main.build_owlet_refresh_payload(dict(_OWLET), _session(night), now=night[-1].end)
+    assert env.apns.payload_size(p) <= env.main.REFRESH_PAYLOAD_BUDGET < env.apns.MAX_PAYLOAD_BYTES
+    assert p["owlet"] == _OWLET and p["event"] == "owlet.refresh"
+    bands = p["sleep"]["bands"]
+    assert 1 < len(bands) < 300
+    # Merged, not skipped: first starts at 0, last ends at the span, no holes in between.
+    assert bands[0]["start"] == 0 and bands[-1]["end"] == span
+    assert all(a["end"] == b["start"] for a, b in zip(bands, bands[1:]))
+    assert sum(b["end"] - b["start"] for b in bands) == span
+    # Every real waking is still an awake band (kind 2) where it happened.
+    for w in (s for s in night if s.band == "awake" and s.seconds >= 300):
+        ws, we = w.start - night[0].start, w.end - night[0].start
+        holder = [b for b in bands if b["start"] <= ws and we <= b["end"]]
+        assert len(holder) == 1 and holder[0]["kind"] == 2
+    # The totals are the session's, untouched by merging.
+    assert p["sleep"]["wakings"] == 8 and p["sleep"]["asleep_seconds"] == 400 * 60
+
+
+def test_a_night_that_cannot_shrink_drops_sleep_but_the_owlet_reading_goes_through(env):
+    """300 bands alternating 5-minute wakings with 10-minute sleeps: no merge is legal (it would
+    paint a waking as sleep), so the summary is dropped — never the whole push."""
+    night, t = [], _T0
+    for i in range(300):
+        kind, minutes = ("awake", 5) if i % 2 else ("light_sleep", 10)
+        night.append(_sh.Segment(kind, t, t + minutes * 60))
+        t += minutes * 60
+    p = env.main.build_owlet_refresh_payload(dict(_OWLET), _session(night), now=t)
+    assert "sleep" not in p
+    assert p["owlet"] == _OWLET and p["aps"] == {"content-available": 1}
+    assert env.apns.payload_size(p) <= env.main.REFRESH_PAYLOAD_BUDGET
+
+
+def test_no_session_means_no_sleep_key(env):
+    p = env.main.build_owlet_refresh_payload(dict(_OWLET), None, now=_T0)
+    assert "sleep" not in p and p["owlet"] == _OWLET
+
+
+def _fake_home_state(env, monkeypatch, *, alerts=None, sleep_state="light_sleep"):
+    async def fake_state():
+        return {"connected": True, "baby_name": "Ryleigh", "nursery": [],
+                "alerts": alerts if alerts is not None else {},
+                "vitals": {"bpm": 140, "spo2": 98, "battery_pct": 60, "sock_on": True,
+                           "sleep_state": sleep_state}}
+    monkeypatch.setattr(env.main.home, "state", fake_state)
+
+
+def test_home_state_carries_tonights_asleep_since(env, monkeypatch):
+    _fake_home_state(env, monkeypatch)
+    D = env.main.owlet_log.Debounced
+    env.db.set_config("owlet_activity_start", "2026-10-01T02:13:00Z")
+    env.db.set_config("owlet_sleep_cls", D(confirmed="asleep").to_json())
+    body = env.http.get("/v1/home/state").json()
+    assert body["sleep_class"] == "asleep"
+    assert body["asleep_since"] == "2026-10-01T02:13:00Z"
+    # Awake (or sock off): the stored anchor is last sleep's, so it must NOT be served.
+    for cls in ("awake", "nosignal"):
+        env.db.set_config("owlet_sleep_cls", D(confirmed=cls).to_json())
+        assert env.http.get("/v1/home/state").json()["asleep_since"] is None
+    # Asleep with no anchor yet → null, not "".
+    env.db.set_config("owlet_sleep_cls", D(confirmed="asleep").to_json())
+    env.db.set_config("owlet_activity_start", "")
+    assert env.http.get("/v1/home/state").json()["asleep_since"] is None
+
+
+def test_the_falling_asleep_refresh_push_carries_tonights_anchor_not_last_nights(env, monkeypatch):
+    """Drive ONE real poller tick across the confirmed awake→asleep edge. The refresh push goes
+    out before the Live Activity block, and the anchor used to be stamped only in the latter."""
+    import asyncio
+    import time as _t
+    _register_push(env, "phoneA", "phoneA", "tok-a")
+    _fake_home_state(env, monkeypatch)
+    monkeypatch.setattr(env.main.home, "_get", lambda *a, **k: asyncio.sleep(0, result=None))
+    D = env.main.owlet_log.Debounced
+    now = _t.time()
+    stale = env.main.owlet_log.iso_at(now - 20 * 3600)                   # last night's
+    env.db.set_config("owlet_activity_start", stale)
+    env.db.set_config("owlet_last_poll_ts", str(now - 15))              # no restart gap
+    env.db.set_config("owlet_last_real_cls", "awake")
+    env.db.set_config("owlet_sleep_cls", D(confirmed="awake", candidate="asleep",
+                                           since=now - 400).to_json())   # held > WAKE_HOLD
+
+    class _Stop(BaseException):
+        pass
+
+    async def stop(_seconds):
+        raise _Stop()
+    monkeypatch.setattr(env.main, "asyncio", types.SimpleNamespace(sleep=stop))
+    with pytest.raises(_Stop):
+        asyncio.run(env.main._owlet_sleep_poller())
+
+    refresh = [c for c in env.fake.calls if c["body"].get("event") == "owlet.refresh"]
+    assert len(refresh) == 1
+    sent = refresh[0]["body"]["owlet"]
+    assert sent["sleep_class"] == "asleep"
+    assert sent["asleep_since"] != stale
+    import calendar
+    anchor = calendar.timegm(_t.strptime(sent["asleep_since"], "%Y-%m-%dT%H:%M:%SZ"))
+    assert abs(anchor - (now - env.main.owlet_log.WAKE_HOLD_SECONDS)) < 5
+    assert env.db.get_config("owlet_activity_start") == sent["asleep_since"]
+
+
+def test_sessions_window_drops_a_night_cut_by_since(env, monkeypatch):
+    """`days=1` asked at 03:00 used to return the tail of a night that started before the
+    window as if it were a whole (short) session."""
+    now = 1_788_100_000
+    monkeypatch.setattr(env.main, "time", types.SimpleNamespace(time=lambda: now))
+    since = now - 86400
+    # A night from since-2h to since+6h (straddles the edge), then a nap fully inside.
+    for m in range(since - 2 * 3600, since + 6 * 3600, 60):
+        env.db.set_sleep_minute(m - m % 60, "light_sleep")
+    nap = since + 10 * 3600
+    for m in range(nap, nap + 90 * 60, 60):
+        env.db.set_sleep_minute(m - m % 60, "deep_sleep")
+    body = env.http.get("/v1/home/sleep/sessions?days=1").json()
+    starts = [s["start"] for s in body["sessions"]]
+    assert starts == [env.main.owlet_log.iso_at(nap - nap % 60)]       # the cut night is gone
+    # minute_count still describes the requested window only.
+    assert body["minute_count"] == sum(1 for r in env.db.sleep_minutes(since)
+                                       if r["minute_ts"] >= since)

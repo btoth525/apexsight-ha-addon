@@ -5,11 +5,21 @@ Why this lives on the relay and not in the app:
 
   * **Retention.** HA's recorder keeps ~10 days. Owlet keeps session history indefinitely. If we
     read the recorder on demand, Taylor gets a beautiful chart for last night and an empty one
-    for last month, with nothing to explain it. So the relay WRITES segments as they close and
-    keeps them; the recorder is used once, to backfill the days we still have.
-  * **One source of truth.** The app must not re-derive bands from the raw `sleep_state`, or the
-    chart would strobe and count ~70 wakings for a night the sleep log correctly records as ~8.
-    Segmentation runs off the same DEBOUNCED signal as the notifications and the auto-log.
+    for last month, with nothing to explain it. So the relay WRITES the sock's state once a
+    minute (`sleep_minute`) and keeps it; the recorder is used once, to backfill the days we
+    still have.
+  * **One source of truth.** The app must not re-derive bands from the raw `sleep_state`; it
+    draws what the relay hands it.
+
+Two paths live here, and only ONE of them feeds the app today:
+
+  * `owlet_sessions()` (bottom of the file) — the per-MINUTE, Owlet-matched sessions. This is
+    what `/v1/home/sleep/sessions` (the hypnogram + session card) and the `owlet.refresh` push's
+    widget summary are built from.
+  * `segments_from_readings()` / `sessions_from_segments()` — the DEBOUNCED bands. The poller
+    and the backfill still write them to the `sleep_segments` table, but no endpoint reads that
+    table any more; it's kept as an audit trail of the debounced signal (the one that drives the
+    notifications and the auto-log), and these functions stay unit-tested for that reason.
 
 Everything here is pure except the callers in main.py — segment maths is unit-tested with no
 clock, network, or DB.
@@ -21,6 +31,7 @@ show the numbers; the parent decides what they mean.
 """
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -246,9 +257,16 @@ def sessions_from_segments(segments: list[Segment],
 # With those, the durations matched to within a minute (deep was exact) and the waking rule below
 # reproduced Owlet's count of 8.
 
-# Sock-off (nosignal) shorter than this is bridged INSIDE a session — a feed/change/adjust, not
-# the end of the night. Longer ends the session. (Owlet bridged the brief gaps in the sample.)
+# Sock-off (nosignal) shorter than this is bridged INSIDE a sock-on run — a feed/change/adjust,
+# not the end of the night. (Owlet bridged the brief gaps in the sample.) It is also how long a
+# hole with NO rows at all is carried forward as the last state (see `_fill_minutes`).
 SESSION_BRIDGE_MINUTES = 15
+# Two sessions separated by at most this much no-data (sock off) are ONE night. A 3 AM feed
+# with the sock on the charger for 19 minutes split Sun 9/27 into "9:10 PM–12:11 AM" and
+# "12:30–9:16 AM"; no parent would call that two sleeps. The gap itself stays out of every
+# total and is left UNCOVERED between bands (the app has no "no data" band kind), never drawn
+# as sleep.
+NIGHT_MERGE_GAP_MINUTES = 45
 # Waking smoothing, calibrated to Owlet's count: a wake registers only after this many continuous
 # awake minutes, and can't register again until this many continuous asleep minutes have passed.
 WAKE_REGISTER_MINUTES = 5
@@ -325,7 +343,8 @@ class OwletSession:
 def _count_wakings(states: list[str]) -> int:
     """Owlet-style waking count over one session's per-minute states. A waking is a SUSTAINED
     awakening between sleep bouts: it registers after WAKE_REGISTER_MINUTES continuous awake, and
-    won't register another until WAKE_REARM_MINUTES continuous asleep have re-armed it. Leading
+    won't register another until WAKE_REARM_MINUTES asleep minutes (uninterrupted by awake; a
+    nosignal minute pauses the count rather than resetting it) have re-armed it. Leading
     (settling) and trailing (final wake) awake are excluded by only scanning between the first and
     last asleep minute."""
     idx = [i for i, s in enumerate(states) if s in _ASLEEP_STATES]
@@ -348,74 +367,195 @@ def _count_wakings(states: list[str]) -> int:
             awake_run = 0
             if asleep_run >= WAKE_REARM_MINUTES:
                 armed = True
-        else:  # a bridged nosignal minute — neither confirms nor breaks a wake
+        else:
+            # A nosignal minute inside the session (sock off / no reading). We can't see her, so
+            # it never counts AS awake or asleep. It does break an in-progress awake run — a
+            # waking needs WAKE_REGISTER_MINUTES of continuously OBSERVED awake, so awake minutes
+            # either side of a sock-off don't add up — but it leaves `asleep_run` and `armed`
+            # alone, so sleep either side of a sock-off still counts toward re-arming.
             awake_run = 0
     return wakings
 
 
-def owlet_sessions(minutes: list[tuple[int, str]]) -> list[OwletSession]:
-    """Build Owlet-matched sessions from a per-minute timeline. One session per sock-on period
-    (brief sock-off bridged); stats at 1-minute resolution to match Owlet's Sleep Summary."""
+def _sock_on_runs(dense: list[tuple[int, str]]) -> list[tuple[int, int]]:
+    """Index ranges `[i0, i1]` (inclusive) into `dense` of the sock-on runs: stretches separated
+    by MORE than SESSION_BRIDGE_MINUTES of nosignal, trimmed of nosignal at both ends. Leading /
+    trailing AWAKE is kept (Owlet's span includes settling and the final wake)."""
+    runs: list[tuple[int, int]] = []
+    first: Optional[int] = None       # first real (non-nosignal) index of the open run
+    last: Optional[int] = None        # last real index of the open run
+    nosig_run = 0
+    for i, (_ts, s) in enumerate(dense):
+        if s == "nosignal":
+            nosig_run += 1
+            if nosig_run > SESSION_BRIDGE_MINUTES and first is not None:
+                runs.append((first, last))
+                first = last = None
+            continue
+        nosig_run = 0
+        if first is None:
+            first = i
+        last = i
+    if first is not None:
+        runs.append((first, last))
+    return runs
+
+
+def _session_from(g: list[tuple[int, str]]) -> OwletSession:
+    """Stats + bands for one night's dense minutes (starts and ends on a real minute). Every
+    total counts REAL minutes only — a nosignal minute is never asleep, awake, or a waking — and
+    nosignal runs are left as uncovered time between bands rather than drawn as anything."""
+    states = [s for _, s in g]
+    light = states.count("light_sleep")
+    deep = states.count("deep_sleep")
+    awake = states.count("awake")
+    # Longest unbroken asleep run (minutes). Awake OR a sock-off breaks it: we can't claim she
+    # slept through a stretch we weren't watching.
+    longest = best = 0
+    for s in states:
+        if s in _ASLEEP_STATES:
+            best += 1
+            longest = max(longest, best)
+        else:
+            best = 0
+    # Hypnogram bands = runs of the per-minute state (so the chart shows Owlet's fine detail).
+    segments: list[Segment] = []
+    run_state = states[0]
+    run_start = g[0][0]
+    for (ts, s) in g[1:] + [(g[-1][0] + 60, None)]:
+        if s != run_state:
+            if run_state != "nosignal":
+                segments.append(Segment(run_state, float(run_start), float(ts)))
+            run_state = s
+            run_start = ts
+    return OwletSession(
+        start=float(g[0][0]), end=float(g[-1][0] + 60),
+        asleep_minutes=light + deep, light_minutes=light, deep_minutes=deep, awake_minutes=awake,
+        wakings=_count_wakings(states), longest_stretch_minutes=longest, segments=segments)
+
+
+def owlet_sessions(minutes: list[tuple[int, str]],
+                   *, merge_gap_minutes: int = NIGHT_MERGE_GAP_MINUTES) -> list[OwletSession]:
+    """Build Owlet-matched sessions from a per-minute timeline, oldest first. One session per
+    sock-on period (brief sock-off bridged); stats at 1-minute resolution to match Owlet's Sleep
+    Summary.
+
+    Sessions separated by at most `merge_gap_minutes` (end of one to start of the next) are then
+    merged into one night. Whatever lies between them stays as it was: real minutes (a short
+    awake run, a fragment too small to be its own session) count in the totals like any other,
+    and the sock-off minutes count in nothing and draw as a hole between bands."""
     dense = _fill_minutes(minutes)
     if not dense:
         return []
-    # Split into sock-on runs separated by a real (unbridged) nosignal stretch.
-    groups: list[list[tuple[int, str]]] = []
-    cur: list[tuple[int, str]] = []
-    nosig_run = 0
-    for ts, s in dense:
-        if s == "nosignal":
-            nosig_run += 1
-            if nosig_run > SESSION_BRIDGE_MINUTES:
-                if cur:
-                    groups.append(cur)
-                    cur = []
-                continue
-        else:
-            nosig_run = 0
-        cur.append((ts, s))
-    if cur:
-        groups.append(cur)
 
-    sessions: list[OwletSession] = []
-    for g in groups:
-        # Trim leading/trailing nosignal but KEEP leading/trailing awake (Owlet's span includes
-        # settling and the final wake).
-        while g and g[0][1] == "nosignal":
-            g.pop(0)
-        while g and g[-1][1] == "nosignal":
-            g.pop()
-        if not g:
-            continue
-        states = [s for _, s in g]
-        if not any(s in _ASLEEP_STATES for s in states):
-            continue
-        light = states.count("light_sleep")
-        deep = states.count("deep_sleep")
-        asleep = light + deep
-        if asleep < MIN_SESSION_ASLEEP_MINUTES:
-            continue
-        awake = states.count("awake")
-        # longest unbroken asleep run (minutes)
-        longest = best = 0
-        for s in states:
-            if s in _ASLEEP_STATES:
-                best += 1
-                longest = max(longest, best)
-            else:
-                best = 0
-        # hypnogram bands = runs of the per-minute state (so the chart shows Owlet's fine detail)
-        segments: list[Segment] = []
-        run_state = states[0]
-        run_start = g[0][0]
-        for (ts, s) in g[1:] + [(g[-1][0] + 60, None)]:
-            if s != run_state:
-                if run_state != "nosignal":
-                    segments.append(Segment(run_state, float(run_start), float(ts)))
-                run_state = s
-                run_start = ts
-        sessions.append(OwletSession(
-            start=float(g[0][0]), end=float(g[-1][0] + 60),
-            asleep_minutes=asleep, light_minutes=light, deep_minutes=deep, awake_minutes=awake,
-            wakings=_count_wakings(states), longest_stretch_minutes=longest, segments=segments))
-    return sessions
+    def asleep_in(r: tuple[int, int]) -> int:
+        return sum(1 for _, s in dense[r[0]: r[1] + 1] if s in _ASLEEP_STATES)
+
+    # A run is a session once it holds enough actual sleep (same bar as before the merge).
+    runs = [r for r in _sock_on_runs(dense) if asleep_in(r) >= MIN_SESSION_ASLEEP_MINUTES]
+
+    nights: list[tuple[int, int]] = []
+    for r in runs:
+        if nights:
+            prev_end = dense[nights[-1][1]][0] + 60          # end of the previous session
+            if dense[r[0]][0] - prev_end <= merge_gap_minutes * 60:
+                nights[-1] = (nights[-1][0], r[1])
+                continue
+        nights.append(r)
+    return [_session_from(dense[i0: i1 + 1]) for i0, i1 in nights]
+
+
+# ---- Band merging (the widget summary has to fit in one push) ------------------------------
+#
+# The `owlet.refresh` push carries the newest night's bands for the home-screen barcode, and
+# APNs refuses ANY payload over 4 KB — the whole push, owlet reading included. A busy night is
+# ~95 one-minute-resolution runs; with default JSON separators that was 4.1–4.4 KB (measured on
+# 9/21, 9/23, 9/25), so the widget stopped updating near wake-up. The old cap was stride sampling
+# (keep every Nth band), which SKIPS bands, so the barcode under-fills and can lose a waking.
+# Merging instead keeps every second covered.
+
+# An awake stretch this long is a real waking (WAKE_REGISTER_MINUTES); merging must never hide one
+# inside a sleep-coloured band.
+PROTECT_AWAKE_SECONDS = WAKE_REGISTER_MINUTES * 60
+_KIND_TIE_ORDER = {AWAKE: 0, LIGHT: 1, DEEP: 2}     # on a tie, awake wins (never hide a waking)
+
+
+@dataclass
+class _BandGroup:
+    start: float
+    end: float
+    seconds: dict                     # band kind -> real (covered) seconds, gaps excluded
+
+    @property
+    def kind(self) -> str:
+        return min(self.seconds, key=lambda k: (-self.seconds[k], _KIND_TIE_ORDER.get(k, 9)))
+
+    def protected(self, protect_awake_seconds: float) -> bool:
+        """An awake band holding a real waking's worth of awake — never to be painted as sleep.
+        Judged on the GROUP, so an awake band grown out of merges is protected too."""
+        return self.kind == AWAKE and self.seconds.get(AWAKE, 0.0) >= protect_awake_seconds
+
+
+def _combine(a: _BandGroup, b: _BandGroup,
+             protect_awake_seconds: float) -> Optional[_BandGroup]:
+    """`a` and `b` as one band, or None if that would swallow a protected waking into sleep."""
+    secs = dict(a.seconds)
+    for k, v in b.seconds.items():
+        secs[k] = secs.get(k, 0.0) + v
+    merged = _BandGroup(start=a.start, end=b.end, seconds=secs)
+    if merged.kind != AWAKE and (a.protected(protect_awake_seconds)
+                                 or b.protected(protect_awake_seconds)):
+        return None
+    return merged
+
+
+def merge_bands(segments: list[Segment], max_bands: int,
+                *, protect_awake_seconds: float = PROTECT_AWAKE_SECONDS) -> list[Segment]:
+    """Reduce `segments` to at most `max_bands` by merging ADJACENT bands — never dropping one —
+    so the merged list still starts where the first band started and ends where the last ended.
+
+    Greedy: always merge the adjacent pair whose combined span is shortest (flicker first; a
+    sock-off gap between two bands counts in the span, so bands either side of a gap merge last).
+    A merged band takes the kind with the most real seconds in it (ties → awake). An awake band
+    of `protect_awake_seconds` or more is never merged into a sleep-coloured band; it may only
+    absorb neighbours while staying awake. If that rule leaves no legal merge, the result can be
+    longer than `max_bands` — the caller decides what to do then."""
+    if max_bands < 1 or len(segments) <= max_bands:
+        return list(segments)
+
+    groups: list[Optional[_BandGroup]] = [
+        _BandGroup(start=s.start, end=s.end, seconds={s.band: s.seconds}) for s in segments]
+    n = len(groups)
+    nxt = list(range(1, n + 1))
+    prv = list(range(-1, n - 1))
+    version = [0] * n
+    heap: list = []
+
+    def push_pair(i: int) -> None:
+        if i < 0 or nxt[i] >= n:
+            return
+        j = nxt[i]
+        merged = _combine(groups[i], groups[j], protect_awake_seconds)
+        if merged is not None:
+            heapq.heappush(heap, (merged.end - merged.start, groups[i].start, i, version[i],
+                                  j, version[j]))
+
+    for i in range(n - 1):
+        push_pair(i)
+    count = n
+    while count > max_bands and heap:
+        _span, _start, i, vi, j, vj = heapq.heappop(heap)
+        if (groups[i] is None or groups[j] is None or version[i] != vi or version[j] != vj
+                or nxt[i] != j):
+            continue                  # stale: one side has merged since this was queued
+        groups[i] = _combine(groups[i], groups[j], protect_awake_seconds)
+        groups[j] = None
+        version[i] += 1
+        nxt[i] = nxt[j]
+        if nxt[j] < n:
+            prv[nxt[j]] = i
+        count -= 1
+        if prv[i] >= 0:
+            push_pair(prv[i])
+        push_pair(i)
+    return [Segment(g.kind, g.start, g.end) for g in groups if g is not None]

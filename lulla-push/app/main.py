@@ -70,13 +70,14 @@ async def _startup() -> None:
 
 
 async def _backfill_sleep_segments() -> None:
-    """Seed the hypnogram ONCE from HA's recorder so it doesn't launch empty.
+    """Seed the sleep history ONCE from HA's recorder so the chart doesn't launch empty.
 
-    The recorder holds ~10 days; from here on the poller writes bands as they close and we keep
-    them indefinitely (Owlet keeps session history forever — a chart that goes blank a fortnight
-    back would be a step DOWN from what Taylor has today). Replayed through the same debounce the
-    poller uses, so backfilled days are shaped identically to live ones — a seam there would show
-    up as the chart changing character ten days back."""
+    The recorder holds ~10 days; from here on the poller writes one `sleep_minute` row a minute
+    and we keep them indefinitely (Owlet keeps session history forever — a chart that goes blank
+    a fortnight back would be a step DOWN from what Taylor has today). The per-minute seed below
+    is what the chart reads. The debounced `sleep_segments` replay is write-only (no endpoint
+    reads that table); it's replayed through the poller's own debounce so the audit trail has no
+    seam ten days back."""
     if db.get_config("owlet_backfill_done"):
         return
     try:
@@ -167,7 +168,8 @@ async def _owlet_sleep_poller() -> None:
             now_ts = time.time()
 
             # 0) RESTART / GAP GUARD. The relay persists its debounce candidates and the open
-            #    hypnogram band across a restart. Without this, a deploy or reboot mid-sleep would
+            #    debounced band (`sleep_segments`) across a restart. Without this, a deploy or
+            #    reboot mid-sleep would
             #    (a) bridge the open band straight across the downtime, hiding any waking that
             #    happened while we were down, and (b) let a stale debounce candidate whose `since`
             #    predates the gap instant-confirm a Focus-piercing wake push from a single sample.
@@ -270,6 +272,13 @@ async def _owlet_sleep_poller() -> None:
             # 3c) Silent nudge on any confirmed change so the phones' widgets / Lock Screen
             #     redraw without waiting on WidgetKit's refresh budget. Carries the reading
             #     itself, so the app can stamp its App Group snapshot with no round trip.
+            # Stamp tonight's sleep anchor on the falling-asleep EDGE before anything reads it:
+            # the refresh push right below carries it as `asleep_since`, and it used to be set
+            # only further down (3c-ii), so the edge push went out with LAST night's anchor.
+            # Back-stamped to when she actually fell asleep, like the auto-log.
+            if new_cls == "asleep":
+                db.set_config("owlet_activity_start", owlet_log.iso_at(
+                    now_ts - owlet_log.WAKE_HOLD_SECONDS))
             if new_stage or new_cls:
                 await _push_owlet_refresh(vitals, stage=stage_state.confirmed, sleep_class=cur)
 
@@ -306,8 +315,7 @@ async def _owlet_sleep_poller() -> None:
                     live_stage_since=live_since if live_stage else None)
 
             if new_cls == "asleep":
-                db.set_config("owlet_activity_start", owlet_log.iso_at(
-                    now_ts - owlet_log.WAKE_HOLD_SECONDS))
+                # (`owlet_activity_start` was stamped above, before the refresh push.)
                 db.set_config("owlet_activity_stage_since", owlet_log.now_iso())
                 # Only push-to-start if the APP hasn't already started (and registered) one. The
                 # app local-starts the card whenever it's open and she's asleep; a relay start on
@@ -375,20 +383,21 @@ async def _owlet_sleep_poller() -> None:
             elif decision == "expire":
                 db.set_config("owlet_deep_arm_until", "")
 
-            # 3c-iii) Record the hypnogram band. Written off the SAME confirmed signals as the
-            #         alerts and the auto-log, so the chart can never contradict them — an app
-            #         that re-derived bands from the raw state would strobe and count ~70
-            #         wakings for a night the log correctly calls eight.
-            # Per-MINUTE raw timeline for the Owlet-matched Sleep Summary (separate from the
-            # debounced band below). Store the RAW sock state so 1-minute stats match Owlet.
+            # 3c-iii) Record the sleep timeline.
+            # Per-MINUTE raw timeline — the ONLY source the chart reads: `/v1/home/sleep/sessions`
+            # (hypnogram + session card) and the owlet.refresh widget summary are both built from
+            # it by `sleep_history.owlet_sessions`. Store the RAW sock state so 1-minute stats
+            # match Owlet.
             db.set_sleep_minute(int(now_ts // 60) * 60,
                                 sleep_history._minute_state(raw_stage))
 
+            # The DEBOUNCED band (`sleep_segments`), written off the same confirmed signals as the
+            # alerts and the auto-log. Nothing reads this table any more (the chart moved to the
+            # per-minute timeline above); it's kept as an audit trail of the debounced signal.
             band = sleep_history.band_for(cur, stage_state.confirmed)
             # Back-stamp a band boundary caused by a CONFIRMED edge to when the change actually
-            # started (now - hold), exactly as the auto sleep-log does — otherwise the chart would
-            # show her asleep up to a full WAKE_HOLD (5 min) longer than the log at every waking,
-            # and the two would visibly disagree on bedtime/wake. A class edge uses WAKE_HOLD; a
+            # started (now - hold), exactly as the auto sleep-log does, so the recorded bands
+            # agree with the log on bedtime/wake. A class edge uses WAKE_HOLD; a
             # pure stage edge uses STAGE_HOLD; a plain fresh-signal tick uses now.
             if new_cls in ("awake", "asleep", "nosignal"):
                 edge_ts = now_ts - owlet_log.WAKE_HOLD_SECONDS
@@ -406,8 +415,8 @@ async def _owlet_sleep_poller() -> None:
                 db.set_config("owlet_band", band or "")
                 db.set_config("owlet_band_start", str(boundary) if band else "")
             elif band and open_band_start:
-                # Keep the OPEN band's end fresh so a chart drawn mid-nap reaches "now" instead
-                # of stopping at the last transition.
+                # Keep the OPEN band's end fresh so the stored band reaches "now" instead of
+                # stopping at the last transition.
                 db.add_sleep_segment(band, open_band_start, now_ts)
 
             # 3d) Auto-log sleep off the CONFIRMED class. The edge is back-stamped to when the
@@ -537,29 +546,83 @@ async def _sleep_activity_push(event: str, state: dict, dismissal_date: Optional
             db.delete_activity(act["activity_id"])
 
 
-def _current_sleep_summary(max_bands: int = 160) -> Optional[dict]:
-    """The newest Owlet-matched session as a COMPACT dict for the home-screen Sleep widget:
-    totals + downsampled barcode bands (kind 0=deep,1=light,2=awake; start/end seconds from the
-    session start). Returns None when there's no session yet."""
-    minutes = [(r["minute_ts"], r["state"]) for r in db.sleep_minutes(time.time() - 2 * 86400)]
+# Keep the encoded owlet.refresh under this, comfortably inside APNs' hard 4096-byte limit (a
+# payload over the limit is rejected WHOLE — the widget then stops updating near wake-up, which
+# is exactly when a busy night has the most bands).
+REFRESH_PAYLOAD_BUDGET = 3900
+# The App Group summary never needs more than this many bands, whatever the byte budget allows.
+SUMMARY_MAX_BANDS = 160
+_BAND_ROW = {"deep_sleep": 0, "light_sleep": 1, "awake": 2}
+
+
+def _newest_sleep_session(now: float) -> Optional[sleep_history.OwletSession]:
+    """The newest Owlet-matched session (the one the home-screen Sleep widget shows), or None."""
+    minutes = [(r["minute_ts"], r["state"]) for r in db.sleep_minutes(now - 2 * 86400)]
     sessions = sleep_history.owlet_sessions(minutes)
-    if not sessions:
-        return None
-    ss = max(sessions, key=lambda x: x.start)
-    bands = ss.segments
-    step = max(1, len(bands) // max_bands)
-    ROW = {"deep_sleep": 0, "light_sleep": 1, "awake": 2}
-    compact = [{"kind": ROW.get(b.band, 2),
-                "start": round(b.start - ss.start), "end": round(b.end - ss.start)}
-               for b in bands[::step]]
+    return max(sessions, key=lambda x: x.start) if sessions else None
+
+
+def _sleep_summary_dict(ss: sleep_history.OwletSession, bands: list, now: float) -> dict:
+    """The COMPACT widget summary: totals + barcode bands (kind 0=deep,1=light,2=awake; start/end
+    seconds from the session start). Sock-off time inside the night is a hole between bands."""
     return {
         "start": owlet_log.iso_at(ss.start), "end": owlet_log.iso_at(ss.end),
         "asleep_seconds": ss.asleep_minutes * 60, "awake_seconds": ss.awake_minutes * 60,
         "light_seconds": ss.light_minutes * 60, "deep_seconds": ss.deep_minutes * 60,
         "wakings": ss.wakings,
-        "in_progress": (time.time() - ss.end) < 900,     # still her current sleep
-        "bands": compact,
+        "in_progress": (now - ss.end) < 900,     # still her current sleep
+        "bands": [{"kind": _BAND_ROW.get(b.band, 2),
+                   "start": round(b.start - ss.start), "end": round(b.end - ss.start)}
+                  for b in bands],
     }
+
+
+def build_owlet_refresh_payload(owlet: dict, session: Optional[sleep_history.OwletSession], *,
+                                now: float, budget: int = REFRESH_PAYLOAD_BUDGET,
+                                max_bands: int = SUMMARY_MAX_BANDS) -> dict:
+    """The `owlet.refresh` background payload, guaranteed to fit `budget` bytes on the wire.
+
+    1. The night's bands, merged (never skipped) down to `max_bands`.
+    2. Still too big → merge further, to as many bands as the remaining bytes can hold.
+    3. Still too big (merging can't hide a real waking, so a pathological night may not shrink
+       enough) → drop the `sleep` key. The owlet reading ALWAYS goes through: the app keeps its
+       previous sleep summary when a refresh carries none, so a stale widget beats a dead push.
+    """
+    data: dict = {"event": "owlet.refresh", "owlet": owlet}
+    if session is None:
+        return apns.build_background_payload(data=data)
+    bands = sleep_history.merge_bands(session.segments, max_bands)
+    data["sleep"] = _sleep_summary_dict(session, bands, now)
+    payload = apns.build_background_payload(data=data)
+    if apns.payload_size(payload) <= budget:
+        return payload
+    # Room for bands = budget minus everything else; each band costs at most this many bytes
+    # (offsets can't exceed the night's span), so this cap is a guaranteed fit if merging can
+    # reach it.
+    data["sleep"] = _sleep_summary_dict(session, [], now)
+    room = budget - apns.payload_size(apns.build_background_payload(data=data))
+    digits = len(str(int(round(session.end - session.start))))
+    per_band = len('{"kind":0,"start":,"end":},') + 2 * digits
+    cap = min(room // per_band, max_bands)
+    if cap >= 1:
+        data["sleep"] = _sleep_summary_dict(
+            session, sleep_history.merge_bands(session.segments, cap), now)
+        payload = apns.build_background_payload(data=data)
+        if apns.payload_size(payload) <= budget:
+            return payload
+    data.pop("sleep", None)
+    log.warning("owlet.refresh: sleep summary dropped to fit the APNs payload limit")
+    return apns.build_background_payload(data=data)
+
+
+def _asleep_since(sleep_class: Optional[str]) -> Optional[str]:
+    """When she fell asleep THIS time (the relay's own Live Activity anchor, back-stamped to the
+    real edge), or None when she isn't confirmed asleep. Not the newest session's start: that
+    can be last night's (a session only appears after ~10 min asleep) or, now that a sock-off
+    gap no longer splits a night, the start of the whole night rather than this stretch."""
+    if sleep_class != "asleep":
+        return None
+    return db.get_config("owlet_activity_start") or None
 
 
 async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
@@ -573,19 +636,16 @@ async def _push_owlet_refresh(vitals: dict, *, stage: Optional[str],
     client = apns.get_client()
     if not client.is_configured():
         return
-    data = {
-        "event": "owlet.refresh",
-        "owlet": {
-            "bpm": vitals.get("bpm"), "spo2": vitals.get("spo2"),
-            "battery_pct": vitals.get("battery_pct"), "sock_on": vitals.get("sock_on"),
-            "sleep_state": stage, "sleep_class": sleep_class,
-            "read_at": owlet_log.now_iso(),
-        },
+    owlet = {
+        "bpm": vitals.get("bpm"), "spo2": vitals.get("spo2"),
+        "battery_pct": vitals.get("battery_pct"), "sock_on": vitals.get("sock_on"),
+        "sleep_state": stage, "sleep_class": sleep_class,
+        "asleep_since": _asleep_since(sleep_class),
+        "read_at": owlet_log.now_iso(),
     }
-    summary = _current_sleep_summary()
-    if summary:
-        data["sleep"] = summary       # the home-screen Sleep widget, refreshed in the background
-    payload = apns.build_background_payload(data=data)
+    now = time.time()
+    # The home-screen Sleep widget, refreshed in the background.
+    payload = build_owlet_refresh_payload(owlet, _newest_sleep_session(now), now=now)
     for dev in db.push_devices(household_id()):
         try:
             await _send_and_log(client, "owlet.refresh", dev["device_token"], dev["env"],
@@ -918,6 +978,9 @@ async def home_state(household: str = Depends(_household)):
     stage = owlet_log.Debounced.from_json(db.get_config("owlet_stage")).confirmed
     st["sleep_class"] = cls                # "awake" | "asleep" | "nosignal" | None
     st["stage_confirmed"] = stage          # "light_sleep" | "deep_sleep" | None
+    # When she fell asleep THIS time ("...Z" ISO, back-stamped to the real edge) — the anchor
+    # for every "asleep for 2h" clock, including the Live Activity. null unless confirmed asleep.
+    st["asleep_since"] = _asleep_since(cls)
     return st
 
 
@@ -931,13 +994,16 @@ async def home_sleep_sessions(days: int = 7, household: str = Depends(_household
     """
     days = max(1, min(int(days), 120))
     since = time.time() - days * 86400
-    minutes = [(r["minute_ts"], r["state"]) for r in db.sleep_minutes(since)]
-    sessions = sleep_history.owlet_sessions(minutes)
+    # Read one extra day back so a night that straddles `since` is assembled WHOLE, then drop it:
+    # cutting the window mid-night used to return its tail as a short, wrong "session".
+    rows = db.sleep_minutes(since - 86400)
+    minutes = [(r["minute_ts"], r["state"]) for r in rows]
+    sessions = [s for s in sleep_history.owlet_sessions(minutes) if s.start >= since]
     sessions.sort(key=lambda s: s.start, reverse=True)
     return {
         "days": days,
         "backfilled": bool(db.get_config("owlet_backfill_done")),
-        "minute_count": len(minutes),
+        "minute_count": sum(1 for r in rows if r["minute_ts"] >= since),
         "sessions": [s.as_dict() for s in sessions],
     }
 
