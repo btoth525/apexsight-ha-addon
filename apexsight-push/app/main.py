@@ -71,6 +71,18 @@ PANEL_SCREEN_FOR_SLUG = {
     "be-right-there":              "button.door_panel_screen_be_right_there",
     "leave-it-at-the-door-please": "button.door_panel_screen_leave_package",
     "thanks-delivery":             "button.door_panel_screen_thanks_delivery",
+    # Halloween soundboard clips: the app's soundboard (and HA's say buttons) flip the matching
+    # panel screen too, so the HA combo scripts send voice only and never double-fire the screen.
+    # NEVER map halloween-ring-*: those play on a doorbell RING, and the panel already owns the
+    # ring screen; a mapped ring slug would yank it off the ring takeover. A screen button that
+    # does not exist yet just makes the best-effort press a no-op.
+    "halloween-no-soliciting":     "button.door_panel_no_soliciting",
+    "halloween-be-right-there":    "button.door_panel_screen_be_right_there",
+    "halloween-leave-package":     "button.door_panel_screen_leave_package",
+    "halloween-thanks-delivery":   "button.door_panel_screen_thanks_delivery",
+    "halloween-trick-or-treat":    "button.door_panel_screen_trick_or_treat",
+    "halloween-candy-bowl":        "button.door_panel_screen_trick_or_treat",
+    "halloween-scare":             "button.door_panel_screen_halloween_scare",
 }
 
 

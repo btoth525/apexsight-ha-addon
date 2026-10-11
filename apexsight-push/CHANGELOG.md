@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.29.2
+
+**Halloween soundboard taps flip the door panel too.** `PANEL_SCREEN_FOR_SLUG` now maps the
+Halloween clips, so one tap in the app's soundboard (or an HA say button) gives screen + voice,
+exactly like the normal clips: `halloween-no-soliciting` → NOT TODAY, `halloween-be-right-there` /
+`-leave-package` / `-thanks-delivery` → their message screens, `halloween-trick-or-treat` and
+`halloween-candy-bowl` → the new trick-or-treat screen, `halloween-scare` → the new scare screen.
+`halloween-ring-*` is deliberately NOT mapped: those play on a doorbell ring, and the panel owns
+its ring takeover. A screen button that doesn't exist yet makes the best-effort press a no-op. New
+`tests/test_panel_screen_map.py` pins the map and fails if a ring clip is ever added. No schema or
+option changes.
+
 ## 1.29.1
 
 **Fix: 1.29.0 refused to start.** The new optional `frigate_api_url` shipped with an empty default
