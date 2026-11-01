@@ -83,6 +83,13 @@ PANEL_SCREEN_FOR_SLUG = {
     "halloween-trick-or-treat":    "button.door_panel_screen_trick_or_treat",
     "halloween-candy-bowl":        "button.door_panel_screen_trick_or_treat",
     "halloween-scare":             "button.door_panel_screen_halloween_scare",
+    # Christmas (Santa) soundboard clips, same rule: never map xmas-ring-* (the panel owns the ring).
+    "xmas-no-soliciting":          "button.door_panel_no_soliciting",
+    "xmas-be-right-there":         "button.door_panel_screen_be_right_there",
+    "xmas-leave-package":          "button.door_panel_screen_leave_package",
+    "xmas-thanks-delivery":        "button.door_panel_screen_thanks_delivery",
+    "xmas-merry-christmas":        "button.door_panel_screen_merry_christmas",
+    "xmas-ho-ho-ho":               "button.door_panel_screen_ho_ho_ho",
 }
 
 

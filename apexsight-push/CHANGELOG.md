@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.29.3
+
+**Christmas soundboard taps flip the door panel too.** `PANEL_SCREEN_FOR_SLUG` maps the Santa
+clips the same way 1.29.2 mapped the Halloween ones: `xmas-no-soliciting` -> NOT TODAY,
+`xmas-be-right-there` / `-leave-package` / `-thanks-delivery` -> their message screens,
+`xmas-merry-christmas` -> the panel's new Merry Christmas screen, `xmas-ho-ho-ho` -> its Santa
+surprise screen. `xmas-ring-*` is deliberately NOT mapped (the panel owns its ring takeover); the
+test now rejects any `-ring-` slug. No schema or option changes.
+
 ## 1.29.2
 
 **Halloween soundboard taps flip the door panel too.** `PANEL_SCREEN_FOR_SLUG` now maps the

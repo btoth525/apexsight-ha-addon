@@ -29,8 +29,8 @@ for node in tree.body:
 check("PANEL_SCREEN_FOR_SLUG is a literal dict", isinstance(mapping, dict))
 mapping = mapping or {}
 
-check("no ring clip is ever mapped (halloween-ring-* / *ring*)",
-      not [k for k in mapping if k.startswith("halloween-ring") or "ring-" in k])
+check("no ring clip is ever mapped (halloween-ring-* / xmas-ring-*)",
+      not [k for k in mapping if "-ring-" in k or k.startswith("ring-")])
 check("every target is a button.door_panel_* entity",
       all(isinstance(v, str) and v.startswith("button.door_panel_") for v in mapping.values()))
 check("no slug has stray whitespace (lookup is exact-match after strip)",
@@ -48,6 +48,12 @@ expected = {
     "halloween-trick-or-treat": "button.door_panel_screen_trick_or_treat",
     "halloween-candy-bowl": "button.door_panel_screen_trick_or_treat",
     "halloween-scare": "button.door_panel_screen_halloween_scare",
+    "xmas-no-soliciting": "button.door_panel_no_soliciting",
+    "xmas-be-right-there": "button.door_panel_screen_be_right_there",
+    "xmas-leave-package": "button.door_panel_screen_leave_package",
+    "xmas-thanks-delivery": "button.door_panel_screen_thanks_delivery",
+    "xmas-merry-christmas": "button.door_panel_screen_merry_christmas",
+    "xmas-ho-ho-ho": "button.door_panel_screen_ho_ho_ho",
 }
 for slug, entity in expected.items():
     check(f"{slug} -> {entity}", mapping.get(slug) == entity)
