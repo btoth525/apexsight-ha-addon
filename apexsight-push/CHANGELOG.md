@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.30.0
+
+**Live Activities for people on camera.** When a person alert is delivered to a phone that has Live
+Activities on (app build 287+), the relay starts a Live Activity for that camera with the phone's
+ActivityKit push-to-start token — or, if one is already showing for that camera, updates it with the
+activity's own token. A sweeper ends it 5 minutes after the camera's last person alert; every push
+carries a stale-date so a relay restart can't leave a "current" card behind. New pairing-code-gated
+endpoints: `POST /v1/liveactivity/register` (push-to-start token; empty = off) and
+`POST /v1/liveactivity/activity` (per-camera update token; empty = ended). Only phones that just
+received the alert get one, so every mute, snooze and per-device gate still applies. Additive: no
+existing route changed; phones that never register see no difference.
+
 ## 1.29.3
 
 **Christmas soundboard taps flip the door panel too.** `PANEL_SCREEN_FOR_SLUG` maps the Santa
