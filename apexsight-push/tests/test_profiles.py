@@ -103,6 +103,41 @@ check("returns False when the broker rejects the publish",
       not bridge._set_frigate_profile(FakeClient(rc=4), "home"))
 check("returns False with no client at all", not bridge._set_frigate_profile(None, "home"))
 
+# ---- reading the active profile (lets the 10-minute heartbeat skip a no-op publish) ----
+class FakeResponse:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+def stub_get(response):
+    def get(url, timeout=None):
+        if isinstance(response, Exception):
+            raise response
+        return response
+    bridge.requests.get = get
+
+
+real_get, real_api = bridge.requests.get, bridge.FRIGATE_API_URL
+bridge.FRIGATE_API_URL = "http://frigate.test:5000"
+stub_get(FakeResponse(200, {"profiles": [], "active_profile": "Home"}))
+check("active profile is read and lower-cased", bridge._frigate_active_profile() == "home")
+stub_get(FakeResponse(200, {"active_profile": None}))
+check("no active profile reads as None (the heartbeat then publishes)", bridge._frigate_active_profile() is None)
+stub_get(FakeResponse(404, {}))
+check("an older Frigate without /api/profiles reads as None", bridge._frigate_active_profile() is None)
+stub_get(FakeResponse(200, ValueError("not json")))
+check("a non-JSON answer reads as None", bridge._frigate_active_profile() is None)
+stub_get(ConnectionError("down"))
+check("Frigate unreachable reads as None, never raises", bridge._frigate_active_profile() is None)
+bridge.FRIGATE_API_URL = ""
+check("no Frigate API configured reads as None", bridge._frigate_active_profile() is None)
+bridge.requests.get, bridge.FRIGATE_API_URL = real_get, real_api
+
 print(f"\n{sum(ok)}/{len(ok)} passed")
 if not all(ok):
     raise SystemExit(1)

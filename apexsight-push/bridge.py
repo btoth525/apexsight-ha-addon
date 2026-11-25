@@ -476,6 +476,23 @@ def _set_frigate_profile(client, mode: str) -> bool:
         return False
 
 
+def _frigate_active_profile():
+    """Frigate's active profile name (`GET /api/profiles` → `active_profile`), or None when it
+    can't be read. Lets the 10-minute heartbeat skip a publish that would change nothing: every
+    activation — even of the profile already active — makes Frigate rebuild its config and re-probe
+    camera streams."""
+    if not FRIGATE_API_URL:
+        return None
+    try:
+        r = requests.get(f"{FRIGATE_API_URL}/api/profiles", timeout=4)
+        if r.status_code != 200:
+            return None
+        active = (r.json() or {}).get("active_profile")
+        return str(active).strip().lower() if active else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _sync_frigate_alert_switches() -> bool:
     """Make Frigate's per-camera review_alerts/review_detections switches match the current house
     mode + the household's custom mode map (edited in the app). This is what keeps 'relay and Home
@@ -541,7 +558,12 @@ def _frigate_switch_watcher(client=None) -> None:
                 if mode in _MODE_MUTES_DEFAULT:
                     _, _, is_default = _effective_mutes(mode)
                     if is_default and USE_FRIGATE_PROFILES:
-                        ok = _set_frigate_profile(client, mode)
+                        # Heartbeat only (nothing changed here): if Frigate already has this
+                        # profile active, there's nothing to heal. A failed read still publishes.
+                        if key == last and _frigate_active_profile() == mode:
+                            ok = True
+                        else:
+                            ok = _set_frigate_profile(client, mode)
                     elif not is_default:
                         log(f"mode '{mode}' has a CUSTOM camera matrix — using HA switches "
                             f"(a static profile can't represent an app-edited list)")

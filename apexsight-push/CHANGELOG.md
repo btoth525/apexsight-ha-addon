@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.31.2
+
+- **Fix: Frigate reloaded its settings every 10 minutes for nothing.** The bridge's self-heal
+  heartbeat re-published the house-mode profile every 10 minutes even when Frigate already had it
+  active, and every activation makes Frigate rebuild its config and re-probe camera streams (26
+  "Profile 'home' activated" lines in a row in Frigate's log). The heartbeat now reads
+  `/api/profiles` first and only publishes when the active profile differs. A mode change still
+  publishes at once, and a failed read still publishes, so self-healing is unchanged.
+
 ## 1.31.1
 
 Hardening pass on 1.31.0. No new features.
