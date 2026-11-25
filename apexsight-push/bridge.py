@@ -30,6 +30,10 @@ import time
 import paho.mqtt.client as mqtt
 import requests
 
+# Package pickup / vehicle home-away / lingering (1.31.0). A sibling module: the Dockerfile copies it
+# next to /bridge.py, which is on sys.path[0] for `python3 /bridge.py`.
+import smart_alerts
+
 RELAY_URL = os.environ.get("RELAY_URL", "").rstrip("/")
 PAIRING_CODE = os.environ.get("PAIRING_CODE", "").upper().strip()
 FRIGATE_BASE_URL = os.environ.get("FRIGATE_BASE_URL", "").rstrip("/")
@@ -1039,9 +1043,10 @@ def _build_alert(after: dict, final: bool = False) -> dict | None:
                 payload["threat_level"] = level if level is not None else 0
                 if story.get("other_concerns"):
                     payload["ai_concerns"] = str(story["other_concerns"])[:300]
-                # THE POINT OF THE FEATURE. A routine delivery upgrades quietly — one buzz, then
-                # better words. Anything the model rated above routine stops being silent and
-                # interrupts, because that is the case you actually want pulled out of your pocket.
+                # A routine delivery upgrades quietly — one buzz, then better words. NOTE (1.31.0):
+                # the relay now delivers EVERY follow-up passive in place of the alert (one activity,
+                # one alert — build 291 buzzed four times for one dog), so the flags below only
+                # survive as the rating carried in the payload (the title's dot, the app's badge).
                 if level is not None and level >= 1:
                     payload["silent"] = False
                     payload["announce"] = True
@@ -1446,9 +1451,13 @@ def _handle_description(event: dict) -> None:
     if not rec:
         return  # no recent alert for this object
     now = time.time()
-    if eid in _described and now - _described[eid] < _PENDING_TTL:
+    # ONE description per REVIEW, not per object. The pending record is stored under every detection
+    # of the review, so a review with several objects (build 291: two dogs and a person on the
+    # driveway) got a GenAI description — and a follow-up push — for each of them. Keyed by review id.
+    key = rec["review_id"]
+    if key in _described and now - _described[key] < _PENDING_TTL:
         return
-    _described[eid] = now
+    _described[key] = now
     payload = {
         "pairing_code": PAIRING_CODE,
         "title": rec["title"],
@@ -1515,9 +1524,14 @@ def on_message(client, userdata, msg):
         _handle_description(event)
         return
     after = event.get("after") or event.get("before") or {}
-    # The events topic only feeds the daily-recap tally, not notifications.
+    # The events topic feeds the daily-recap tally and the smart alerts (memory only here — every
+    # Frigate read and relay POST they need happens on the smart-alert worker thread).
     if msg.topic == EVENTS_TOPIC:
         _record_event(after)
+        try:
+            _smart().on_event(event.get("type", ""), after)
+        except Exception as exc:  # noqa: BLE001 — a smart-alert bug must never stop the bridge
+            log("smart alerts: event failed:", exc)
         return
     msg_type = event.get("type", "")
     stages = _stages_to_send(after, msg_type)
@@ -1530,6 +1544,66 @@ def on_message(client, userdata, msg):
     # stalls EVERY other message — including a time-critical doorbell RING — for the whole duration
     # (and risks blowing the MQTT keepalive). Dispatch and let the loop keep pumping messages.
     threading.Thread(target=_forward_stages, args=(after, stages, review_id, now), daemon=True).start()
+
+
+# ---- smart alerts (1.31.0) ---------------------------------------------------------------------
+
+def _frigate_json(path: str):
+    """GET a Frigate API path on the LAN API, JSON or None. Bridge-only URL, never in a payload."""
+    if not FRIGATE_API_URL:
+        return None
+    try:
+        r = requests.get(f"{FRIGATE_API_URL}{path}", timeout=6)
+        if r.status_code != 200:
+            if r.status_code != 404:
+                _note_frigate_problem("smart-alert", f"HTTP {r.status_code}")
+            return None
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        _note_frigate_problem("smart-alert", repr(exc))
+        return None
+
+
+def _frigate_bytes(path: str):
+    if not FRIGATE_API_URL:
+        return None
+    try:
+        r = requests.get(f"{FRIGATE_API_URL}{path}", timeout=8)
+        return r.content if r.status_code == 200 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _post_smart(payload: dict) -> None:
+    # Own thread: _post_to_relay retries for up to ~33 s, which must not hold up the next check.
+    threading.Thread(target=_post_to_relay, args=(payload, payload.get("kind", "smart")),
+                     daemon=True).start()
+
+
+_smart_instance = None
+_smart_lock = threading.Lock()
+
+
+def _smart():
+    global _smart_instance
+    with _smart_lock:
+        if _smart_instance is None:
+            _smart_instance = smart_alerts.SmartAlerts(
+                smart_alerts.Options.from_env(os.environ),
+                post=_post_smart, frigate_json=_frigate_json, frigate_bytes=_frigate_bytes,
+                store_get=_get_cfg, store_set=_set_cfg, public_base=FRIGATE_BASE_URL,
+                pairing_code=PAIRING_CODE, log=log)
+        return _smart_instance
+
+
+def _smart_ticker() -> None:
+    """Every 5 s: confirm pending pickups/departures, fire due linger alerts, refresh known vehicles."""
+    while True:
+        try:
+            _smart().tick()
+        except Exception as exc:  # noqa: BLE001
+            log("smart alerts: tick failed:", exc)
+        time.sleep(5)
 
 
 def main():
@@ -1556,6 +1630,9 @@ def main():
     # Watch for app arm/disarm requests and forward them to HA (consume-once, restart-safe).
     threading.Thread(target=_mode_request_watcher, args=(client,), daemon=True).start()
     threading.Thread(target=_frigate_switch_watcher, args=(client,), daemon=True).start()
+    o = _smart().opts
+    log(f"smart alerts: package={o.package_alerts} vehicles={o.vehicle_alerts} linger={o.linger_alerts}")
+    threading.Thread(target=_smart_ticker, daemon=True).start()
 
     while True:
         try:

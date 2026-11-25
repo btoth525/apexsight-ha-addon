@@ -257,6 +257,10 @@ def build_payload(
     threat_level: int = 0,
     ai_summary: str = "",
     ai_concerns: str = "",
+    time_sensitive: bool = False,
+    detection_id: str = "",
+    kind: str = "",
+    follow_up: bool = False,
 ) -> dict:
     """Build the APNs payload the ApexSight NotificationService extension expects.
 
@@ -273,11 +277,24 @@ def build_payload(
         "mutable-content": 1,
         "category": "APEX_FRIGATE_ALERT",
     }
+    # (Through /v1/notify every follow-up is `follow_up` and passive — see above; this branch is the
+    # payload-level rule for a caller that isn't replacing an alert.)
     # An AI rating above routine OVERRIDES `silent`. The follow-up push is normally a quiet
     # in-place upgrade (better GIF, better words) that must not buzz a second time — but when the
     # model flagged the activity as worth a look, that quiet upgrade is exactly the notification
     # the user needs pulled out of their pocket. Time-sensitive breaks through Focus.
-    if threat_level >= 1:
+    if follow_up:
+        # A follow-up (AI description, final GIF, any later phase) REPLACES the alert already on the
+        # phone via the shared collapse id. It must never buzz or banner again: one activity, one
+        # alert (build 291: a dog + person on the driveway produced four alerting banners). The
+        # better words and media still land in Notification Center and the long-press view.
+        aps["interruption-level"] = "passive"
+    elif time_sensitive:
+        # A smart alert that needs someone now (an unknown person took the package, someone has been
+        # lingering at the door): breaks through Focus AND makes a sound.
+        aps["interruption-level"] = "time-sensitive"
+        aps["sound"] = "default"
+    elif threat_level >= 1:
         aps["interruption-level"] = "time-sensitive"
         if threat_level >= 2:
             aps["sound"] = "default"
@@ -297,7 +314,7 @@ def build_payload(
     # an existing alert (the silent final GIF, or the announce-only AI description) must not add to
     # the count. Flag those so the extension skips the bump (it also only bumps when review_id is set,
     # which already excludes the recap summary).
-    if silent or announce:
+    if silent or announce or follow_up:
         payload["no_badge"] = True
     # Mirror the local-notification userInfo contract exactly.
     if review_id:
@@ -336,6 +353,12 @@ def build_payload(
         payload["labels"] = [str(label) for label in labels][:8]
     if zones:
         payload["zones"] = zones
+    # The tracked object the push is about, so the long-press view can follow it in a panoramic
+    # frame (fetches /api/events/<id> for its path) without first resolving the review.
+    if detection_id:
+        payload["detection_id"] = detection_id
+    if kind:
+        payload["kind"] = kind
     if score:
         payload["score"] = score
     return payload

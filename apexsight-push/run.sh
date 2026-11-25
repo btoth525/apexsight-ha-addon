@@ -50,6 +50,16 @@ export DOORBELL_TAIL_MS="$(bashio::config 'doorbell_tail_ms')"
 export DOORBELL_DRAIN_MS="$(bashio::config 'doorbell_drain_ms')"
 export DOORBELL_RING_DEBOUNCE="$(bashio::config 'doorbell_ring_debounce')"
 
+# ---- smart alerts (1.31.0): package pickup, vehicle home/away, lingering ------
+# has_value guards: an unset optional can read back as "null"; the bridge falls back to defaults.
+for opt in smart_package_alerts package_confirm_seconds package_min_dwell_seconds package_image_check \
+           smart_vehicle_alerts vehicle_cameras vehicle_home_zones vehicle_depart_confirm_seconds \
+           smart_linger_alerts linger_person_seconds linger_car_seconds linger_zones; do
+  if bashio::config.has_value "${opt}"; then
+    export "$(echo "${opt}" | tr '[:lower:]' '[:upper:]')=$(bashio::config "${opt}")"
+  fi
+done
+
 if bashio::services.available "mqtt"; then
   export MQTT_HOST="$(bashio::services mqtt 'host')"
   export MQTT_PORT="$(bashio::services mqtt 'port')"

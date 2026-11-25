@@ -10,8 +10,9 @@ distinct visit 380 s after the first alert was dropped as a "duplicate" 275 s af
 
 Rules pinned here:
   - a final is never compared and never writes the state;
-  - a silent final whose own alert was suppressed is dropped (nothing on the phone to replace);
-  - a non-silent (AI-escalated) final always goes out.
+  - a final (or AI description) whose own alert was suppressed is dropped, silent or not: since
+    1.31.0 every follow-up is delivered passive in place of its alert, so it can't alert anyone and
+    would only land as a second notification for one activity.
 """
 import os
 import tempfile
@@ -60,7 +61,8 @@ check("its silent final is dropped too (no alert on the phone to replace)", supp
 check("without writing", state is None)
 
 supp, state = decide(prev_b, "B", PERSON, "final", False, 160.0, W)
-check("but an AI-escalated (non-silent) final still goes out", supp is False and state is None)
+check("an AI-escalated (non-silent) final of a suppressed alert is dropped too (follow-ups are passive)",
+      supp is True and state is None)
 
 supp, _ = decide(prev_b, "A", PERSON, "final", True, 160.0, W)
 check("the delivered review's silent final goes out", supp is False)

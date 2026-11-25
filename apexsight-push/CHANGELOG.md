@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.31.0
+
+**Daily summaries.** The evening recap is written as sentences ("Brandon and Taylor came by. UPS
+and Amazon came by with deliveries. Chico was out 5 times.") with no emoji title, and opens Your Day
+(`apex://recap`). New morning brief at a chosen time ("Overnight: Someone at the Side Gate at
+1:12 AM. Also 2 cars." / "A quiet night. Nothing came by."), from 9 PM to the send time, opening the
+Activity feed; sent only within three hours of its time. `/v1/recap` takes `morning_enabled`,
+`morning_hour` and `morning_minute`. Before this the app never actually synced the recap schedule.
+
+**Fix: one activity, one alert.** In build 291, a single driveway review (two dogs and a person)
+reached the phone as four alerting banners: `[alert]`, `[description]` twice, then `[final]`.
+
+- **Root cause of the double description.** The bridge stored the AI follow-up record under
+  every detection id of the review, and its once-only guard was keyed per object. Each object
+  Frigate described therefore produced its own `description` forward. It is now keyed by review: one
+  description per review.
+- **Follow-ups replace the alert silently.** Every follow-up (description, final, any later phase)
+  goes out with the review id as `apns-collapse-id` (the same id the alert uses, and enforced even if
+  the bridge omits it), `interruption-level: passive`, no sound and no badge. The better title,
+  summary and media still replace the banner in Notification Center and the long-press view.
+  **Behaviour change:** an AI-escalated final (`threat_level` ≥ 1) no longer re-alerts. The rating
+  still rides in the payload and the title's dot.
+- **Persistent per-review, per-phone push log** (new `push_log` table, pruned after 2 days):
+  - the same phase is never sent twice for one review (covers a bridge retry, a re-forward or a
+    relay restart);
+  - a follow-up identical to what the phone already shows is skipped;
+  - a failed send releases its claim, so the bridge's retry reaches only the phone that missed it,
+    instead of re-buzzing all of them;
+  - a follow-up to a phone whose alert never landed is passive, never that phone's first buzz.
+- Follow-ups never start or update a Live Activity.
+- App side (NotificationService): converting a carrier alert into a Communication notification keeps
+  the push's interruption level and thread, so a passive replacement stays passive and in place.
+- New test: `tests/test_one_alert_per_activity.py` replays alert → description → description → final.
+
+**Smart alerts: package pickup, vehicles home/away, and lingering.** Three new watchers in the bridge
+(`smart_alerts.py`, copied next to `/bridge.py`), fed by Frigate's `frigate/events` stream. Every push
+goes through `/v1/notify`, so the household gate, per-device mutes, quiet hours and triggers all apply.
+
+- **Package picked up.** A package is watched once Frigate has called it *stationary* for
+  `package_min_dwell_seconds` (30, or 10 just after a carrier visit). A box being carried up the
+  walk never arms it. A pickup is considered only when the package track ends with a person on that
+  camera; a box can't leave by itself, so an end with nobody there is detector flicker. The pickup
+  is confirmed once everyone has left and the spot has stayed empty for `package_confirm_seconds`
+  (120) with no new package track there. With `package_image_check` on, the package's region in the
+  current frame must also no longer look like the package (ffmpeg crop plus normalized
+  correlation). Frigate only re-detects a still box when something moves near it, so on a real
+  afternoon one box produced about 15 tracks and sat untouched through gaps of up to 11 minutes.
+  The push reads "Alex picked up the package" for a recognised face (refreshed from Frigate at
+  confirm time), or "Someone took the package" otherwise, which is time-sensitive. It carries a
+  preview GIF of the moment and the person's snapshot.
+- **Vehicles.** Known vehicles are the keys of Frigate's `lpr.known_plates`, never the plate text.
+  Identity carries across the two driveway cameras by start time, and forward to a re-started
+  unlabelled track parked in the vehicle's spot.
+  - Arrival: came in from outside the home zones, then parked (or ended) inside them.
+  - Departure: left the home zones after Frigate counted a real position change, confirmed for
+    `vehicle_depart_confirm_seconds` (60). It is cancelled if any camera still sees the vehicle
+    parked. A parked box jittering across the LPR camera's zone line is not a departure.
+  - Tracks first seen hours after they started (an add-on restart) update the state silently.
+  - Pushes read "Sam's Truck arrived home" or "Sam's Truck left".
+  - New `GET /v1/vehicles?pairing_code=` (pairing-gated) returns each vehicle's status, since and
+    last change.
+- **Lingering.** An unknown person, or an unknown car that drove in during this track, staying in a
+  watched zone past `linger_person_seconds` (90) or `linger_car_seconds` (300). The push is
+  time-sensitive and sent once per object; the fired set is persisted. Before firing, the event is
+  re-read from Frigate: it must still be open and still unrecognised.
+  - At most one push per camera every 10 minutes, since Frigate double-tracks one visitor.
+  - No push for a person on the driveway cameras right after a household vehicle came or went.
+  - A car in a household vehicle's usual spot is not "unknown", because its plate is often unread.
+  - Defaults are `doorbell:side_walk,doorbell:porch,Front_Driveway:driveway:car`, where an optional
+    `:person` or `:car` limits an entry. Side_Gate and driveway people are opt-in: a replayed week
+    showed the dog and residents.
+- **Relay.** `/v1/notify` takes `kind` and `time_sensitive`. A `kind` push skips the style
+  re-render, the duplicate-review dedup (both read and write) and the Live Activity. Its label is
+  synthetic (`package_pickup`, `vehicle_presence`, `loitering`), so the app's per-object toggle
+  mutes each kind without touching "person"/"car". APNs payloads now also carry `detection_id` and
+  `kind`, which lets the long-press view follow the subject. Additive: older apps ignore the new
+  keys.
+- New options, all optional with defaults: `smart_package_alerts`, `package_confirm_seconds`,
+  `package_min_dwell_seconds`, `package_image_check`, `smart_vehicle_alerts`, `vehicle_cameras`,
+  `vehicle_home_zones`, `vehicle_depart_confirm_seconds`, `smart_linger_alerts`,
+  `linger_person_seconds`, `linger_car_seconds`, `linger_zones`.
+- New tests: `test_package_pickup.py`, `test_vehicles.py`, `test_lingering.py`,
+  `test_notify_kind.py` (shared fakes in `tests/smart_harness.py`).
+
 ## 1.30.2
 
 **No more "Person-Verified" in alerts.** A recognised object (`person-verified`, `car-verified`)

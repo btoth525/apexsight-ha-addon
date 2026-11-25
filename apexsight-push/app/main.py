@@ -11,6 +11,7 @@ Admin web GUI (browser, password-protected): mounted at /admin — upload the
 """
 import asyncio
 import datetime
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -197,6 +198,7 @@ async def _recap_scheduler() -> None:
             prune_tick += 1
             if prune_tick % 60 == 1:   # ~hourly
                 db.prune_recap_events(time.time() - 2 * 86_400)   # keep ~2 days
+                db.prune_push_log(time.time() - 2 * 86_400)
         except Exception as exc:
             print("[recap] error:", exc, flush=True)
         await asyncio.sleep(60)
@@ -212,8 +214,6 @@ async def _maybe_send_recap() -> None:
         cfg = json.loads(raw)
     except json.JSONDecodeError:
         return
-    if not cfg.get("enabled"):
-        return
     if not db.devices_for(PAIRING_CODE):
         return
 
@@ -222,6 +222,10 @@ async def _maybe_send_recap() -> None:
     tz = datetime.timezone(datetime.timedelta(seconds=int(cfg.get("tz_offset", 0))))
     now = datetime.datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
+    if cfg.get("morning_enabled"):
+        await _maybe_send_morning(cfg, tz, now, today)
+    if not cfg.get("enabled"):
+        return
 
     # Catch-up safety net: a large mid-day tz_offset change (travel) can jump `today` forward
     # across midnight before the PREVIOUS day's target hour was ever reached. Without this, the
@@ -257,6 +261,25 @@ async def _maybe_send_recap() -> None:
         db.set_config(f"recap_sent:{PAIRING_CODE}", today)
     db.prune_recap_events(midnight.timestamp() - 2 * 86_400)   # keep ~2 days of history
     print(f"[recap] daily recap to {PAIRING_CODE} for {today}: {result.get('sent', 0)} sent, {len(rows)} events", flush=True)
+
+
+async def _maybe_send_morning(cfg: dict, tz: datetime.tzinfo, now: datetime.datetime, today: str) -> None:
+    """The morning brief: what happened overnight (9 PM until now), once a day at the chosen time.
+    Only on the day itself: a relay that was down at 7 AM doesn't send "overnight" at 3 PM."""
+    if db.get_config(f"brief_sent:{PAIRING_CODE}") == today:
+        return
+    target = int(cfg.get("morning_hour", 7)) * 60 + int(cfg.get("morning_minute", 0))
+    minutes = now.hour * 60 + now.minute
+    if minutes < target or minutes > target + 180:
+        return
+    evening = (now - datetime.timedelta(days=1)).replace(hour=21, minute=0, second=0, microsecond=0)
+    rows = db.recap_events_between(PAIRING_CODE, evening.timestamp(), now.timestamp())
+    title, body = recap.format_morning(rows, tz)
+    payload = apns.build_payload(title=title, body=body, apex_url="apex://activity")
+    result = await apns.deliver_to_pairing(PAIRING_CODE, payload, collapse_id=f"brief-{today}")
+    if result.get("sent", 0) > 0:
+        db.set_config(f"brief_sent:{PAIRING_CODE}", today)
+    print(f"[recap] morning brief to {PAIRING_CODE} for {today}: {result.get('sent', 0)} sent, {len(rows)} events", flush=True)
 
 
 # ---- naive per-IP rate limiting --------------------------------------------
@@ -395,6 +418,11 @@ class NotifyIn(BaseModel):
     ai_summary: str = ""
     ai_concerns: str = ""
     threat_level: int = 0
+    # Smart alerts (1.31.0): "package_pickup" | "vehicle_presence" | "loitering". The bridge writes
+    # the finished words and media, so a kind skips the style re-render, the duplicate-review dedup
+    # and the Live Activity — but rides every gate (household, per-device mutes, quiet hours).
+    kind: str = ""
+    time_sensitive: bool = False
 
 
 class DoorbellPlayIn(BaseModel):
@@ -493,6 +521,9 @@ class RecapIn(BaseModel):
     hour: int = 21
     minute: int = 0
     tz_offset: int = 0           # seconds from GMT, so the relay sends at the user's local time
+    morning_enabled: bool = False
+    morning_hour: int = 7
+    morning_minute: int = 0
 
 
 # ---- public API -------------------------------------------------------------
@@ -782,6 +813,38 @@ def get_rings(pairing_code: str = "", limit: int = 50, _: None = Depends(rate_li
     return {"ok": True, "count": len(rings), "rings": rings}
 
 
+@app.get("/v1/vehicles")
+def get_vehicles(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
+    """Known vehicles' home/away status, kept by the bridge (1.31.0).
+
+    Known = the keys of Frigate's `lpr.known_plates`; the bridge tracks arrivals and departures on
+    the driveway cameras and stores them under `vehicles:{code}`. Pairing-gated: whether the house's
+    cars are home is exactly the occupancy signal a burglar wants.
+    """
+    code = _require_pairing(pairing_code)
+    try:
+        stored = json.loads(db.get_config(f"vehicles:{code}", "") or "{}")
+    except Exception:
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    raw = stored.get("vehicles") if isinstance(stored.get("vehicles"), dict) else {}
+    known = stored.get("known") if isinstance(stored.get("known"), list) else []
+    out = []
+    for vid in sorted(set(raw) | set(known)):
+        v = raw.get(vid) if isinstance(raw.get(vid), dict) else {}
+        status = v.get("status") if v.get("status") in ("home", "away") else "unknown"
+        out.append({
+            "id": vid,
+            "name": str(v.get("name") or vid),
+            "status": status,
+            "since": float(v.get("since") or 0) or None,
+            "last_change": float(v.get("changed") or 0) or None,
+            "camera": str(v.get("camera") or ""),
+        })
+    return {"ok": True, "updated": float(stored.get("updated") or 0) or None, "vehicles": out}
+
+
 # ---- doorbell talkback (play audio to the Aqara speaker) ---------------------
 
 def _require_pairing(code: str) -> str:
@@ -1036,16 +1099,19 @@ def _dedup_decision(prev: dict, review_id: str, labels, stage: str, silent: bool
     final through the comparison re-stamped the clock with its own time, ~105 s after the alert,
     so a distinct visit minutes later was dropped as a "duplicate"; and a final whose labels had
     grown to match another review could be dropped itself, losing the escalation. The one final
-    that IS dropped: a silent one whose own alert was suppressed — with nothing on the phone to
-    replace, it would land as a second notification for one activity. A non-silent final there
-    still goes out: the model rated it worth attention, and a missed real alert is worse than a
-    stray buzz.
+    that IS dropped: one whose own alert was suppressed — with nothing on the phone to replace, it
+    would land as a second notification for one activity. Since 1.31.0 that holds for a non-silent
+    (AI-escalated) final and for an AI description too: every follow-up is delivered passive in
+    place of its alert, so it can no longer alert anyone and has nothing to add but a duplicate.
 
     Pure (no DB, no APNs) so tests/test_dedup.py can pin it directly.
     """
     suppressed = [r for r in (prev.get("suppressed") or []) if isinstance(r, str)]
     if stage == "final":
-        return (silent and review_id in suppressed), None
+        # Every follow-up is now delivered passive in place of its alert (1.31.0), so even an
+        # AI-escalated one can't alert anyone; when its alert was suppressed it would only land as a
+        # second notification for one activity. Drop it, silent or not.
+        return (review_id in suppressed), None
     new_labels = set(labels or [])
     prev_labels = set(prev.get("labels") or [])
     if (prev.get("review_id") and prev.get("review_id") != review_id
@@ -1146,8 +1212,14 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     # A FINAL follow-up is never compared and never re-stamps the clock; it is dropped only when it
     # is silent and its own alert was (see _dedup_decision).
     stage = body.stage or "alert"
-    if (body.review_id and body.camera and not body.is_description
-            and (stage == "final" or (body.labels and not body.silent))):
+    # A smart alert is not a review push: comparing it would drop it as a "duplicate" of the person
+    # alert minutes earlier, and stamping it would make the NEXT real review on that camera look
+    # like a duplicate of it. Skip both the read and the write.
+    # A description is a follow-up exactly like the final: it replaces its review's alert, so it is
+    # dropped with it when that alert was a suppressed duplicate.
+    dedup_stage = "final" if body.is_description else stage
+    if (not body.kind and body.review_id and body.camera
+            and (dedup_stage == "final" or (body.labels and not body.silent))):
         try:
             window = float(db.get_config(f"dedup_window:{code}", "") or 300)
         except Exception:
@@ -1161,7 +1233,7 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
             except Exception:
                 prev = {}
             try:
-                suppress, state = _dedup_decision(prev, body.review_id, body.labels, stage,
+                suppress, state = _dedup_decision(prev, body.review_id, body.labels, dedup_stage,
                                                   bool(body.silent), time.time(), window)
             except Exception:
                 suppress, state = False, None
@@ -1171,9 +1243,10 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
                 except Exception:
                     pass
             if suppress:
-                what = ("its alert was a dupe" if stage == "final"
+                what = ("its alert was a dupe" if dedup_stage == "final"
                         else f"identical dupe of {prev.get('review_id')}, labels {sorted(set(body.labels or []))}")
-                print(f"[dedup] {body.camera}: review {body.review_id} [{stage}] suppressed ({what})", flush=True)
+                label = "description" if body.is_description else stage
+                print(f"[dedup] {body.camera}: review {body.review_id} [{label}] suppressed ({what})", flush=True)
                 return {"ok": True, "sent": 0, "note": "duplicate review (dedup)"}
 
     title, text = body.title, body.body
@@ -1185,7 +1258,8 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     # emits at least an entity list + timestamp for stage "alert" — so once the bridge started
     # sending `labels` (needed so per-object/zone mutes apply to descriptions too), rendering here
     # would overwrite "A person delivers multiple packages to the porch" with "Person · 3:42 PM".
-    if (body.detection_id or body.labels or body.sub_labels) and not body.is_description:
+    # A smart alert (`kind`) arrives finished — re-rendering would turn its words into "Loitering · 4:12 PM".
+    if not body.kind and (body.detection_id or body.labels or body.sub_labels) and not body.is_description:
         raw = db.get_config(f"style:{code}")
         style = {}
         if raw:
@@ -1226,6 +1300,21 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         except Exception as exc:
             print(f"[notify] render failed ({exc}); using bridge-supplied title/body", flush=True)
 
+    # ---- one alert per activity (1.31.0) ----
+    # The phase this push is. Everything after the instant alert REPLACES it in place: same collapse
+    # id (the review id, which the alert uses too), passive, no sound, no badge. A smart alert is its
+    # own phase (it has its own collapse id), keyed by kind so it never collides with the review's.
+    if body.kind:
+        phase = body.kind
+    elif body.is_description:
+        phase = "description"
+    else:
+        phase = body.stage or "alert"
+    follow_up = phase not in ("alert",) and not body.kind
+    collapse_id = body.collapse_id
+    if body.review_id and not body.kind and (follow_up or not collapse_id):
+        collapse_id = body.review_id
+
     payload = apns.build_payload(
         title=title,
         body=text,
@@ -1244,7 +1333,13 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         threat_level=body.threat_level,
         ai_summary=body.ai_summary,
         ai_concerns=body.ai_concerns,
+        time_sensitive=body.time_sensitive,
+        detection_id=body.detection_id,
+        kind=body.kind,
+        follow_up=follow_up,
     )
+    content_hash = hashlib.sha256(json.dumps(
+        [title, text, snapshot_url, thumbnail_url], ensure_ascii=False).encode()).hexdigest()[:24]
     # Per-device SOFT gate: camera / object / zone / quiet-hours / per-camera-snooze / triggers,
     # each synced per device via /v1/device-prefs and evaluated FAIL-OPEN (see gate.py). The app
     # gates on the review's first object (AppState.handleReview uses `objects.first`), so mirror
@@ -1265,7 +1360,27 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
         except Exception:  # noqa: BLE001 — fail-open
             return 0.0
 
+    claimed: list[str] = []
+
     def device_gate(token: str) -> tuple[bool, str]:
+        deliver, reason = _prefs_gate(token)
+        if not deliver or not body.review_id:
+            return deliver, reason
+        # Per-phone, per-review history: never the same phase twice (a second AI description for
+        # another object in the review, a bridge retry, a re-POST after a relay restart), and never a
+        # follow-up that would show exactly what the phone already shows.
+        try:
+            sent = db.pushes_for(body.review_id, token)
+            if follow_up and sent and sent[-1]["content_hash"] == content_hash:
+                return False, f"unchanged {phase} for {body.review_id}"
+            if not db.claim_push(body.review_id, token, phase, content_hash):
+                return False, f"{phase} already sent for {body.review_id}"
+        except Exception as exc:  # noqa: BLE001 — a log hiccup must never cost a real alert
+            return True, f"{reason} (push log unavailable: {exc!r})"
+        claimed.append(token)
+        return True, reason
+
+    def _prefs_gate(token: str) -> tuple[bool, str]:
         prefs_raw = db.get_config(f"prefs:{token}")
         focus_until = _focus_snooze(token)
         if prefs_raw:
@@ -1295,13 +1410,24 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
                     pass
         return True, "no per-device prefs"
 
-    result = await apns.deliver_to_pairing(
-        code, payload, collapse_id=body.collapse_id, gate=device_gate
-    )
+    result: dict = {}
+    try:
+        result = await apns.deliver_to_pairing(
+            code, payload, collapse_id=collapse_id, gate=device_gate
+        )
+    finally:
+        # A phone whose send failed — or a send that raised outright — gets its claim back, so the
+        # bridge's retry can still reach it (the phones that DID get it are skipped, not re-buzzed).
+        for token in set(claimed) - set(result.get("delivered") or []):
+            try:
+                db.release_push(body.review_id, token, phase)
+            except Exception:  # noqa: BLE001
+                pass
     # Live Activity for a person on camera — only for phones that just got THIS alert (so every mute,
     # snooze and per-device gate above applies), only on the first stage (not the silent final-GIF or
     # the description follow-ups), and off the request path so it can never delay or fail the alert.
-    if (result.get("delivered") and not body.silent and not body.is_description and not body.announce):
+    if (result.get("delivered") and not body.silent and not body.is_description and not body.announce
+            and not body.kind and not follow_up):
         _keep(asyncio.create_task(liveactivity.on_person_alert(
             result["delivered"], body.camera, body.camera_name, title, text, body.review_id, body.labels)))
     # If ANY reachable device failed for a TRANSIENT reason (APNs timeout / 5xx / 429 — NOT a
@@ -1637,6 +1763,9 @@ def set_recap(body: RecapIn, _: None = Depends(rate_limit)) -> dict:
             "hour": max(0, min(23, int(body.hour))),
             "minute": max(0, min(59, int(body.minute))),
             "tz_offset": max(-86399, min(86399, int(body.tz_offset))),
+            "morning_enabled": bool(body.morning_enabled),
+            "morning_hour": max(0, min(23, int(body.morning_hour))),
+            "morning_minute": max(0, min(59, int(body.morning_minute))),
         }),
     )
     return {"ok": True}

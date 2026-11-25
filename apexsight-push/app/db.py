@@ -93,6 +93,18 @@ def init() -> None:
                 environment  TEXT NOT NULL DEFAULT 'production',
                 updated_at   INTEGER NOT NULL
             );
+            -- One row per (review, phone, phase) actually delivered (1.31.0). Follow-ups replace the
+            -- alert in place, so the same phase must never go out twice for one review, and a
+            -- follow-up identical to what the phone already shows is not sent at all. Persisted so a
+            -- bridge retry, a second forward or a relay restart can't double-send.
+            CREATE TABLE IF NOT EXISTS push_log (
+                review_id    TEXT NOT NULL,
+                device_token TEXT NOT NULL,
+                phase        TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                ts           REAL NOT NULL,
+                PRIMARY KEY (review_id, device_token, phase)
+            );
             CREATE TABLE IF NOT EXISTS la_activities (
                 device_token   TEXT NOT NULL,
                 camera         TEXT NOT NULL,
@@ -479,3 +491,34 @@ def set_la_activity_token(device_token: str, camera: str, activity_token: str, e
 def delete_la_activity(device_token: str, camera: str) -> None:
     with _conn() as c:
         c.execute("DELETE FROM la_activities WHERE device_token=? AND camera=?", (device_token, camera))
+
+
+# ---- per-review push log (1.31.0) --------------------------------------------
+
+def claim_push(review_id: str, device_token: str, phase: str, content_hash: str) -> bool:
+    """Atomically reserve (review, phone, phase). False when it was already sent (or is being sent
+    by a concurrent request) — the caller must then skip this phone. Release on a failed send."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO push_log(review_id, device_token, phase, content_hash, ts) "
+            "VALUES(?,?,?,?,?)", (review_id, device_token, phase, content_hash, time.time()))
+        return cur.rowcount == 1
+
+
+def release_push(review_id: str, device_token: str, phase: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM push_log WHERE review_id = ? AND device_token = ? AND phase = ?",
+                  (review_id, device_token, phase))
+
+
+def pushes_for(review_id: str, device_token: str) -> list[sqlite3.Row]:
+    """What this phone already got for this review, oldest first."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT phase, content_hash, ts FROM push_log WHERE review_id = ? AND device_token = ? "
+            "ORDER BY ts", (review_id, device_token)).fetchall()
+
+
+def prune_push_log(before_ts: float) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM push_log WHERE ts < ?", (before_ts,))

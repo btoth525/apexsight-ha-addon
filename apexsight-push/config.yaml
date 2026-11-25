@@ -1,5 +1,5 @@
 name: ApexSight Push
-version: "1.30.2"
+version: "1.31.0"
 slug: apexsight_push
 description: All-in-one APNs relay (web GUI) + Frigate alert bridge for instant iOS notifications.
 url: https://github.com/btoth525/apexsight-ha-addon/tree/main/apexsight-push
@@ -49,6 +49,18 @@ options:
   mqtt_password: ""
   turn_key_id: ""
   turn_api_token: ""
+  smart_package_alerts: true
+  package_confirm_seconds: 120
+  package_min_dwell_seconds: 30
+  package_image_check: true
+  smart_vehicle_alerts: true
+  vehicle_cameras: "Front_Driveway,Front_Driveway_LPR"
+  vehicle_home_zones: "driveway"
+  vehicle_depart_confirm_seconds: 60
+  smart_linger_alerts: true
+  linger_person_seconds: 90
+  linger_car_seconds: 300
+  linger_zones: "doorbell:side_walk,doorbell:porch,Front_Driveway:driveway:car"
 schema:
   admin_username: str
   admin_password: password
@@ -78,3 +90,15 @@ schema:
   mqtt_password: password?
   turn_key_id: str?
   turn_api_token: password?
+  smart_package_alerts: bool?
+  package_confirm_seconds: int(60,3600)?
+  package_min_dwell_seconds: int(5,600)?
+  package_image_check: bool?
+  smart_vehicle_alerts: bool?
+  vehicle_cameras: str?
+  vehicle_home_zones: str?
+  vehicle_depart_confirm_seconds: int(0,1800)?
+  smart_linger_alerts: bool?
+  linger_person_seconds: int(15,3600)?
+  linger_car_seconds: int(30,7200)?
+  linger_zones: str?

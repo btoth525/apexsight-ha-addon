@@ -64,3 +64,59 @@ configuration:
   mqtt_password:
     name: MQTT password (optional)
     description: Leave blank to use the Home Assistant broker automatically.
+  smart_package_alerts:
+    name: Package pickup alerts
+    description: >-
+      After a package has rested at the door, push when it is picked up — naming a
+      recognised person, or a time-sensitive "Someone took the package" otherwise.
+  package_confirm_seconds:
+    name: Package pickup confirm (seconds)
+    description: >-
+      How long the spot must stay empty, after everyone has left, before a pickup is
+      announced. Frigate drops a still box's track when someone stands in front of it,
+      so too short a wait sends false pickups. Default 120.
+  package_min_dwell_seconds:
+    name: Package resting time (seconds)
+    description: >-
+      A package must be seen resting this long before it is watched (a box being carried
+      is not a delivery). Default 30; 10 right after a carrier visit.
+  package_image_check:
+    name: Package image check
+    description: >-
+      Before announcing a pickup, compare the package's spot in the camera's current frame
+      with the package's own snapshot, and stay quiet if it still looks like the package.
+  smart_vehicle_alerts:
+    name: Vehicle arrival / departure alerts
+    description: >-
+      Track the known vehicles in Frigate's LPR known_plates (home or away) and push when
+      one arrives home or leaves. Also feeds the app's Vehicles row.
+  vehicle_cameras:
+    name: Vehicle cameras
+    description: Comma-separated cameras that watch the driveway.
+  vehicle_home_zones:
+    name: Vehicle home zones
+    description: Comma-separated zones that count as "parked at home".
+  vehicle_depart_confirm_seconds:
+    name: Departure confirm (seconds)
+    description: >-
+      A departure is announced only if the vehicle isn't seen parked again within this
+      many seconds (a turn in the street is not leaving). Default 60.
+  smart_linger_alerts:
+    name: Lingering alerts
+    description: >-
+      Time-sensitive push when an unknown person or car stays in an alert zone too long.
+      Once per visitor.
+  linger_person_seconds:
+    name: Lingering person threshold (seconds)
+    description: Default 90.
+  linger_car_seconds:
+    name: Lingering car threshold (seconds)
+    description: Default 300.
+  linger_zones:
+    name: Lingering zones
+    description: >-
+      Comma-separated camera:zone pairs to watch; camera:* means anywhere on that camera
+      (for a camera with no zones), and an optional :person or :car limits an entry. The
+      driveway watches cars only by default (residents there are rarely face-matched) — add
+      Front_Driveway:driveway:person for people. Side_Gate is off by default (its long
+      "person" tracks were the dog and yard things); add Side_Gate:* to watch it.
