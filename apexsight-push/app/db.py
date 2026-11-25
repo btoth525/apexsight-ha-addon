@@ -84,6 +84,24 @@ def init() -> None:
                 message      TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_diag_ts ON diag(pairing_code, ts);
+            -- Live Activities (1.30.0). A phone's push-to-start token (one per phone, only while the
+            -- user has Live Activities on in the app), and the per-activity update token for the
+            -- camera activity it is showing (one per phone per camera).
+            CREATE TABLE IF NOT EXISTS la_start_tokens (
+                device_token TEXT PRIMARY KEY,
+                start_token  TEXT NOT NULL,
+                environment  TEXT NOT NULL DEFAULT 'production',
+                updated_at   INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS la_activities (
+                device_token   TEXT NOT NULL,
+                camera         TEXT NOT NULL,
+                activity_token TEXT,
+                environment    TEXT NOT NULL DEFAULT 'production',
+                last_alert     INTEGER NOT NULL,
+                state          TEXT,
+                PRIMARY KEY (device_token, camera)
+            );
             """
         )
         # Migration for DBs created before device_name existed (v1.7.0). ADD COLUMN is a
@@ -400,3 +418,64 @@ def migrate_pairing_codes(old_codes: set[str], new_code: str) -> int:
                 except Exception:
                     pass
     return moved
+
+
+# ---- Live Activities -----------------------------------------------------------------------------
+
+def set_la_start_token(device_token: str, start_token: str, environment: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO la_start_tokens(device_token, start_token, environment, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(device_token) DO UPDATE SET start_token=excluded.start_token, "
+            "environment=excluded.environment, updated_at=excluded.updated_at",
+            (device_token, start_token, environment, int(time.time())),
+        )
+
+
+def delete_la_start_token(device_token: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM la_start_tokens WHERE device_token=?", (device_token,))
+        c.execute("DELETE FROM la_activities WHERE device_token=?", (device_token,))
+
+
+def la_start_token_for(device_token: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM la_start_tokens WHERE device_token=?", (device_token,)).fetchone()
+
+
+def la_activity_for(device_token: str, camera: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM la_activities WHERE device_token=? AND camera=?",
+                         (device_token, camera)).fetchone()
+
+
+def touch_la_activity(device_token: str, camera: str, environment: str, when: int, state: str) -> None:
+    """Record a person alert on this camera for this phone (creates the row on a fresh start) and the
+    content it showed, which the sweeper's end push repeats."""
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO la_activities(device_token, camera, activity_token, environment, last_alert, state) "
+            "VALUES (?,?,NULL,?,?,?) ON CONFLICT(device_token, camera) DO UPDATE SET "
+            "last_alert=excluded.last_alert, state=excluded.state",
+            (device_token, camera, environment, when, state),
+        )
+
+
+def la_quiet_activities(last_alert_before: int) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM la_activities WHERE last_alert <= ?", (last_alert_before,)).fetchall()
+
+
+def set_la_activity_token(device_token: str, camera: str, activity_token: str, environment: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO la_activities(device_token, camera, activity_token, environment, last_alert) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(device_token, camera) DO UPDATE SET "
+            "activity_token=excluded.activity_token, environment=excluded.environment",
+            (device_token, camera, activity_token, environment, int(time.time())),
+        )
+
+
+def delete_la_activity(device_token: str, camera: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM la_activities WHERE device_token=? AND camera=?", (device_token, camera))

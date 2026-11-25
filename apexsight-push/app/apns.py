@@ -149,6 +149,33 @@ async def send_to_token(
     return False, f"{resp.status_code} {reason}".strip()
 
 
+async def send_liveactivity(token: str, environment: str, payload: dict, priority: int = 10) -> tuple[bool, str]:
+    """Send one ActivityKit push (start / update / end) to a push-to-start or per-activity token.
+
+    Same provider token as alerts; Live Activity pushes go to `<bundle>.push-type.liveactivity` with
+    `apns-push-type: liveactivity`. Returns (ok, detail) like `send_to_token`."""
+    p8, key_id, team_id, bundle_id, env_mode = _credentials()
+    headers = {
+        "authorization": f"bearer {_provider_token(p8, key_id, team_id)}",
+        "apns-topic": f"{bundle_id}.push-type.liveactivity",
+        "apns-push-type": "liveactivity",
+        "apns-priority": str(priority),
+    }
+    url = f"{_host_for(environment, env_mode)}/3/device/{token}"
+    try:
+        resp = await _apns_client().post(url, headers=headers, content=json.dumps(payload))
+    except httpx.HTTPError as exc:
+        return False, f"network error: {exc}"
+    if resp.status_code == 200:
+        return True, "ok"
+    reason = ""
+    try:
+        reason = resp.json().get("reason", "")
+    except Exception:
+        reason = resp.text.strip()
+    return False, f"{resp.status_code} {reason}".strip()
+
+
 async def send_background(device_token: str, environment: str, payload: dict) -> tuple[bool, str]:
     """Send a SILENT background push (content-available) — wakes the app briefly with no banner.
     APNs requires push-type `background` + priority `5` for these (a 10 gets rejected/throttled).
@@ -325,6 +352,7 @@ async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str 
     rows = db.devices_for(pairing_code)
     sent, failed, pruned, suppressed = 0, 0, 0, 0
     errors: list[str] = []
+    delivered: list[str] = []
     deliverable = []
     for row in rows:
         token = row["device_token"]
@@ -344,6 +372,7 @@ async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str 
         token = row["device_token"]
         if ok:
             sent += 1
+            delivered.append(token)
             continue
         failed += 1
         errors.append(detail)
@@ -357,4 +386,4 @@ async def deliver_to_pairing(pairing_code: str, payload: dict, collapse_id: str 
             db.delete_device_if_unchanged(token, row["updated_at"])
             pruned += 1
     return {"devices": len(rows), "sent": sent, "failed": failed,
-            "pruned": pruned, "suppressed": suppressed, "errors": errors}
+            "pruned": pruned, "suppressed": suppressed, "errors": errors, "delivered": delivered}

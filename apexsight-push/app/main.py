@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, aqara_talk, config, db, doorbell, gate, recap, render, turn
+from . import apns, aqara_talk, config, db, doorbell, gate, liveactivity, recap, render, turn
 from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
@@ -168,6 +168,17 @@ async def _startup() -> None:
     if LEGACY_PAIRING_CODES:
         print(f"[pairing] {len(LEGACY_PAIRING_CODES)} retired code(s) accepted as aliases; moved {moved} row(s)", flush=True)
     asyncio.create_task(_recap_scheduler())
+    _keep(asyncio.create_task(liveactivity.sweeper()))
+
+
+# Fire-and-forget tasks need a strong reference or the loop may garbage-collect them mid-flight.
+_background_tasks: set = set()
+
+
+def _keep(task: "asyncio.Task") -> "asyncio.Task":
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # ---- daily recap scheduler --------------------------------------------------
@@ -509,6 +520,62 @@ def register(body: RegisterIn, _: None = Depends(rate_limit)) -> dict:
 @app.post("/v1/unregister")
 def unregister(body: UnregisterIn, _: None = Depends(rate_limit)) -> dict:
     db.delete_device(body.device_token)
+    db.delete_la_start_token(body.device_token)
+    return {"ok": True}
+
+
+class LiveActivityRegisterIn(BaseModel):
+    pairing_code: str = Field(min_length=4, max_length=64)
+    device_token: str = Field(min_length=32, max_length=200)
+    start_token: str = Field(default="", max_length=400)   # empty = Live Activities off on this phone
+    environment: str = "production"
+
+
+class LiveActivityTokenIn(BaseModel):
+    pairing_code: str = Field(min_length=4, max_length=64)
+    device_token: str = Field(min_length=32, max_length=200)
+    camera: str = Field(min_length=1, max_length=64)
+    activity_token: str = Field(default="", max_length=400)  # empty = that activity ended on the phone
+    environment: str = "production"
+
+
+def _require_registered_device(pairing_code: str, device_token: str) -> str:
+    code = _require_pairing(pairing_code)
+    if not any(row["device_token"] == device_token for row in db.devices_for(code)):
+        raise HTTPException(status_code=404, detail="device not registered")
+    return code
+
+
+def _hex_token(token: str) -> str:
+    token = token.strip().lower()
+    if token and not all(ch in "0123456789abcdef" for ch in token):
+        raise HTTPException(status_code=422, detail="token must be hex")
+    return token
+
+
+@app.post("/v1/liveactivity/register")
+def liveactivity_register(body: LiveActivityRegisterIn, _: None = Depends(rate_limit)) -> dict:
+    """A phone's push-to-start token (or an empty one: the user turned Live Activities off)."""
+    _require_registered_device(body.pairing_code, body.device_token)
+    env = body.environment if body.environment in ("production", "sandbox") else "production"
+    token = _hex_token(body.start_token)
+    if token:
+        db.set_la_start_token(body.device_token, token, env)
+    else:
+        db.delete_la_start_token(body.device_token)
+    return {"ok": True, "enabled": bool(token)}
+
+
+@app.post("/v1/liveactivity/activity")
+def liveactivity_activity(body: LiveActivityTokenIn, _: None = Depends(rate_limit)) -> dict:
+    """The update token of the camera activity a phone is showing (empty: it ended there)."""
+    _require_registered_device(body.pairing_code, body.device_token)
+    env = body.environment if body.environment in ("production", "sandbox") else "production"
+    token = _hex_token(body.activity_token)
+    if token:
+        db.set_la_activity_token(body.device_token, body.camera, token, env)
+    else:
+        db.delete_la_activity(body.device_token, body.camera)
     return {"ok": True}
 
 
@@ -1231,6 +1298,12 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     result = await apns.deliver_to_pairing(
         code, payload, collapse_id=body.collapse_id, gate=device_gate
     )
+    # Live Activity for a person on camera — only for phones that just got THIS alert (so every mute,
+    # snooze and per-device gate above applies), only on the first stage (not the silent final-GIF or
+    # the description follow-ups), and off the request path so it can never delay or fail the alert.
+    if (result.get("delivered") and not body.silent and not body.is_description and not body.announce):
+        _keep(asyncio.create_task(liveactivity.on_person_alert(
+            result["delivered"], body.camera, body.camera_name, title, text, body.review_id, body.labels)))
     # If ANY reachable device failed for a TRANSIENT reason (APNs timeout / 5xx / 429 — NOT a
     # permanent bad-token prune, and NOT a per-device mute), signal failure so the bridge leaves the
     # stage unstamped and retries on the review's next update. Previously this only fired when EVERY
