@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.30.1
+
+**Delivery alerts can show the carrier's logo.** Alert pushes now carry every detected label as
+`labels` (alongside the existing first-label `label`), so the app's notification extension can see
+"ups" in `["car", "ups"]` and present the alert with the carrier's logo. Additive.
+
 ## 1.30.0
 
 **Live Activities for people on camera.** When a person alert is delivered to a phone that has Live

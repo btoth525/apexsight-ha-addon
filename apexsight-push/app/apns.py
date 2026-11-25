@@ -331,6 +331,9 @@ def build_payload(
         payload["ai_concerns"] = ai_concerns[:300]
     if labels:
         payload["label"] = labels[0]
+        # Every label (1.30.1): a delivery reads ["car", "ups"], and the app's notification extension
+        # needs the carrier to show its logo — the first label alone was "car".
+        payload["labels"] = [str(label) for label in labels][:8]
     if zones:
         payload["zones"] = zones
     if score:
