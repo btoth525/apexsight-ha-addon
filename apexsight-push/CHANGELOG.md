@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.30.2
+
+**No more "Person-Verified" in alerts.** A recognised object (`person-verified`, `car-verified`)
+now reads as the object ("Brandon · Person"), and the duplicate it produced alongside the plain label is
+dropped. The emoji lookup uses the plain label too.
+
 ## 1.30.1
 
 **Delivery alerts can show the carrier's logo.** Alert pushes now carry every detected label as

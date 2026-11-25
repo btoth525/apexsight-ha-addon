@@ -71,7 +71,12 @@ def render(ev: dict, style: dict | None, stage: str) -> dict:
     emoji_map = {**DEFAULT_EMOJI, **(s.get("emojiMap") or {})}
     sep = s.get("fieldSeparator", " · ")
 
-    labels = _as_list(ev.get("labels"))
+    # Frigate reports a recognised object as "person-verified"; in an alert it's still a person
+    # ("Brandon · Person", never "Brandon · Person-Verified · Person"). Order kept, duplicates dropped.
+    labels = list(dict.fromkeys(
+        str(x)[: -len("-verified")] if str(x).lower().endswith("-verified") else str(x)
+        for x in _as_list(ev.get("labels"))
+    ))
     subs = _as_list(ev.get("sub_labels"))
     zones = _as_list(ev.get("zones"))
     severity = ev.get("severity") or "detection"
