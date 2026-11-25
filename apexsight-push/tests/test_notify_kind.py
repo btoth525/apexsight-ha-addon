@@ -103,8 +103,47 @@ with TestClient(m.app) as c:
     db.set_config(f"gate:{CODE}", json.dumps({"disarmed": False}))
 
     sent.clear()
-    c.post("/v1/notify", json=dict(body, review_id="rev-e3", collapse_id="linger-e3b"))
-    check("the same smart alert for the same review never goes out twice", not sent)
+    c.post("/v1/notify", json=dict(body, review_id="rev-e3", collapse_id="linger-e3"))
+    check("the same smart alert (same collapse id) never goes out twice", not sent)
+
+    # 1.31.1: several smart alerts can share one Frigate review — two cars that pull in together are
+    # one review, and a parked car's arrival and its departure hours later are one long event that
+    # /api/review/event/<id> maps to the same review. Each is its own alert.
+    veh = dict(body, kind="vehicle_presence", labels=["vehicle_presence"], time_sensitive=False,
+               camera="Front_Driveway", zones=["driveway"], review_id="rev-two-cars")
+    sent.clear()
+    c.post("/v1/notify", json=dict(veh, title="Family Truck arrived home", collapse_id="veh-Family_Truck-1800000000"))
+    c.post("/v1/notify", json=dict(veh, title="Family Jeep arrived home", collapse_id="veh-Family_Jeep-1800000004"))
+    check("two vehicles arriving in ONE review → two alerts (the second is not 'already sent')",
+          [p["aps"]["alert"]["title"] for _, p, _ in sent] == ["Family Truck arrived home", "Family Jeep arrived home"])
+    sent.clear()
+    c.post("/v1/notify", json=dict(veh, title="Family Truck left", collapse_id="veh-Family_Truck-1800030000"))
+    check("…and the same truck leaving later on the same long event's review is delivered too", len(sent) == 1)
+
+    # A smart alert with NO review (a pickup nobody was reviewed for) is logged by its collapse id, so a
+    # retry after one phone's transient failure reaches only that phone.
+    DEV_B = "b" * 64
+    db.upsert_device(DEV_B, m._canonical_code(CODE), "production", "ios")
+    real_send = apns.send_to_token
+    fail = {DEV_B}
+
+    async def flaky_send(token, environment, payload, collapse_id=""):
+        if token in fail:
+            return False, "503 ServiceUnavailable"
+        return await real_send(token, environment, payload, collapse_id)
+
+    apns.send_to_token = flaky_send
+    pickup = dict(body, kind="package_pickup", labels=["package_pickup"], review_id="",
+                  collapse_id="pickup-1800000100.0-abc", title="Someone took the package")
+    sent.clear()
+    r = c.post("/v1/notify", json=pickup)
+    check("no-review smart alert, one phone failing → retry requested", r.status_code == 503 and len(sent) == 1)
+    fail.clear()
+    sent.clear()
+    r = c.post("/v1/notify", json=pickup)
+    check("…the retry reaches ONLY the phone that missed it (no second time-sensitive buzz)",
+          r.status_code == 200 and [t for t, _, _ in sent] == [DEV_B])
+    apns.send_to_token = real_send
 
     # ---- GET /v1/vehicles ----
     r = c.get("/v1/vehicles", params={"pairing_code": "APEX-WRNG-0000"})

@@ -7,6 +7,7 @@ Three concerns:
 """
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from typing import Optional
 
@@ -103,6 +104,7 @@ def init() -> None:
                 phase        TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
                 ts           REAL NOT NULL,
+                state        TEXT NOT NULL DEFAULT 'sent',
                 PRIMARY KEY (review_id, device_token, phase)
             );
             CREATE TABLE IF NOT EXISTS la_activities (
@@ -126,6 +128,12 @@ def init() -> None:
         # no way to tell whose phone a token belonged to, or that one of them was stale.
         try:
             c.execute("ALTER TABLE voip_tokens ADD COLUMN device_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # push_log.state (1.31.1): a claim is 'sending:<boot>' until APNs accepts it, then 'sent'.
+        # Rows from 1.31.0 were only ever kept for delivered pushes, so they read as 'sent'.
+        try:
+            c.execute("ALTER TABLE push_log ADD COLUMN state TEXT NOT NULL DEFAULT 'sent'")
         except sqlite3.OperationalError:
             pass
 
@@ -495,20 +503,53 @@ def delete_la_activity(device_token: str, camera: str) -> None:
 
 # ---- per-review push log (1.31.0) --------------------------------------------
 
-def claim_push(review_id: str, device_token: str, phase: str, content_hash: str) -> bool:
-    """Atomically reserve (review, phone, phase). False when it was already sent (or is being sent
-    by a concurrent request) — the caller must then skip this phone. Release on a failed send."""
+# Identifies THIS relay process in an in-flight claim. A claim left 'sending' by another boot was
+# orphaned by a relay that died between claiming and hearing back from APNs (an add-on restart or
+# update mid-alert): nothing will ever release it, and honouring it would turn every retry of that
+# alert into "already sent" — a missed alert. Such a claim is taken over at once.
+BOOT_ID = uuid.uuid4().hex[:12]
+# A claim held this long by THIS process is stuck, not in flight (a send is bounded by the APNs
+# client's timeouts, well under a minute).
+SENDING_STALE_S = 120.0
+
+
+def claim_push(review_id: str, device_token: str, phase: str, content_hash: str) -> str:
+    """Atomically reserve (review, phone, phase) before sending. Returns:
+      'claimed' — the caller sends, then calls mark_push_sent (or release_push on failure);
+      'sent'    — this phone already has it: skip;
+      'busy'    — another request is sending it right now: skip, but tell the caller to retry (that
+                  send may still fail, and its own caller may have given up waiting for it)."""
+    now = time.time()
+    mine = f"sending:{BOOT_ID}"
     with _conn() as c:
         cur = c.execute(
-            "INSERT OR IGNORE INTO push_log(review_id, device_token, phase, content_hash, ts) "
-            "VALUES(?,?,?,?,?)", (review_id, device_token, phase, content_hash, time.time()))
-        return cur.rowcount == 1
+            "INSERT OR IGNORE INTO push_log(review_id, device_token, phase, content_hash, ts, state) "
+            "VALUES(?,?,?,?,?,?)", (review_id, device_token, phase, content_hash, now, mine))
+        if cur.rowcount == 1:
+            return "claimed"
+        cur = c.execute(
+            "UPDATE push_log SET content_hash = ?, ts = ?, state = ? "
+            "WHERE review_id = ? AND device_token = ? AND phase = ? AND state LIKE 'sending:%' "
+            "AND (state != ? OR ts < ?)",
+            (content_hash, now, mine, review_id, device_token, phase, mine, now - SENDING_STALE_S))
+        if cur.rowcount == 1:
+            return "claimed"
+        row = c.execute("SELECT state FROM push_log WHERE review_id = ? AND device_token = ? AND phase = ?",
+                        (review_id, device_token, phase)).fetchone()
+        return "busy" if row and str(row["state"]).startswith("sending:") else "sent"
+
+
+def mark_push_sent(review_id: str, device_token: str, phase: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE push_log SET state = 'sent' WHERE review_id = ? AND device_token = ? AND phase = ?",
+                  (review_id, device_token, phase))
 
 
 def release_push(review_id: str, device_token: str, phase: str) -> None:
+    """Give back an in-flight claim after a failed send. Never deletes a delivered row."""
     with _conn() as c:
-        c.execute("DELETE FROM push_log WHERE review_id = ? AND device_token = ? AND phase = ?",
-                  (review_id, device_token, phase))
+        c.execute("DELETE FROM push_log WHERE review_id = ? AND device_token = ? AND phase = ? "
+                  "AND state LIKE 'sending:%'", (review_id, device_token, phase))
 
 
 def pushes_for(review_id: str, device_token: str) -> list[sqlite3.Row]:

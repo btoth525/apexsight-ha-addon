@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.31.1
+
+Hardening pass on 1.31.0. No new features.
+
+- **Fix: a second smart alert in the same review was swallowed.** The push log keyed smart alerts
+  on (review, kind). Several smart alerts can share one Frigate review: two cars pulling in
+  together are one review, and a parked car's arrival and its departure hours later are one long
+  event. Frigate's `/api/review/event/<id>` returns the same review for both (measured on this
+  install: one car event appears in two reviews hours apart). So the second car's arrival, or the
+  departure, was dropped as "already sent". Smart alerts are now logged by their own collapse id. A
+  smart alert with no review (a pickup nobody was reviewed for) is now logged too, so a retry after
+  one phone's transient failure no longer re-buzzes the phones that already got it.
+- **Fix: an alert could be lost to a relay restart.** The push log claims a phone before the
+  APNs send. A relay that died between the claim and the send (an add-on restart or update
+  mid-alert) left the claim behind, and every retry of that alert then read "already sent". Claims
+  now carry a state: `sending:<boot>` until APNs accepts, then `sent`. A claim left `sending` by an
+  earlier boot, or stuck for over 2 minutes, is taken over. Existing rows migrate as `sent`.
+- **Fix: success was reported for a send still in flight elsewhere.** When the bridge's 10 s POST
+  timed out and it retried, the retry found the first send's claim and returned 200. If that first
+  send then failed, nobody retried, and the alert was lost. The retry now gets a 503 for a phone
+  whose send is still in flight, so it retries again, by which time the send has either been
+  delivered or released.
+- **Fix: the AI description could be overwritten by its own alert.** The description record is
+  written when the alert is built, before its POST confirms, so the description could reach the
+  phone first. The plain alert then replaced it through the shared collapse id, and because only one
+  description is sent per review, the AI sentence was gone for good. The bridge now holds a
+  description until its review's alert is confirmed, for at most 45 s.
+- **Fix: the description forward blocked the MQTT loop.** It ran on paho's network thread, with up to
+  ~33 s of retries. That stalled everything behind it, doorbell rings included. It now runs on a
+  worker thread.
+- **Fix: one malformed MQTT message dropped the connection.** paho re-raises callback exceptions out
+  of `loop_forever`. A JSON `null`, or an `after` that isn't an object, therefore cost the 10 s
+  reconnect pause, and every alert published during that pause was lost (QoS 0). `on_message` now
+  catches and logs.
+- **Fix (smart alerts): a lost package `end` message disabled that spot for good.** The open track
+  kept the spot "occupied", so no pickup was ever considered there again, and the spot was never
+  pruned. Package tracks that have been quiet for 10 minutes are now checked against Frigate every
+  5 minutes (one GET per box, read-only). If a track has ended, its end is replayed. A track the
+  bridge has forgotten no longer pins its spot.
+- **Fix (smart alerts): one odd `/api/config` stopped every watcher.** `refresh_config` ran
+  unguarded at the top of each tick. An exception there skipped every pickup, departure and linger
+  decision, every 5 s. It is now guarded and retried once a minute.
+- **Fix (smart alerts): the vehicle state is now serialized under the lock.** Without it, a
+  concurrent MQTT update could raise "dictionary changed size during iteration" and the save was
+  lost.
+- **Fix (summaries): no stale catch-up recap.** The evening catch-up now covers only the day just
+  before today. Before this, re-enabling a recap that had been off for days sent a "Your Day" at
+  once, built from the last 24 h and filed under the old date. A multi-day outage did the same.
+- **Fix (summaries): table pruning no longer depends on the summary succeeding.** A summary that
+  raised every minute skipped the hourly prune of `recap_events` and `push_log`.
+
 ## 1.31.0
 
 **Daily summaries.** The evening recap is written as sentences ("Brandon and Taylor came by. UPS

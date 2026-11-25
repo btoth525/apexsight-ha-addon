@@ -188,6 +188,41 @@ w.run(600)
 check("a box still being carried (moving, 20 s) never arms — the drop-off isn't a pickup",
       not [p for p in w.posts if p.get("kind") == "package_pickup"])
 
+# ---- 11. (1.31.1) the package track's `end` message was lost (broker restart / reconnect pause) ----
+# Before: the track stayed "open" in the spot forever, so that spot never considered a pickup again.
+w = World(ncc=0.1)
+delivered(w)
+w.run(15 * 60)                                   # resting, quiet: Frigate sends nothing for a still box
+t = w.clock()
+w.send("new", **obj("per9", "doorbell", "person", t, PERSON, entered=["side_walk"], current=["side_walk"]))
+w.tick(5)
+w.events["pkg1"] = {"id": "pkg1", "end_time": w.clock()}   # Frigate ended it; the MQTT end never came
+w.tick(5)
+w.send("end", **obj("per9", "doorbell", "person", t, PERSON, entered=["side_walk"], current=[], end=w.clock()))
+w.events["per9"] = {"id": "per9", "end_time": w.clock()}
+w.run(5 * 60 + 200)
+check("a quiet package track Frigate has ended is reconciled → the pickup is still announced",
+      len([p for p in w.posts if p.get("kind") == "package_pickup"]) == 1)
+
+# A track whose object was forgotten (6 h without a word, end never seen) no longer pins its spot.
+w = World(ncc=0.1)
+delivered(w)
+spot = w.sa.spots[0]
+check("the resting track holds its spot", "pkg1" in spot.tracks)
+w.events["pkg1"] = None                      # Frigate unreachable for this one: can't reconcile
+w.run(6 * 3600 + 60, step=60)
+check("once the track is forgotten, the spot is no longer held by it", "pkg1" not in spot.tracks)
+t = w.clock()
+w.send("new", **obj("pkg2", "doorbell", "package", t, BOX, entered=["side_walk"], current=["side_walk"]))
+for _ in range(12):
+    w.tick(5)
+    w.send("update", **obj("pkg2", "doorbell", "package", t, BOX, entered=["side_walk"],
+                           current=["side_walk"], stationary=True))
+pickup(w, pid="pkg2", person="per2")
+w.run(200)
+check("…so a later pickup at that spot is announced again",
+      len([p for p in w.posts if p.get("kind") == "package_pickup"]) == 1)
+
 # ---- 10. switched off ----
 w = World(opts=smart_alerts.Options(package_alerts=False), ncc=0.1)
 delivered(w)

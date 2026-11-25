@@ -189,6 +189,17 @@ for i in range(6):
     w.tick(5)
 check("a track already 3 h old when first seen counts from now, not its start", not lingers(w))
 
+# ---- 11e. (1.31.1) a malformed /api/config must not stop the watchers ----
+# refresh_config ran unguarded at the top of every tick: one odd camera block raised there each time,
+# before any linger, pickup or departure was decided — every smart alert went dark.
+w = World()
+w.config["cameras"]["Broken_Cam"] = "not an object"
+w.sa._config_loaded_at = 0
+stand(w, "p11", 120)
+check("a config refresh that raises still lets a due linger fire", len(lingers(w)) == 1)
+check("…and the failed refresh is retried in a minute, not every 5 s tick",
+      w.sa._config_loaded_at > 0 and w.clock() - w.sa._config_loaded_at < 3600)
+
 # ---- 12. options ----
 o = smart_alerts.Options.from_env({"LINGER_PERSON_SECONDS": "30", "LINGER_ZONES": "doorbell:porch,Garage",
                                    "SMART_PACKAGE_ALERTS": "false", "LINGER_CAR_SECONDS": "null"})

@@ -189,19 +189,30 @@ async def _recap_scheduler() -> None:
     today — so the daily summary arrives reliably even with the app fully closed."""
     prune_tick = 0
     while True:
-        try:
-            await _maybe_send_recap()
-            # Prune old recap rows on a fixed cadence REGARDLESS of whether the recap is enabled.
-            # The bridge records every event into recap_events unconditionally, but the prune inside
-            # _maybe_send_recap only runs after its enabled/configured/time early-returns — so a
-            # household that never enables the recap (or hasn't set up APNs) grew the table forever.
-            prune_tick += 1
-            if prune_tick % 60 == 1:   # ~hourly
-                db.prune_recap_events(time.time() - 2 * 86_400)   # keep ~2 days
-                db.prune_push_log(time.time() - 2 * 86_400)
-        except Exception as exc:
-            print("[recap] error:", exc, flush=True)
+        prune_tick = await _scheduler_pass(prune_tick)
         await asyncio.sleep(60)
+
+
+async def _scheduler_pass(prune_tick: int) -> int:
+    """One minute of the scheduler: the summaries, then (~hourly) the table pruning. Separate guards:
+    a summary that raises every minute (a bad stored config, a DB hiccup) used to skip the prune with
+    it, and both recap_events and push_log then grew without bound."""
+    try:
+        await _maybe_send_recap()
+    except Exception as exc:
+        print("[recap] error:", exc, flush=True)
+    # Prune old recap rows on a fixed cadence REGARDLESS of whether the recap is enabled.
+    # The bridge records every event into recap_events unconditionally, but the prune inside
+    # _maybe_send_recap only runs after its enabled/configured/time early-returns — so a
+    # household that never enables the recap (or hasn't set up APNs) grew the table forever.
+    prune_tick += 1
+    if prune_tick % 60 == 1:   # ~hourly
+        try:
+            db.prune_recap_events(time.time() - 2 * 86_400)   # keep ~2 days
+            db.prune_push_log(time.time() - 2 * 86_400)
+        except Exception as exc:
+            print("[recap] prune error:", exc, flush=True)
+    return prune_tick
 
 
 async def _maybe_send_recap() -> None:
@@ -232,8 +243,14 @@ async def _maybe_send_recap() -> None:
     # scheduler starts evaluating the new date immediately and never notices — it only ever
     # compares against "today", so that day's recap is silently skipped forever. Detect a date we
     # last checked but never actually sent, and send a best-effort catch-up for it first.
+    # Only for the day just before today (1.31.1): the date we last checked is NOT a day that was
+    # missed if it is older than that — it is the day the recap was switched off (re-enabling it a
+    # week later sent a "Your Day" at once, built from the last 24 h and filed under that old date)
+    # or the start of a multi-day relay outage.
     last_checked = db.get_config(f"recap_last_checked:{PAIRING_CODE}")
-    if last_checked and last_checked != today and db.get_config(f"recap_sent:{PAIRING_CODE}") != last_checked:
+    yesterday = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    if (last_checked and last_checked != today and last_checked == yesterday
+            and db.get_config(f"recap_sent:{PAIRING_CODE}") != last_checked):
         catchup_rows = db.recap_events_between(PAIRING_CODE, now.timestamp() - 86_400, now.timestamp())
         catchup_title, catchup_body = recap.format_recap(catchup_rows)
         catchup_payload = apns.build_payload(title=catchup_title, body=catchup_body, apex_url="apex://recap")
@@ -1361,20 +1378,33 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
             return 0.0
 
     claimed: list[str] = []
+    busy: list[str] = []
+    # What the push log is keyed on. A review push: the review. A smart alert: its OWN collapse id
+    # (1.31.1) — several smart alerts can share one review (two cars arriving together are one
+    # Frigate review; a parked car's arrival and departure hours later are one long event, and
+    # /api/review/event/<id> returns the same review for both — measured on this Frigate), so keying
+    # them on (review, kind) swallowed the second car and the departure as "already sent". A smart
+    # alert with no review (a pickup nobody was reviewed for) is now logged too, so a bridge retry
+    # after one phone's transient failure no longer re-buzzes the phones that already got it.
+    log_key = (body.collapse_id or body.review_id) if body.kind else body.review_id
 
     def device_gate(token: str) -> tuple[bool, str]:
         deliver, reason = _prefs_gate(token)
-        if not deliver or not body.review_id:
+        if not deliver or not log_key:
             return deliver, reason
         # Per-phone, per-review history: never the same phase twice (a second AI description for
         # another object in the review, a bridge retry, a re-POST after a relay restart), and never a
         # follow-up that would show exactly what the phone already shows.
         try:
-            sent = db.pushes_for(body.review_id, token)
+            sent = db.pushes_for(log_key, token)
             if follow_up and sent and sent[-1]["content_hash"] == content_hash:
-                return False, f"unchanged {phase} for {body.review_id}"
-            if not db.claim_push(body.review_id, token, phase, content_hash):
-                return False, f"{phase} already sent for {body.review_id}"
+                return False, f"unchanged {phase} for {log_key}"
+            claim = db.claim_push(log_key, token, phase, content_hash)
+            if claim == "busy":
+                busy.append(token)
+                return False, f"{phase} for {log_key} is in flight in another request"
+            if claim != "claimed":
+                return False, f"{phase} already sent for {log_key}"
         except Exception as exc:  # noqa: BLE001 — a log hiccup must never cost a real alert
             return True, f"{reason} (push log unavailable: {exc!r})"
         claimed.append(token)
@@ -1418,9 +1448,13 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     finally:
         # A phone whose send failed — or a send that raised outright — gets its claim back, so the
         # bridge's retry can still reach it (the phones that DID get it are skipped, not re-buzzed).
-        for token in set(claimed) - set(result.get("delivered") or []):
+        delivered_set = set(result.get("delivered") or [])
+        for token in set(claimed):
             try:
-                db.release_push(body.review_id, token, phase)
+                if token in delivered_set:
+                    db.mark_push_sent(log_key, token, phase)
+                else:
+                    db.release_push(log_key, token, phase)
             except Exception:  # noqa: BLE001
                 pass
     # Live Activity for a person on camera — only for phones that just got THIS alert (so every mute,
@@ -1442,6 +1476,13 @@ async def notify(body: NotifyIn, _: None = Depends(rate_limit)) -> dict:
     if result["devices"] > 0 and transient_failed > 0:
         raise HTTPException(status_code=503,
                             detail=f"{transient_failed} of {result['devices']} deliveries failed transiently — retry")
+    # A phone skipped because ANOTHER request is mid-send for it is not done yet: that send can still
+    # fail, and its own caller may be gone (the bridge's 10 s POST timeout fired and this request IS
+    # its retry). Reporting success here let the bridge stamp the alert as sent while the only send
+    # in flight failed — a missed alert. Ask for a retry; by then it is either sent or released.
+    if busy:
+        raise HTTPException(status_code=503,
+                            detail=f"{len(busy)} deliver{'y' if len(busy) == 1 else 'ies'} still in flight — retry")
     return {"ok": result["sent"] > 0 or result["devices"] == 0, **result}
 
 

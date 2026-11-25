@@ -192,6 +192,8 @@ with TestClient(m.app) as c:
 # ---- the bridge: one description per review, however many objects are described ----
 posted = []
 bridge._post_to_relay = lambda payload, stage, attempts=3: posted.append((stage, payload)) or True
+bridge._run_in_background = lambda fn, *args: fn(*args)   # inline: the forward runs on a thread live
+bridge._notified[REVIEW] = {"alert": __import__("time").time()}   # its alert already confirmed
 bridge._pending.clear()
 bridge._described.clear()
 record = {"review_id": REVIEW, "title": "Dog, Person", "camera": "Front_Driveway", "apex_url": "",

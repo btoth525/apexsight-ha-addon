@@ -88,6 +88,11 @@ _LINGER_CAMERA_COOLDOWN_S = 10 * 60
 # People on the vehicle cameras right after a known vehicle came or went are the household unloading
 # or leaving (a week of replay: every driveway-person linger near an arrival was this).
 _HOUSEHOLD_ACTIVITY_S = 20 * 60
+# A package track with no MQTT update for this long is checked against Frigate (did it end while we
+# weren't listening?), at most once per _TRACK_RECHECK_S. A box at rest gets no updates for hours,
+# so this is a cheap GET per resting box every few minutes, never a guess from silence.
+_TRACK_QUIET_S = 10 * 60
+_TRACK_RECHECK_S = 5 * 60
 
 PLACE_PHRASE = {"doorbell": "at the front door", "Front_Driveway": "in the driveway",
                 "Front_Driveway_LPR": "in the driveway", "Side_Gate": "at the side gate",
@@ -363,6 +368,7 @@ class SmartAlerts:
         self._outbox: list[tuple[str, dict]] = []    # (kind, facts) decided under the lock, sent in tick
         self.fired_linger: dict[str, float] = self._load_json("smart:linger_fired", {})
         self.linger_camera_at: dict[str, float] = {}  # "camera|label" -> last linger push
+        self._track_checked: dict[str, float] = {}    # quiet package track id -> last Frigate check
 
     # ---- persistence ----------------------------------------------------------------------------
 
@@ -378,11 +384,16 @@ class SmartAlerts:
             return default
 
     def _save_vehicles(self) -> None:
-        self._set(self._vehicle_key(), json.dumps({
-            "updated": self.clock(),
-            "known": sorted(self.known),
-            "vehicles": self.vehicles,
-        }))
+        # Serialized under the lock, written outside it: json.dumps walked self.vehicles while paho's
+        # thread could be mutating it (a new spot, a status change) — "dictionary changed size during
+        # iteration", and the save was lost.
+        with self._lock:
+            blob = json.dumps({
+                "updated": self.clock(),
+                "known": sorted(self.known),
+                "vehicles": self.vehicles,
+            })
+        self._set(self._vehicle_key(), blob)
 
     # ---- Frigate config (known vehicles + detect sizes) -------------------------------------------
 
@@ -937,7 +948,17 @@ class SmartAlerts:
 
     def tick(self) -> None:
         """Worker-thread heartbeat: housekeeping, then every decision that needs I/O."""
-        self.refresh_config()
+        try:
+            self.refresh_config()
+        except Exception as exc:  # noqa: BLE001 — an odd /api/config must not stop every watcher
+            # Unguarded, one malformed camera block raised here on EVERY tick, before any pickup,
+            # departure or linger was decided: all three smart alerts went dark. Retry in a minute.
+            self._config_loaded_at = self.clock() - 3600 + 60
+            self.log(f"[smart] config refresh failed: {exc!r}")
+        try:
+            self._reconcile_spot_tracks()
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[smart] package track check failed: {exc!r}")
         now = self.clock()
         with self._lock:
             self._prune(now)
@@ -968,12 +989,39 @@ class SmartAlerts:
             except Exception as exc:  # noqa: BLE001
                 self.log(f"[smart] linger check failed: {exc!r}")
 
+    def _reconcile_spot_tracks(self) -> None:
+        """Ask Frigate about package tracks that have gone quiet. A spot with an open track never
+        considers a pickup, and an `end` message lost on the way (a broker restart, the bridge's
+        reconnect pause — QoS 0) left that track open forever: the spot never alerted again. A quiet
+        track that Frigate has ended is fed back as its end, exactly as the message would have been."""
+        now = self.clock()
+        with self._lock:
+            quiet = [(oid, self.objs[oid]) for s in self.spots for oid in s.tracks
+                     if oid in self.objs and self.objs[oid].end is None
+                     and now - self.objs[oid].last_seen > _TRACK_QUIET_S
+                     and now - self._track_checked.get(oid, -1e18) > _TRACK_RECHECK_S]
+            for oid, _ in quiet:
+                self._track_checked[oid] = now
+        for oid, o in quiet:
+            ev = self._fj(f"/api/events/{oid}")
+            if not isinstance(ev, dict) or not ev.get("end_time"):
+                continue
+            self.log(f"[smart] package track {oid} on {o.camera} ended without an end message")
+            self.on_event("end", {"id": oid, "camera": o.camera, "label": o.label,
+                                  "start_time": o.start, "end_time": ev["end_time"]})
+
     def _prune(self, now: float) -> None:
         for oid in [k for k, o in self.objs.items()
                     if (o.end is not None and now - o.end > _KEEP_ENDED_S)
                     or (o.end is None and now - o.last_seen > 6 * 3600)]:
             self.objs.pop(oid, None)
             self.adopted.pop(oid, None)
+        for oid in [k for k in self._track_checked if k not in self.objs]:
+            self._track_checked.pop(oid, None)
+        # A track forgotten above can no longer end here; holding its id kept the spot "occupied"
+        # (no pickup could ever be considered there) and kept the spot itself from being pruned.
+        for s in self.spots:
+            s.tracks &= set(self.objs)
         self.spots = [s for s in self.spots
                       if s.pending or s.tracks
                       or (s.armed and now - s.last_activity < 48 * 3600)

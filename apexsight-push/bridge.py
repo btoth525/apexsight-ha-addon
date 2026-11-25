@@ -1478,10 +1478,44 @@ def _handle_description(event: dict) -> None:
         payload["snapshot_url"] = rec["snapshot_url"]
     if rec.get("thumbnail_url"):
         payload["thumbnail_url"] = rec["thumbnail_url"]
+    # Off paho's network-loop thread (1.31.1): _post_to_relay can retry for ~33 s, and inline it
+    # stalled every other message for that long — a doorbell ring, the next review's alert.
+    _run_in_background(_forward_description, payload, rec["review_id"])
+
+
+# How long a description waits for its review's alert to be confirmed before going out anyway.
+# Covers the alert's own retry budget (3 attempts, 10 s timeouts, 1 + 2 s back-off).
+_DESC_WAIT_FOR_ALERT_S = 45.0
+
+
+def _run_in_background(fn, *args) -> None:
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def _forward_description(payload: dict, review_id: str) -> None:
+    """Send a description follow-up AFTER its review's alert. The description is built from a record
+    written when the alert was BUILT, before its POST confirmed, so it could reach the relay first —
+    and then the alert, arriving second with the same collapse id, replaced the AI sentence on the
+    phone with the plain "Person · Front Door" (the description is sent once per review, so the
+    better words were gone for good). Waiting is bounded: if the alert never confirms, the
+    description still goes out (passive), and the alert's own retry replaces it later."""
+    deadline = time.time() + _DESC_WAIT_FOR_ALERT_S
+    while "alert" not in _notified.get(review_id, {}) and time.time() < deadline:
+        time.sleep(0.5)
     _post_to_relay(payload, "description")
 
 
 def on_message(client, userdata, msg):
+    """paho callback. Never lets an exception out: paho re-raises it from loop_forever, which drops
+    the MQTT connection for the 10 s reconnect pause — every alert published in that gap is lost
+    (QoS 0). One malformed message (a JSON `null`, a non-object `after`) must cost only itself."""
+    try:
+        _on_message(client, userdata, msg)
+    except Exception as exc:  # noqa: BLE001
+        log(f"message on {getattr(msg, 'topic', '?')} failed: {exc!r}")
+
+
+def _on_message(client, userdata, msg):
     # House mode arrives as a plain string ("home"/"night"/"away"), not JSON — handle it before the
     # JSON decode below (which would otherwise reject it).
     if msg.topic == MODE_TOPIC:
@@ -1520,10 +1554,14 @@ def on_message(client, userdata, msg):
     except Exception as exc:
         log("bad payload:", exc)
         return
+    if not isinstance(event, dict):
+        return
     if AI_DESCRIPTIONS and msg.topic == DESC_TOPIC:
         _handle_description(event)
         return
     after = event.get("after") or event.get("before") or {}
+    if not isinstance(after, dict):
+        return
     # The events topic feeds the daily-recap tally and the smart alerts (memory only here — every
     # Frigate read and relay POST they need happens on the smart-alert worker thread).
     if msg.topic == EVENTS_TOPIC:
