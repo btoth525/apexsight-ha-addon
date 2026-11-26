@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.32.0
+
+- **New: steer the Tapo C246D telephoto lenses from the app.** Each C246D is a fixed wide lens plus
+  a pan/tilt telephoto lens (`Backyard_PTZ`, `Living_Room_PTZ` in Frigate). Frigate can only nudge
+  them four ways at one speed and can't aim at a point (they lack ONVIF's field-of-view relative
+  move), so the relay now speaks ONVIF to the camera itself under `/v1/ptz`:
+  - **Analog joystick** (`POST /v1/ptz/<cam>/move`): any direction, any speed, behind a 1.2 s
+    dead-man lease. A held stick re-sends its velocity; if the phone goes quiet the lens stops.
+  - **Tap-to-aim** (`POST /v1/ptz/<cam>/aim`): tap a point on the wide lens and the tele centres
+    on it. Measured on the real backyard camera: within about 1.5 % of the frame.
+  - **Where it's looking** (`GET /v1/ptz/<cam>/state`): the tele's position as a box on the wide
+    lens, plus the camera's saved spots.
+  - **Saved spots**: create, go to and delete camera presets.
+- Aiming uses a per-camera calibration measured 2026-11-25: the tele stepped through a grid,
+  located inside the wide picture by template matching, then fitted. Re-measure if a camera moves.
+- The camera login is never stored: it's read from the camera's `onvif:` block in Frigate's raw
+  config over the LAN API. Camera names are an allowlist; every route is pairing-gated. Joystick
+  updates have their own roomier rate limit (900/min) so a long pan isn't cut off.
+
 ## 1.31.2
 
 - **Fix: Frigate reloaded its settings every 10 minutes for nothing.** The bridge's self-heal

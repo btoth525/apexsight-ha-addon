@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import apns, aqara_talk, config, db, doorbell, gate, liveactivity, recap, render, turn
+from . import apns, aqara_talk, config, db, doorbell, gate, liveactivity, ptz, recap, render, turn
 from .admin import router as admin_router
 
 # Read from the add-on env (run.sh) — used by the daily-recap scheduler.
@@ -365,6 +365,26 @@ def rate_limit(request: Request) -> None:
         for stale in [k for k, w in list(_hits.items()) if not w or now - w[-1] > 60]:
             _hits.pop(stale, None)
 
+
+# Pan/tilt joystick traffic (1.32.0). A held stick re-sends its velocity a few times a second as a
+# dead-man heartbeat, which the general 120/min would cut off a minute into a pan. Its own bucket,
+# still bounded, so the joystick can't starve or be starved by everything else.
+PTZ_RATE_LIMIT_PER_MINUTE = 900
+_ptz_hits: dict = defaultdict(deque)
+
+
+def ptz_rate_limit(request: Request) -> None:
+    ip = _real_ip(request)
+    now = time.time()
+    window = _ptz_hits[ip]
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= PTZ_RATE_LIMIT_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    window.append(now)
+    if len(_ptz_hits) > 256:
+        for stale in [k for k, w in list(_ptz_hits.items()) if not w or now - w[-1] > 60]:
+            _ptz_hits.pop(stale, None)
 
 # ---- request models ---------------------------------------------------------
 
@@ -1810,3 +1830,8 @@ def set_recap(body: RecapIn, _: None = Depends(rate_limit)) -> dict:
         }),
     )
     return {"ok": True}
+
+
+# Tapo C246D telephoto pan/tilt: analog joystick, tap-to-aim, live aim box, saved spots (1.32.0).
+# Registered last so it can share `_require_pairing` and both limiters defined above.
+app.include_router(ptz.build_router(_require_pairing, rate_limit, ptz_rate_limit))
