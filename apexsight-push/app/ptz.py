@@ -365,8 +365,11 @@ def _disarm_lease(name: str) -> None:
 
 class MoveIn(BaseModel):
     pairing_code: str = ""
-    x: float = 0.0      # pan velocity, -1 (left) … 1 (right)
-    y: float = 0.0      # tilt velocity, -1 (down) … 1 (up)
+    # Screen directions. ONVIF *velocity* on these cameras is already picture-relative (+x looks
+    # right, +y looks up on both, measured 2026-11-25) even though their *position* spaces are
+    # mirrored differently, so the joystick passes straight through; only aiming needs the fit.
+    x: float = 0.0      # -1 look left … 1 look right
+    y: float = 0.0      # -1 look down … 1 look up
 
 
 class AimIn(BaseModel):

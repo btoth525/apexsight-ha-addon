@@ -152,7 +152,7 @@ with TestClient(m.app) as c:
     check("move with the wrong code -> 403", c.post("/v1/ptz/Backyard_PTZ/move", json={"pairing_code": "x", "x": 1}).status_code == 403)
     cam.calls.clear()
     r = c.post("/v1/ptz/Backyard_PTZ/move", json={"pairing_code": CODE, "x": 2.5, "y": -0.4})
-    check("move clamps velocity to [-1, 1] and sends a diagonal", r.json()["moving"] and cam.calls[-1] == ("move", 1.0, -0.4))
+    check("move clamps velocity to [-1, 1] and passes the screen direction straight through", r.json()["moving"] and cam.calls[-1] == ("move", 1.0, -0.4))
     import time as _t
     _t.sleep(0.6)
     check("dead-man lease: a joystick that goes quiet stops the lens", cam.calls[-1] == ("stop",))
