@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.33.0
+
+- **New: Property Radar sync** (`GET`/`POST /v1/radar`). The ApexSight app draws a top-down map of
+  the property with live dots for people, cars and dogs. One phone calibrates each camera (points in
+  the camera picture matched to points on the map); every paired phone reads the same calibration,
+  so nobody else has to set it up. Last write wins; saves are size-capped (64 KB) and cleaned (only
+  real camera names, in-frame image points and plausible coordinates are kept).
+- `GET /v1/radar` also returns the house's coordinates (Home Assistant `zone.home`) so the map opens
+  on the house, and where each Bermuda-tracked phone is (sensors with Bermuda's device class ending
+  `_area`), so a person on a camera can be labelled with whose phone is in that area. Both are read
+  from Home Assistant at request time (cached 5 s), never stored or logged, and only returned to a
+  paired phone: the stored calibration and the coordinates are the house's location.
+
 ## 1.32.0
 
 - **New: steer the Tapo C246D telephoto lenses from the app.** Each C246D is a fixed wide lens plus
