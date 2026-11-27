@@ -986,6 +986,14 @@ def _clean_radar(config: dict) -> dict:
                              "distance": distance or 200.0, "heading": heading or 0.0}
             if pitch is not None:
                 clean["view"]["pitch"] = round(pitch, 1)
+    # The house's own spot, corrected on the map in setup (Home Assistant's zone.home and street
+    # addresses are often a house or two off).
+    home_in = config.get("home") if isinstance(config.get("home"), dict) else None
+    if home_in:
+        lat = _radar_float(home_in.get("lat"), -90.0, 90.0)
+        lon = _radar_float(home_in.get("lon"), -180.0, 180.0)
+        if lat is not None and lon is not None:
+            clean["home"] = {"lat": round(lat, 7), "lon": round(lon, 7)}
     faces_in = config.get("faces") if isinstance(config.get("faces"), dict) else {}
     faces = {}
     for name, kind in list(faces_in.items())[:_RADAR_MAX_FACES]:

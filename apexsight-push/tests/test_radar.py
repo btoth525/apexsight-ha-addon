@@ -63,6 +63,7 @@ config = {
         "Backyard_Wide": {"points": [], "heading": 400, "fov": 5, "aim": -3, "icon": "../x"},  # all out of range
     },
     "faces": {"Alex": "adult", "Kid (Small)": "child", "../x": "child", "Sam": "giant", "Lee": 3},
+    "home": {"lat": 1.00005, "lon": 2.00007},
     "view": {"lat": 1.0, "lon": 2.0, "distance": 150, "heading": 30, "pitch": 62},
 }
 saved = client.post("/v1/radar", json={"pairing_code": CODE, "config": config})
@@ -79,6 +80,7 @@ check("the mount is kept", cams["Front_Driveway"].get("mount") == {"lat": 1.0003
 check("a mount without a height gets the default", cams["Side_Gate"]["mount"]["height"] == 2.7)
 check("an absurd mount height gets the default", cams["Garage"]["mount"]["height"] == 2.7)
 check("only valid face kinds are kept", clean.get("faces") == {"Alex": "adult", "Kid (Small)": "child"})
+check("the corrected house spot is kept", clean.get("home") == {"lat": 1.00005, "lon": 2.00007})
 check("the saved map view is kept", clean.get("view", {}).get("heading") == 30.0 and clean["view"].get("pitch") == 62.0)
 check("stamped with the save time", isinstance(clean.get("updated_at"), float))
 

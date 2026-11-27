@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.36.0
+
+- **Property Radar: the house's own spot.** Saved calibrations keep `home` (`lat`/`lon`), set by
+  dragging the house pin onto the right roof in setup: Home Assistant's `zone.home` and street
+  addresses are often a house or two off. Every phone then centres on the corrected spot.
+
 ## 1.35.0
 
 - **Property Radar: cameras placed straight on the map.** Saved calibrations keep each camera's
