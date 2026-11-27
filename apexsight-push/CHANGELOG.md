@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.35.0
+
+- **Property Radar: cameras placed straight on the map.** Saved calibrations keep each camera's
+  placed lens: `heading` (degrees clockwise from north), `fov` (how wide it sees, 20–200°), `aim`
+  (how far out the middle of its picture meets the ground, 1–150 m) and an `icon` (an SF Symbol
+  name). The saved map `view` can carry a `pitch` (0–85°) so every phone opens the 3D view at the
+  same tilt. Out-of-range values are dropped.
+
 ## 1.34.0
 
 - **Property Radar: phone tracking removed.** `GET /v1/radar` no longer reads Bermuda phone areas or

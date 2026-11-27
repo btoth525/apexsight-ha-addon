@@ -951,6 +951,20 @@ def _clean_radar(config: dict) -> dict:
                 continue
             points.append({"x": round(x, 5), "y": round(y, 5), "lat": round(lat, 7), "lon": round(lon, 7)})
         entry: dict = {"points": points}
+        # Where it points (degrees clockwise from north), how wide it sees (degrees), and how far out
+        # the middle of its picture meets the ground (metres): the placed-on-the-map lens.
+        heading = _radar_float(cam.get("heading"), 0.0, 360.0)
+        fov = _radar_float(cam.get("fov"), 20.0, 200.0)
+        aim = _radar_float(cam.get("aim"), 1.0, 150.0)
+        if heading is not None:
+            entry["heading"] = round(heading, 2)
+        if fov is not None:
+            entry["fov"] = round(fov, 1)
+        if aim is not None:
+            entry["aim"] = round(aim, 2)
+        icon = cam.get("icon")
+        if isinstance(icon, str) and 0 < len(icon) <= 40 and all(ch.isalnum() or ch == "." for ch in icon):
+            entry["icon"] = icon
         mount = cam.get("mount") if isinstance(cam.get("mount"), dict) else None
         if mount:
             lat = _radar_float(mount.get("lat"), -90.0, 90.0)
@@ -966,9 +980,12 @@ def _clean_radar(config: dict) -> dict:
         lon = _radar_float(view.get("lon"), -180.0, 180.0)
         distance = _radar_float(view.get("distance"), 10.0, 20000.0)
         heading = _radar_float(view.get("heading"), 0.0, 360.0)
+        pitch = _radar_float(view.get("pitch"), 0.0, 85.0)
         if lat is not None and lon is not None:
             clean["view"] = {"lat": round(lat, 7), "lon": round(lon, 7),
                              "distance": distance or 200.0, "heading": heading or 0.0}
+            if pitch is not None:
+                clean["view"]["pitch"] = round(pitch, 1)
     faces_in = config.get("faces") if isinstance(config.get("faces"), dict) else {}
     faces = {}
     for name, kind in list(faces_in.items())[:_RADAR_MAX_FACES]:

@@ -1,4 +1,4 @@
-"""Property Radar calibration sync: GET/POST /v1/radar (1.33.0, mounts + face kinds 1.34.0).
+"""Property Radar calibration sync: GET/POST /v1/radar (1.33.0, mounts + face kinds 1.34.0, placed lens + view pitch 1.35.0).
 
 Pairing-gated both ways, junk dropped on save, size-capped, and the house's coordinates (zone.home)
 parsed without ever being stored. Coordinates and names here are made up — this repo is public and
@@ -58,22 +58,28 @@ config = {
         "../etc": {"points": [{"x": 0.1, "y": 0.1, "lat": 1.0, "lon": 2.0}]},  # bad name: dropped
         "doorbell": "nonsense",                                               # not an object: dropped
         "Side_Gate": {"points": [], "mount": {"lat": 1.0, "lon": 2.0}},          # no height: default
-        "Garage": {"points": [], "mount": {"lat": 1.0, "lon": 2.0, "height": 99}},  # absurd height: default
+        "Garage": {"points": [], "mount": {"lat": 1.0, "lon": 2.0, "height": 99},   # absurd height: default
+                   "heading": 135.5, "fov": 100, "aim": 12, "icon": "video.doorbell.fill"},
+        "Backyard_Wide": {"points": [], "heading": 400, "fov": 5, "aim": -3, "icon": "../x"},  # all out of range
     },
     "faces": {"Alex": "adult", "Kid (Small)": "child", "../x": "child", "Sam": "giant", "Lee": 3},
-    "view": {"lat": 1.0, "lon": 2.0, "distance": 150, "heading": 30},
+    "view": {"lat": 1.0, "lon": 2.0, "distance": 150, "heading": 30, "pitch": 62},
 }
 saved = client.post("/v1/radar", json={"pairing_code": CODE, "config": config})
 check("POST accepts a calibration", saved.status_code == 200)
 clean = saved.json().get("config", {})
 cams = clean.get("cameras", {})
-check("only the real cameras are kept", sorted(cams) == ["Front_Driveway", "Garage", "Side_Gate"])
+check("only the real cameras are kept", sorted(cams) == ["Backyard_Wide", "Front_Driveway", "Garage", "Side_Gate"])
+check("the placed lens is kept", {k: cams["Garage"].get(k) for k in ("heading", "fov", "aim", "icon")}
+      == {"heading": 135.5, "fov": 100.0, "aim": 12.0, "icon": "video.doorbell.fill"})
+check("an out-of-range lens and a bad icon are dropped",
+      not any(k in cams["Backyard_Wide"] for k in ("heading", "fov", "aim", "icon")))
 check("only in-frame, real points are kept", len(cams["Front_Driveway"]["points"]) == 2)
 check("the mount is kept", cams["Front_Driveway"].get("mount") == {"lat": 1.0003, "lon": 2.0003, "height": 3.1})
 check("a mount without a height gets the default", cams["Side_Gate"]["mount"]["height"] == 2.7)
 check("an absurd mount height gets the default", cams["Garage"]["mount"]["height"] == 2.7)
 check("only valid face kinds are kept", clean.get("faces") == {"Alex": "adult", "Kid (Small)": "child"})
-check("the saved map view is kept", clean.get("view", {}).get("heading") == 30.0)
+check("the saved map view is kept", clean.get("view", {}).get("heading") == 30.0 and clean["view"].get("pitch") == 62.0)
 check("stamped with the save time", isinstance(clean.get("updated_at"), float))
 
 back = client.get("/v1/radar", params={"pairing_code": CODE}).json()
