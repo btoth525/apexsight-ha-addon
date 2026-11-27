@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.34.0
+
+- **Property Radar: phone tracking removed.** `GET /v1/radar` no longer reads Bermuda phone areas or
+  returns `people`: the radar now identifies people from the cameras alone (faces, and adult/child
+  from their measured height). It still returns the house's coordinates (`zone.home`, now cached for
+  a minute) so the map opens on the house.
+- Saved calibrations keep two new things: each camera's `mount` (where it hangs on the map and how
+  high, 0.5–15 m, default 2.7 m), which the app needs to measure people's height and draw the camera
+  in 3D, and a `faces` map marking each Frigate face name as `adult` or `child`. The old per-camera
+  `area` (used only for Bermuda) is dropped.
+
 ## 1.33.0
 
 - **New: Property Radar sync** (`GET`/`POST /v1/radar`). The ApexSight app draws a top-down map of

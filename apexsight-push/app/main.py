@@ -896,18 +896,11 @@ def get_vehicles(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
 _RADAR_MAX_BYTES = 64 * 1024
 _RADAR_MAX_CAMERAS = 16
 _RADAR_MAX_POINTS = 40
-_RADAR_CTX_TTL = 5.0
-_radar_ctx_cache: dict = {"at": 0.0, "value": (None, [])}
-
-_RADAR_HA_TEMPLATE = (
-    "{% set ns = namespace(p=[]) %}"
-    "{% for s in states.sensor if s.attributes.device_class == 'bermuda__custom_device_class' "
-    "and s.entity_id.endswith('_area') %}"
-    "{% set ns.p = ns.p + [{'id': s.entity_id, 'name': s.name, 'area': s.state, "
-    "'since': as_timestamp(s.last_changed)}] %}"
-    "{% endfor %}"
-    "{{ {'home': {'lat': state_attr('zone.home', 'latitude'), 'lon': state_attr('zone.home', 'longitude')}, "
-    "'people': ns.p} | tojson }}"
+_RADAR_MAX_FACES = 32
+_RADAR_HOME_TTL = 60.0
+_radar_home_cache: dict = {"at": 0.0, "value": None}
+_RADAR_HOME_TEMPLATE = (
+    "{{ {'lat': state_attr('zone.home', 'latitude'), 'lon': state_attr('zone.home', 'longitude')} | tojson }}"
 )
 
 
@@ -921,9 +914,22 @@ def _radar_float(value, low: float, high: float) -> Optional[float]:
     return f
 
 
+def _radar_name(value) -> Optional[str]:
+    """A Frigate face name ("Zach", "Grandma (Mom)"): plain characters only, never a path."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not (1 <= len(name) <= 64) or name in (".", "..") or not all(
+        ch.isalnum() or ch in " _-'()." for ch in name
+    ):
+        return None
+    return name
+
+
 def _clean_radar(config: dict) -> dict:
     """Keep only well-formed calibration: camera names Frigate could have, image points inside the
-    frame, real coordinates. Anything else is dropped rather than stored."""
+    frame, real coordinates, a plausible mount, and an adult/child setting per face name. Anything
+    else is dropped rather than stored."""
     cameras_in = config.get("cameras") if isinstance(config.get("cameras"), dict) else {}
     cameras: dict = {}
     for name, cam in list(cameras_in.items())[:_RADAR_MAX_CAMERAS]:
@@ -945,9 +951,13 @@ def _clean_radar(config: dict) -> dict:
                 continue
             points.append({"x": round(x, 5), "y": round(y, 5), "lat": round(lat, 7), "lon": round(lon, 7)})
         entry: dict = {"points": points}
-        area = cam.get("area")
-        if isinstance(area, str) and 0 < len(area.strip()) <= 64:
-            entry["area"] = area.strip()
+        mount = cam.get("mount") if isinstance(cam.get("mount"), dict) else None
+        if mount:
+            lat = _radar_float(mount.get("lat"), -90.0, 90.0)
+            lon = _radar_float(mount.get("lon"), -180.0, 180.0)
+            height = _radar_float(mount.get("height"), 0.5, 15.0)
+            if lat is not None and lon is not None:
+                entry["mount"] = {"lat": round(lat, 7), "lon": round(lon, 7), "height": round(height or 2.7, 2)}
         cameras[name] = entry
     clean: dict = {"cameras": cameras, "updated_at": time.time()}
     view = config.get("view") if isinstance(config.get("view"), dict) else None
@@ -959,63 +969,55 @@ def _clean_radar(config: dict) -> dict:
         if lat is not None and lon is not None:
             clean["view"] = {"lat": round(lat, 7), "lon": round(lon, 7),
                              "distance": distance or 200.0, "heading": heading or 0.0}
+    faces_in = config.get("faces") if isinstance(config.get("faces"), dict) else {}
+    faces = {}
+    for name, kind in list(faces_in.items())[:_RADAR_MAX_FACES]:
+        clean_name = _radar_name(name)
+        if clean_name and kind in ("adult", "child"):
+            faces[clean_name] = kind
+    if faces:
+        clean["faces"] = faces
     return clean
 
 
-async def _radar_ha_context() -> tuple:
-    """(home {lat, lon} or None, [Bermuda phones {id, name, area, since}]) — cached a few seconds,
-    since every open radar polls it. Fails quiet: no token or an HA hiccup just means no extras."""
+async def _radar_home() -> Optional[dict]:
+    """The house's coordinates (Home Assistant zone.home) for centering the map, cached for a minute.
+    Fails quiet: no token or an HA hiccup just means the app frames the saved view instead."""
     now = time.monotonic()
-    if now - _radar_ctx_cache["at"] < _RADAR_CTX_TTL:
-        return _radar_ctx_cache["value"]
-    value: tuple = (None, [])
+    if now - _radar_home_cache["at"] < _RADAR_HOME_TTL:
+        return _radar_home_cache["value"]
+    home = None
     if SUPERVISOR_TOKEN:
         try:
             async with httpx.AsyncClient(timeout=6.0) as client:
                 resp = await client.post(
                     f"{HA_CORE_URL}/api/template",
                     headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
-                    json={"template": _RADAR_HA_TEMPLATE},
+                    json={"template": _RADAR_HOME_TEMPLATE},
                 )
             data = json.loads(resp.text) if resp.status_code == 200 else {}
-            home_raw = data.get("home") if isinstance(data, dict) else None
-            home = None
-            if isinstance(home_raw, dict):
-                lat = _radar_float(home_raw.get("lat"), -90.0, 90.0)
-                lon = _radar_float(home_raw.get("lon"), -180.0, 180.0)
+            if isinstance(data, dict):
+                lat = _radar_float(data.get("lat"), -90.0, 90.0)
+                lon = _radar_float(data.get("lon"), -180.0, 180.0)
                 if lat is not None and lon is not None:
                     home = {"lat": lat, "lon": lon}
-            people = []
-            for p in (data.get("people") if isinstance(data, dict) and isinstance(data.get("people"), list) else []):
-                if not isinstance(p, dict):
-                    continue
-                area = str(p.get("area") or "")
-                if area.lower() in ("", "unknown", "unavailable", "not_home", "away", "none"):
-                    area = ""
-                name = str(p.get("name") or p.get("id") or "")
-                if name.lower().endswith(" area"):
-                    name = name[: -len(" area")]
-                people.append({"id": str(p.get("id") or ""), "name": name.strip(), "area": area or None,
-                               "since": _radar_float(p.get("since"), 0, 1e11)})
-            value = (home, people)
         except Exception as exc:  # never the coordinates: only that the lookup failed
-            print(f"radar HA context unavailable: {type(exc).__name__}", flush=True)
-    _radar_ctx_cache["at"] = now
-    _radar_ctx_cache["value"] = value
-    return value
+            print(f"radar home unavailable: {type(exc).__name__}", flush=True)
+    _radar_home_cache["at"] = now
+    _radar_home_cache["value"] = home
+    return home
 
 
 @app.get("/v1/radar")
 async def get_radar(pairing_code: str = "", _: None = Depends(rate_limit)) -> dict:
-    """The household's radar calibration (null until a phone saves one), the house's coordinates for
-    centering the map, and where each Bermuda-tracked phone is."""
+    """The household's radar calibration (null until a phone saves one) and the house's coordinates
+    for centering the map."""
     code = _require_pairing(pairing_code)
     try:
         stored = json.loads(db.get_config(f"radar:{code}", "") or "null")
     except Exception:
         stored = None
-    home, people = await _radar_ha_context()
-    return {"ok": True, "config": stored if isinstance(stored, dict) else None, "home": home, "people": people}
+    return {"ok": True, "config": stored if isinstance(stored, dict) else None, "home": await _radar_home()}
 
 
 @app.post("/v1/radar")
