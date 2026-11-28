@@ -87,6 +87,12 @@ check("stamped with the save time", isinstance(clean.get("updated_at"), float))
 back = client.get("/v1/radar", params={"pairing_code": CODE}).json()
 check("GET returns what was saved", back.get("config", {}).get("cameras") == cams)
 
+# A phone on an older app saves without the house's spot: the stored correction stays.
+older = client.post("/v1/radar", json={"pairing_code": CODE, "config": {"cameras": {}, "faces": {"Alex": "adult"}}})
+check("a save without home keeps the stored house spot", older.json().get("config", {}).get("home") == {"lat": 1.00005, "lon": 2.00007})
+moved = client.post("/v1/radar", json={"pairing_code": CODE, "config": {"cameras": {}, "home": {"lat": 1.2, "lon": 2.2}}})
+check("a save with home replaces it", moved.json().get("config", {}).get("home") == {"lat": 1.2, "lon": 2.2})
+
 # Size cap.
 huge = {"cameras": {"Front_Driveway": {"points": [], "pad": "x" * (70 * 1024)}}}
 check("an oversized save is refused",

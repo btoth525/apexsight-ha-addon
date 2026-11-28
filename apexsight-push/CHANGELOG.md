@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.36.1
+
+- **Property Radar: a save from an older app keeps the house's spot.** A phone that doesn't know
+  about `home` yet (build 298) no longer wipes the corrected spot when it saves a face's adult/child
+  setting or a default view.
+
 ## 1.36.0
 
 - **Property Radar: the house's own spot.** Saved calibrations keep `home` (`lat`/`lon`), set by

@@ -1052,6 +1052,15 @@ def post_radar(body: RadarIn, _: None = Depends(rate_limit)) -> dict:
     if len(json.dumps(body.config)) > _RADAR_MAX_BYTES:
         raise HTTPException(status_code=413, detail="radar config too large")
     clean = _clean_radar(body.config or {})
+    # A phone on an older app doesn't know about the house's own spot: keep the stored one rather
+    # than let its save wipe the correction.
+    if "home" not in clean:
+        try:
+            stored = json.loads(db.get_config(f"radar:{code}", "") or "null")
+        except Exception:
+            stored = None
+        if isinstance(stored, dict) and isinstance(stored.get("home"), dict):
+            clean["home"] = stored["home"]
     db.set_config(f"radar:{code}", json.dumps(clean))
     return {"ok": True, "config": clean}
 
